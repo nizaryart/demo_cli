@@ -23,6 +23,7 @@ import uuid
 from dataclasses import dataclass
 from typing import List, Optional
 
+from .classify import redirect_target
 from .context import redact
 
 _PG_URL = re.compile(r"\bpostgres(?:ql)?://\S+", re.I)
@@ -84,8 +85,11 @@ def resolve_target(cmd: str, explicit_db: Optional[str] = None,
 # rather than passed as a flag.
 # --------------------------------------------------------------------------
 
-_RM_RE = re.compile(r"^\s*(?:sudo\s+)?rm\b", re.I)
-_MV_RE = re.compile(r"^\s*(?:sudo\s+)?mv\b", re.I)
+# Leading env-var assignments (`X=1 rm ...`) are a shell prefix before the
+# command word; allow them so the operand extractor still fires (#006).
+_ENV_ASSIGN = re.compile(r"^[A-Za-z_]\w*=")
+_RM_RE = re.compile(r"^\s*(?:[A-Za-z_]\w*=\S*\s+)*(?:sudo\s+)?rm\b", re.I)
+_MV_RE = re.compile(r"^\s*(?:[A-Za-z_]\w*=\S*\s+)*(?:sudo\s+)?mv\b", re.I)
 _PS_REMOVE_RE = re.compile(r"^\s*(?:Remove-Item|ri)\b", re.I)
 
 # Brace expansion. The shell expands `{a,b}` and `{1..3}` BEFORE globbing and
@@ -191,10 +195,17 @@ def _path_operands(cmd: str) -> List[str]:
     them ourselves is the only way to know what the command will actually
     destroy - which is also, exactly, the thing the user needed to see.
     """
+    toks = cmd.strip().split()
+    i = 0
+    # Skip the shell prefix: leading env-var assignments and sudo come BEFORE the
+    # command word. (After the command word, `X=1` would be a real filename, so
+    # only the leading run is skipped - `rm X=1 f` still treats X=1 as an operand.)
+    while i < len(toks) and (_ENV_ASSIGN.match(toks[i]) or toks[i] == "sudo"):
+        i += 1
+    if i < len(toks) and toks[i] in ("rm", "mv"):
+        i += 1
     out: List[str] = []
-    for tok in cmd.strip().split():
-        if tok in ("sudo", "rm", "mv"):
-            continue
+    for tok in toks[i:]:
         if tok.startswith("-"):
             continue
         tok = tok.strip("'\"")
@@ -373,7 +384,21 @@ def extract_path_operand(cmd: str) -> Optional[str]:
     if _PS_REMOVE_RE.search(cmd):
         target = _ps_remove_item_operand(cmd)
         return target if target and os.path.exists(target) else None
+    # Truncating output redirection ('> file'): snapshot the file it overwrites.
+    # Uses the same quote-aware detector as the classifier, so classify (is it
+    # destructive?) and recovery (what to snapshot?) can never disagree.
+    tgt = redirect_target(cmd)
+    if tgt:
+        ap = os.path.abspath(tgt)
+        return ap if os.path.exists(ap) else None
     return None
+
+
+def is_fs_delete(cmd: str) -> bool:
+    """True if cmd is a local filesystem delete/move whose target THIS module
+    resolves by operand extraction (rm / mv / PowerShell Remove-Item). Used by
+    the guard to refuse a partial .db-name capture for such a command (#004)."""
+    return bool(_RM_RE.search(cmd) or _MV_RE.search(cmd) or _PS_REMOVE_RE.search(cmd))
 
 
 def is_remote_pg(ref: str) -> bool:

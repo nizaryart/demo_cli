@@ -100,3 +100,147 @@ def test_unix_rm_rf_unaffected_by_powershell_rule():
     c = classify_pipeline("rm -rf ./build")
     assert c.matched_rule == "rm_rf"
     assert c.nonrecoverable_surface is None
+
+
+def test_mkfs_is_nonrecoverable_disk_format():
+    # mkfs / mkfs.<fstype> formats a whole device; it cannot be honestly
+    # snapshotted, so it carries the disk_format non-recoverable surface
+    # (hard-stop in every environment). Real-incident gap: raw-data hard_command.
+    for cmd in ["mkfs.ext4 /dev/sda1", "mkfs /dev/sdb"]:
+        c = classify_pipeline(cmd)
+        assert c.is_destructive, cmd
+        assert c.matched_rule == "fs_mkfs", cmd
+        assert c.nonrecoverable_surface == "disk_format", cmd
+    # no false positive on prose merely containing the letters
+    assert classify_pipeline("echo making files").matched_rule is None
+
+
+def test_redirect_truncation_is_destructive_recoverable():
+    # A single '>' overwrites a file from byte 0 -> destructive, recoverable
+    # (target snapshotted), so NOT a non-recoverable surface.
+    for cmd in ["> app.db", "echo x > app.db", ": > app.db"]:
+        c = classify_pipeline(cmd)
+        assert c.is_destructive, cmd
+        assert c.matched_rule == "fs_redirect_truncate", cmd
+        assert c.nonrecoverable_surface is None, cmd
+
+
+def test_redirect_quote_and_escape_aware():
+    # '>' inside quotes or backslash-escaped is literal, not the operator.
+    assert classify_pipeline('echo "a>b"').matched_rule is None
+    assert classify_pipeline('echo "safe > text here"').matched_rule is None
+    assert classify_pipeline(r"echo a\>b").matched_rule is None
+    # but a real redirect AFTER a quoted '>' is still caught, target = app.db
+    c = classify_pipeline('echo "a>b" > app.db')
+    assert c.is_destructive and c.matched_rule == "fs_redirect_truncate"
+
+
+def test_redirect_append_and_sinks_not_destructive():
+    assert classify_pipeline("echo x >> app.db").matched_rule is None   # append
+    assert classify_pipeline("cmd > /dev/null").matched_rule is None    # sink
+    assert classify_pipeline("cmd 2> err.log").matched_rule is None     # fd-prefixed
+
+
+def test_redirect_hidden_in_chain_is_caught():
+    c = classify_pipeline("ls && echo x > app.db")
+    assert c.is_pipeline and c.is_destructive
+    assert c.matched_rule == "fs_redirect_truncate"
+
+
+def test_redirect_target_extraction():
+    from demo_cli.classify import redirect_target
+    assert redirect_target("echo x > app.db") == "app.db"
+    assert redirect_target('> "my file"') == "my file"
+    assert redirect_target('echo "a>b" > app.db') == "app.db"
+    assert redirect_target("echo x >> app.db") is None
+    assert redirect_target("cmd > /dev/null") is None
+
+
+def test_destructive_git_is_caught():
+    for cmd, rule in [
+        ("git worktree remove --force wt", "git_worktree_remove"),
+        ("git branch -D feature", "git_branch_delete"),
+        ("git checkout -- src/app.py", "git_checkout_discard"),
+        ("git checkout .", "git_checkout_discard"),
+        ("git restore config.py", "git_restore"),
+        ("git stash drop", "git_stash_drop"),
+        ("git stash pop", "git_stash_pop"),
+        ("git reflog expire --expire=now --all", "git_reflog_expire"),
+        ("git gc --prune=now", "git_gc_prune"),
+        ("git filter-branch --tree-filter x", "git_filter_branch"),
+        ("git update-ref -d refs/heads/x", "git_update_ref_delete"),
+    ]:
+        c = classify_pipeline(cmd)
+        assert c.is_destructive, cmd
+        assert c.matched_rule == rule, (cmd, c.matched_rule)
+
+
+def test_readonly_git_is_not_flagged():
+    # the perimeter stays narrow: normal-flow git is NOT escalated.
+    for cmd in ["git status", "git diff", "git log --oneline", "git add -A",
+                "git commit -m x", "git push", "git pull", "git fetch",
+                "git checkout main", "git branch --list", "git stash", "git gc"]:
+        assert classify_pipeline(cmd).is_destructive is False, cmd
+
+
+def test_git_branch_delete_case_sensitive_D():
+    # -D force-deletes (loses commits) -> destructive; -d refuses on unmerged
+    # work -> safe. The case distinction must hold despite re.I on the table.
+    assert classify_pipeline("git branch -D x").matched_rule == "git_branch_delete"
+    assert classify_pipeline("git branch -d merged").is_destructive is False
+
+
+def test_powershell_remove_item_parity():
+    assert classify_pipeline("Remove-Item app.db").matched_rule == "ps_remove_item"
+    assert classify_pipeline("Remove-Item -Recurse dist").matched_rule == "ps_remove_item"
+    # the -Recurse -Force nuke still wins its specific higher-signal id
+    assert classify_pipeline("Remove-Item -Recurse -Force dist").matched_rule == "ps_remove_item_rf"
+
+
+def test_env_prefix_does_not_hide_rm():
+    # #006: a leading env-var assignment must not defeat the rm_local anchor.
+    assert classify_pipeline("X=1 rm app.db").matched_rule == "rm_local"
+    assert classify_pipeline("A=1 B=2 rm data").matched_rule == "rm_local"
+    # ... but only assignment prefixes: a real command-word prefix must still
+    # NOT match, so git/docker/npm rm subcommands are not false-flagged.
+    assert classify_pipeline("git rm app.db").matched_rule != "rm_local"
+    assert classify_pipeline("docker rm container").matched_rule != "rm_local"
+
+
+def test_saas_deploy_destructive_vs_safe():
+    # Approach A: content/deploy SaaS CLIs escalate on their DESTRUCTIVE subcommand;
+    # read/preview forms are left alone.
+    for cmd in ["shopify theme push", "shopify theme delete",
+                "vercel --prod", "vercel remove myapp", "vercel rm dep",
+                "netlify deploy --prod", "netlify sites:delete",
+                "firebase hosting:disable", "firebase firestore:delete",
+                "wrangler kv:key delete K"]:
+        c = classify_pipeline(cmd)
+        assert c.nonrecoverable_surface == "saas_deploy", cmd
+    for cmd in ["shopify theme pull", "vercel", "vercel dev",
+                "netlify status", "firebase deploy", "wrangler tail"]:
+        assert classify_pipeline(cmd).nonrecoverable_surface is None, cmd
+
+
+def test_saas_cms_destructive_vs_safe():
+    for cmd in ["wp db reset", "wp db drop", "wp site empty",
+                "wp post delete 42", "wp user delete 3", "wp option delete foo",
+                "contentful space delete", "contentful entry delete --id 9"]:
+        assert classify_pipeline(cmd).nonrecoverable_surface == "saas_cms", cmd
+    for cmd in ["wp post list", "wp db export", "contentful space list"]:
+        assert classify_pipeline(cmd).nonrecoverable_surface is None, cmd
+
+
+def test_paas_destroy_destructive_vs_safe():
+    for cmd in ["heroku apps:destroy myapp", "heroku pg:reset DATABASE",
+                "supabase db reset", "flyctl apps destroy x", "fly destroy x"]:
+        assert classify_pipeline(cmd).nonrecoverable_surface == "paas_destroy", cmd
+    for cmd in ["heroku logs", "heroku ps", "supabase status"]:
+        assert classify_pipeline(cmd).nonrecoverable_surface is None, cmd
+
+
+def test_gh_destructive_extensions():
+    assert classify_pipeline("gh repo delete owner/x").nonrecoverable_surface == "vcs_remote_state"
+    assert classify_pipeline("gh api -X DELETE /repos/x/y").nonrecoverable_surface == "vcs_remote_state"
+    assert classify_pipeline("gh repo view owner/x").nonrecoverable_surface is None
+    assert classify_pipeline("gh pr list").nonrecoverable_surface is None

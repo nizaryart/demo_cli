@@ -70,6 +70,7 @@ class Config:
     workspace_dir: str = ".demo_cli"
     approval_key_env: Optional[str] = None
     targets: List[TargetRule] = field(default_factory=list)
+    egress: dict = field(default_factory=dict)  # [egress] table for the egress guard
     source_path: Optional[str] = None  # path of the loaded config, if any
 
     # ---- resolved paths (always project-local, never install-local) ----
@@ -138,6 +139,10 @@ def load_config(start: Optional[str] = None) -> Config:
     appr = data.get("approval", {})
     if isinstance(appr, dict) and appr.get("key_env"):
         cfg.approval_key_env = str(appr["key_env"])
+
+    eg = data.get("egress", {})
+    if isinstance(eg, dict):
+        cfg.egress = eg
 
     for raw in data.get("target", []) or []:
         if not isinstance(raw, dict) or "match" not in raw:

@@ -380,6 +380,34 @@ def cmd_init(a) -> int:
 
 
 def cmd_install_hook(a) -> int:
+    if getattr(a, "codex", False):
+        from .hooks.codex import settings_snippet, install_into_hooks_json
+        snippet = settings_snippet()
+        if a.print:
+            print(json.dumps(snippet, indent=2))
+            return 0
+        target = (os.path.expanduser("~/.codex/hooks.json") if a.scope == "global"
+                  else os.path.join(os.getcwd(), ".codex", "hooks.json"))
+        install_into_hooks_json(target)
+        print(f"Installed PreToolUse hook into {target}")
+        print("Gates Codex shell commands (Bash) AND file edits (apply_patch).")
+        print()
+        print("  ACTION REQUIRED - the hook is INERT until both of these are done:")
+        print("   1. RESTART Codex. Hook config is read once, at session start; a")
+        print("      session already running keeps whatever it loaded and this")
+        print("      install has no effect on it (silently - no warning either side).")
+        print("   2. Run  /hooks  in Codex and approve this entry. Trust is tracked")
+        print("      by hash, so re-approve after any upgrade.")
+        print()
+        print("  Until then: no gating, no receipts, no protection.")
+        if a.scope != "global":
+            print()
+            print("  TIP: --scope global installs to ~/.codex/hooks.json so every Codex")
+            print("       session is covered. A per-project guard is missing precisely")
+            print("       in the projects you did not think to protect. Outside a")
+            print("       configured project it runs in shadow (observe + snapshot,")
+            print("       never block), so it is safe to enable everywhere.")
+        return 0
     if getattr(a, "cursor", False):
         from .hooks.cursor import settings_snippet, install_into_hooks_json
         snippet = settings_snippet()
@@ -413,6 +441,164 @@ def cmd_hook(a) -> int:
 def cmd_hook_cursor(a) -> int:
     from .hooks.cursor import run_before_shell
     return run_before_shell(sys.stdin, sys.stdout)
+
+
+def cmd_hook_codex(a) -> int:
+    from .hooks.codex import run_pretooluse
+    return run_pretooluse(sys.stdin, sys.stdout)
+
+
+_SHELL_GUARD_SNIPPET = r'''# >>> demo_cli shell guard >>>
+# Gate commands that bypass the PreToolUse hook: Claude Code `!` mode, or any
+# command typed directly into the shell. Bash only. The DEBUG trap fires BEFORE
+# each command; on a blocking decision it stops the command from running.
+#   * non-interactive shell (Claude Code `!` mode is `bash -c`): `extdebug`
+#     cannot be enabled from a startup file, so we TERMINATE the shell before the
+#     command runs.
+#   * interactive shell: skip the command via `extdebug` so the terminal survives.
+# A cheap pre-filter avoids spawning demo_cli for obviously-safe commands (it
+# shares the string classifier's frontier by design - obfuscation is the syscall
+# guard's job, not this).
+if [ -n "$BASH_VERSION" ] && command -v demo_cli >/dev/null 2>&1; then
+  case $- in *i*) shopt -s extdebug 2>/dev/null ;; esac
+  __demo_cli_shell_guard() {
+    case "$BASH_COMMAND" in
+      # Skip the `eval '<cmd>' < /dev/null` wrapper Claude Code !-mode uses:
+      # eval re-fires the DEBUG trap on its EXPANSION (the real command), which
+      # is handled there exactly once. Processing the wrapper too = double
+      # snapshot. (guard-shell keeps an eval-unwrap for direct/test calls.)
+      demo_cli*|__demo_cli_shell_guard*|eval\ *) return 0 ;;
+      *rm\ *|*rmdir*|*mkfs*|*shred*|*truncate*|*\ dd\ *|*git\ *|*Remove-Item*|*\>\ *|*DROP\ *|*TRUNCATE\ *|*DELETE\ FROM*|*shutil.rmtree*)
+        if ! demo_cli guard-shell "$BASH_COMMAND"; then
+          echo "demo_cli: blocked \"$BASH_COMMAND\" before it ran." >&2
+          case $- in
+            *i*) return 1 ;;                           # interactive: skip, keep the shell
+            *)   kill -TERM $$ 2>/dev/null; exit 1 ;;  # non-interactive (!-mode): terminate
+          esac
+        fi ;;
+      *) return 0 ;;
+    esac
+  }
+  trap '__demo_cli_shell_guard' DEBUG
+fi
+# <<< demo_cli shell guard <<<
+'''
+
+
+def cmd_guard_shell(a) -> int:
+    """(internal) Evaluate a raw shell command (e.g. from a bash DEBUG trap) so
+    commands that bypass the PreToolUse hook - Claude Code `!` mode, or direct
+    shell use - still get classified, snapshotted, and gated. In enforce mode a
+    blocking decision returns exit 1, which under `shopt -s extdebug` aborts the
+    command. Fail-open on our own errors: never brick the user's shell."""
+    import re
+    from .guard import Guard
+    from .context import Intent
+    command = " ".join(getattr(a, "argv", None) or []).strip()
+    # Claude Code `!`-mode delivers the command wrapped as `eval '<cmd>' < /dev/null`.
+    # classify would flag the `eval` as opaque execution and block everything;
+    # unwrap it so we judge the real command. (The DEBUG trap also re-fires on
+    # eval's expansion, so a destructive inner command is caught either way.)
+    m = re.match(r"""^\s*eval\s+(['"])(.*)\1\s*(?:<\s*\S+\s*)*$""", command, re.S)
+    if m:
+        command = m.group(2).strip()
+    if not command or command.startswith("demo_cli") or "guard-shell" in command:
+        return 0
+    try:
+        guard = Guard(config=load_config())
+        result = guard.evaluate(command, intent=Intent(reasoning="shell/!-mode"),
+                                agent_id="shell", session_id="bang-mode")
+    except Exception as exc:
+        sys.stderr.write(f"demo_cli: shell-guard internal error, stepping aside ({exc})\n")
+        return 0
+    if guard.mode != "enforce":
+        if result.decision.is_blocking:
+            sys.stderr.write(f"demo_cli [shadow/shell] {result.decision.decision}: {result.decision.reason}\n")
+        elif result.recovery_entry:
+            rid = result.recovery_entry.get("id", "")
+            sys.stderr.write(f"demo_cli [shadow/shell] snapshot {rid}; undo: demo_cli undo {rid}\n")
+        return 0
+    if result.decision.is_blocking:
+        sys.stderr.write(f"demo_cli ⛔ shell-guard blocked: {result.decision.reason}\n")
+        return 1
+    if result.recovery_entry:
+        rid = result.recovery_entry.get("id", "")
+        sys.stderr.write(f"demo_cli ✅ shell-guard snapshot {rid}; undo: demo_cli undo {rid}\n")
+    return 0
+
+
+def cmd_install_shell_guard(a) -> int:
+    if getattr(a, "print", False):
+        print(_SHELL_GUARD_SNIPPET)
+        return 0
+    script = os.path.expanduser("~/.demo_cli_shellguard.sh")
+    with open(script, "w", encoding="utf-8") as f:
+        f.write(_SHELL_GUARD_SNIPPET)
+    rc = os.path.expanduser("~/.bashrc")
+    marker = "demo_cli_shellguard.sh"
+    already = os.path.exists(rc) and marker in open(rc, encoding="utf-8").read()
+    if not already:
+        with open(rc, "a", encoding="utf-8") as f:
+            # BASH_ENV makes a NON-interactive `bash -c` (Claude Code !-mode,
+            # which does not read ~/.bashrc) source the guard. We deliberately do
+            # NOT `source` it into the interactive shell: guarding the human's own
+            # prompt is out of scope (demo_cli gates the agent, not the user) and
+            # would fire the trap on ordinary interactive commands.
+            f.write(
+                f"\n# demo_cli shell guard (gates non-interactive bash -c, e.g. Claude Code !-mode)\n"
+                f"export BASH_ENV={script}\n")
+    print(f"Wrote {script}")
+    print(f"{'Already configured' if already else 'Set BASH_ENV'} in {rc} "
+          "(gates non-interactive `bash -c` / !-mode; the interactive shell is left alone).")
+    print("Relaunch Claude Code from a NEW terminal so !-mode inherits BASH_ENV.")
+    return 0
+
+
+def cmd_egress(a) -> int:
+    """Start the egress guard: an mitmproxy addon that gates destructive external
+    / SaaS API calls on the network wire. Shells out to the installed `mitmdump`
+    (demo_cli never imports mitmproxy), mirroring how recovery.py uses pg_dump."""
+    import shutil
+    mitm = shutil.which("mitmdump")
+    if not mitm:
+        print("mitmdump not found. Install it (external tool, not bundled):")
+        print("  pipx install mitmproxy      # then re-run demo_cli egress")
+        return 1
+    here = os.path.dirname(os.path.abspath(__file__))       # .../<pkgparent>/demo_cli
+    loader = os.path.join(here, "egress_addon.py")          # thin package-aware entry
+    pkg_parent = os.path.dirname(here)                       # so `import demo_cli` works
+    port = getattr(a, "port", 8080)
+    mode = "enforce" if getattr(a, "enforce", False) else load_config().mode
+    ca = os.path.expanduser("~/.mitmproxy/mitmproxy-ca-cert.pem")
+    print(render.c(f"\ndemo_cli egress guard  (mode={mode}, port={port})\n", "dim"))
+    print("1) point the agent's traffic at the proxy:")
+    print(f"     export HTTPS_PROXY=http://localhost:{port}  HTTP_PROXY=http://localhost:{port}")
+    print("2) let it read TLS by trusting mitmproxy's CA (first run generates it):")
+    print(f"     export REQUESTS_CA_BUNDLE={ca}   NODE_EXTRA_CA_CERTS={ca}")
+    print("3) relaunch the agent from that shell. Ctrl-C here stops the guard.\n")
+    # mitmdump runs its OWN Python; add demo_cli's location so the addon imports.
+    env = dict(os.environ, DEMO_CLI_EGRESS_MODE=mode,
+               PYTHONPATH=pkg_parent + os.pathsep + os.environ.get("PYTHONPATH", ""))
+    os.execve(mitm, [mitm, "-s", loader, "--listen-port", str(port), "-q"], env)
+
+
+def cmd_run(a) -> int:
+    """Run a command under the behavioral (syscall) guard [Linux only].
+
+    Complements the pre-execution string guard: it does not read the command
+    text, it watches the syscalls, so obfuscated / indirected destruction that
+    the classifier misses is still snapshotted before it happens.
+    """
+    argv = [t for t in (getattr(a, "argv", None) or []) if t != "--"]
+    if not argv:
+        print("usage: demo_cli run [--deny] <command> [args...]")
+        return 1
+    try:
+        from .syscall_guard import run_supervised
+        return run_supervised(argv, config=load_config(), deny=getattr(a, "deny", False))
+    except RuntimeError as exc:  # e.g. non-Linux
+        print(f"demo_cli run: {exc}")
+        return 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -489,9 +675,13 @@ def build_parser() -> argparse.ArgumentParser:
     it.add_argument("--force", action="store_true")
     it.set_defaults(func=cmd_init)
 
-    ih = sub.add_parser("install-hook", parents=[common], help="wire the safety hook into Claude Code or Cursor")
+    ih = sub.add_parser("install-hook", parents=[common],
+                        help="wire the safety hook into Claude Code, Cursor, or Codex")
     ih.add_argument("--cursor", action="store_true",
                     help="install the Cursor beforeShellExecution hook (into .cursor/hooks.json) "
+                         "instead of the Claude Code PreToolUse hook")
+    ih.add_argument("--codex", action="store_true",
+                    help="install the Codex PreToolUse hook (into .codex/hooks.json) "
                          "instead of the Claude Code PreToolUse hook")
     ih.add_argument("--scope", choices=("project", "global"), default="project")
     ih.add_argument("--print", action="store_true", help="print the settings snippet instead of writing")
@@ -503,6 +693,34 @@ def build_parser() -> argparse.ArgumentParser:
     hc = sub.add_parser("hook-cursor", parents=[common],
                         help="(internal) Cursor beforeShellExecution entrypoint; reads JSON on stdin")
     hc.set_defaults(func=cmd_hook_cursor)
+
+    hx = sub.add_parser("hook-codex", parents=[common],
+                        help="(internal) Codex PreToolUse entrypoint; reads JSON on stdin")
+    hx.set_defaults(func=cmd_hook_codex)
+
+    rn = sub.add_parser("run", parents=[common],
+                        help="run a command under the behavioral (syscall) guard [Linux]")
+    rn.add_argument("--deny", action="store_true",
+                    help="block destructive syscalls instead of snapshot-then-allow")
+    rn.add_argument("argv", nargs=argparse.REMAINDER,
+                    help="the command to run under the guard (e.g. demo_cli run rm -rf ./x)")
+    rn.set_defaults(func=cmd_run)
+
+    isg = sub.add_parser("install-shell-guard", parents=[common],
+                         help="gate `!`-mode / direct shell commands via a bash DEBUG-trap [bash]")
+    isg.add_argument("--print", action="store_true", help="print the snippet instead of installing")
+    isg.set_defaults(func=cmd_install_shell_guard)
+
+    gs = sub.add_parser("guard-shell", parents=[common],
+                        help="(internal) evaluate a raw shell command; used by the shell-guard DEBUG trap")
+    gs.add_argument("argv", nargs=argparse.REMAINDER)
+    gs.set_defaults(func=cmd_guard_shell)
+
+    eg = sub.add_parser("egress", parents=[common],
+                        help="gate destructive external/SaaS API calls via an HTTP proxy (needs mitmdump)")
+    eg.add_argument("--port", type=int, default=8080, help="proxy listen port (default 8080)")
+    eg.add_argument("--enforce", action="store_true", help="block/review destructive calls (else shadow)")
+    eg.set_defaults(func=cmd_egress)
 
     return p
 

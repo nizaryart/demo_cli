@@ -42,7 +42,11 @@ _DESTRUCTIVE_RULES = [
     # start of the segment (like the operand extractor) so subcommands such as
     # `git rm`, `docker rm`, `npm rm` do NOT match - those are not local-file
     # deletions and would only produce false escalations.
-    ("rm_local", "shell", r"^\s*(?:sudo\s+)?rm\b[^|;&]*"),
+    # Leading `NAME=value ` env-var assignments (a shell prefix) are allowed
+    # before rm, so `X=1 rm app.db` is caught like `rm app.db` (#006). Only
+    # assignment tokens are permitted - an arbitrary word prefix is NOT, so
+    # `git rm` / `docker rm` / `npm rm` still do not match.
+    ("rm_local", "shell", r"^\s*(?:[A-Za-z_]\w*=\S*\s+)*(?:sudo\s+)?rm\b[^|;&]*"),
     # PowerShell recursive-force delete: Remove-Item (alias `ri`) carrying BOTH a
     # Recurse-like flag and a Force-like flag, in any order, full or abbreviated
     # (-Recurse/-rec/-r and -Force/-fo/-f). The two lookaheads disambiguate
@@ -55,6 +59,13 @@ _DESTRUCTIVE_RULES = [
     # path (see decide.py for the still-unrecovered hard-stop).
     ("ps_remove_item_rf", "shell",
      r"\b(?:Remove-Item|ri)\b(?=[^|;&]*\s-r[a-z]*\b)(?=[^|;&]*\s-f[a-z]*\b)[^|;&]*"),
+    # Any top-level Remove-Item (alias `ri`) - the PowerShell twin of rm_local.
+    # Closes the parity gap: `Remove-Item app.db` and `Remove-Item -Recurse x`
+    # (no -Force) were previously missed on Windows while `rm app.db` was caught
+    # on POSIX. Recoverable (recovery.py resolves the -Path/-LiteralPath/
+    # positional operand and snapshots it), so NOT in _LOCAL_UNRECOVERABLE.
+    # Listed AFTER ps_remove_item_rf so the -Recurse -Force nuke keeps its id.
+    ("ps_remove_item", "shell", r"^\s*(?:Remove-Item|ri)\b[^|;&]*"),
     ("rmdir_s", "shell", r"\brmdir\b.*\/[sS]"),
     ("del_force", "shell", r"\bdel\b.*\/[fFsS]"),
     ("mv_overwrite", "shell", r"\bmv\s+(?:-[a-z]*f[a-z]*\s+)?\S+\s+\S+"),
@@ -66,8 +77,33 @@ _DESTRUCTIVE_RULES = [
     ("fs_shred", "shell", r"\bshred\b"),
     ("fs_truncate", "shell", r"\btruncate\b[^|;&]*\s-s\b"),
     ("fs_dd_of", "shell", r"\bdd\b[^|;&]*\bof=\S+"),
+    # Filesystem format: mkfs / mkfs.<fstype> wipes an entire device. Placed with
+    # the other fs_ destroyers; marked non-recoverable below (a whole-device
+    # format cannot be honestly snapshotted).
+    ("fs_mkfs", "shell", r"\bmkfs(?:\.\w+)?\b"),
     ("fs_find_delete", "shell", r"\bfind\b[^|;&]*\s-delete\b"),
     ("git_clean", "git", r"\bgit\s+clean\b[^|;&]*-[a-z]*d"),
+    # Destructive git that loses work / rewrites history / prunes recovery. NOT
+    # "all git" - read-only and normal-flow git (status/diff/log/add/commit/
+    # push/pull/checkout <branch>) is deliberately left alone to keep the
+    # perimeter honest and avoid flooding review. Each has no local file operand,
+    # so decide.py escalates them (no snapshot to stand behind).
+    ("git_worktree_remove", "git", r"\bgit\s+worktree\s+remove\b[^|;&]*(?:--force|\s-f)\b"),
+    # branch delete: only -D (force) is destructive; -d refuses on unmerged work,
+    # so it is SAFE. Match a capital D case-sensitively via (?-i:...) even though
+    # the table is compiled with re.I - so `-d` is NOT swept in.
+    ("git_branch_delete", "git", r"\bgit\s+branch\b[^|;&]*\s(?-i:-\w*D\w*)\b"),
+    ("git_checkout_discard", "git", r"\bgit\s+checkout\b[^|;&]*?(?:\s--\s|\s\.(?:\s|$))"),
+    ("git_restore", "git", r"\bgit\s+restore\b"),
+    ("git_stash_drop", "git", r"\bgit\s+stash\s+(?:drop|clear)\b"),
+    # `git stash pop` applies then drops the stash; a conflict during apply can
+    # leave the working tree mangled and the stash consumed. Real incident
+    # (raw-data #009b). `git stash apply` is left alone - it keeps the stash.
+    ("git_stash_pop", "git", r"\bgit\s+stash\s+pop\b"),
+    ("git_reflog_expire", "git", r"\bgit\s+reflog\s+expire\b"),
+    ("git_gc_prune", "git", r"\bgit\s+gc\b[^|;&]*--prune=\S+"),
+    ("git_filter_branch", "git", r"\bgit\s+filter-(?:branch|repo)\b"),
+    ("git_update_ref_delete", "git", r"\bgit\s+update-ref\s+-d\b"),
 ]
 _DESTRUCTIVE = [(rid, a, re.compile(rx, re.I | re.S)) for rid, a, rx in _DESTRUCTIVE_RULES]
 
@@ -111,6 +147,7 @@ _EXTERNAL_IRREVERSIBLE = {
 _LOCAL_UNRECOVERABLE = {
     "rmdir_s": "recursive_force_delete",
     "del_force": "recursive_force_delete",
+    "fs_mkfs": "disk_format",
 }
 
 # Opaque remote execution: code is fetched and run in one step. It cannot be
@@ -149,7 +186,8 @@ _NONRECOVERABLE_SURFACES = [
     ("external_payment", r"\b(stripe|paypal|braintree)\b[^|;&]*\b(charge|refund|payout|capture)\b"),
     ("external_message", r"\b(slack|discord|twilio)\b[^|;&]*\b(post|send|message|webhook)\b"
                          r"|hooks\.slack\.com|chat\.postMessage"),
-    ("vcs_remote_state", r"\b(gh|hub)\s+(pr|issue|release)\s+(close|merge|delete|create)\b"),
+    ("vcs_remote_state", r"\b(gh|hub)\s+(pr|issue|release)\s+(close|merge|delete|create)\b"
+                         r"|\bgh\s+repo\s+delete\b|\bgh\s+api\b[^|;&]*-X\s*(?:DELETE|PUT)\b"),
     ("credential_rotation", r"\brotat(?:e|ing)\b[^|;&]*\b(key|secret|credential|token)\b"
                             r"|\b(?:aws\s+iam|gcloud\s+iam|az\s+role)\b"),
     ("secret_write", r"\b(vault|aws\s+secretsmanager|aws\s+ssm)\b[^|;&]*\b(put|write|delete|set)\b"),
@@ -158,6 +196,19 @@ _NONRECOVERABLE_SURFACES = [
     ("remote_filesystem", r"\bssh\b[^|;&]*\brm\b|\brsync\b[^|;&]*--delete\b"),
     ("schema_migration", r"\b(alembic|flyway|liquibase|prisma\s+migrate|knex\s+migrate|sequelize\s+db:migrate)\b"
                          r"|\brails\s+db:migrate\b|\bmanage\.py\s+migrate\b"),
+    # Content / deploy SaaS CLIs (Approach A) - the always-on string-layer twin of
+    # the egress guard. Narrow, DESTRUCTIVE-SUBCOMMAND-ONLY (like git -d/-D): never
+    # the whole tool, never the read/preview forms. External -> escalate.
+    ("saas_deploy", r"\bshopify\s+theme\s+(?:push|delete)\b"
+                    r"|\bvercel\s+(?:remove|rm)\b|\bvercel\b[^|;&]*--prod\b"
+                    r"|\bnetlify\s+deploy\b[^|;&]*--prod\b|\bnetlify\s+sites:delete\b"
+                    r"|\bfirebase\s+(?:hosting:disable|firestore:delete)\b"
+                    r"|\bwrangler\b[^|;&]*\bdelete\b"),
+    ("saas_cms", r"\bwp\s+(?:db\s+(?:reset|drop)|site\s+empty|post\s+delete|user\s+delete|option\s+delete)\b"
+                 r"|\bcontentful\s+space\s+delete\b|\bcontentful\b[^|;&]*\bentry\b[^|;&]*\bdelete\b"),
+    ("paas_destroy", r"\bheroku\s+(?:apps:destroy|pg:reset)\b"
+                     r"|\bsupabase\s+db\s+reset\b"
+                     r"|\bfly(?:ctl)?\s+(?:apps\s+destroy|destroy)\b"),
 ]
 _NONRECOVERABLE = [(label, re.compile(rx, re.I)) for label, rx in _NONRECOVERABLE_SURFACES]
 
@@ -213,6 +264,73 @@ def split_segments(cmd: str) -> List[str]:
     return [s.strip() for s in segments if s.strip()]
 
 
+def redirect_target(cmd: str) -> Optional[str]:
+    """Return the file a truncating output redirection ('> file') overwrites, or
+    None. Quote- and escape-aware (the same technique as split_segments): a '>'
+    inside quotes or backslash-escaped is literal text, not the operator, so
+    `echo "a>b"` is safe while `echo "a>b" > app.db` targets app.db. Skips '>>'
+    (append), fd-prefixed redirects (2> &>), and /dev/* sinks. Shared by
+    _classify_segment (is it destructive?) and recovery.extract_path_operand
+    (what to snapshot), so the two never disagree."""
+    n = len(cmd)
+    i = 0
+    quote = None
+    while i < n:
+        ch = cmd[i]
+        if quote:
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            continue
+        if ch == "\\":                       # escaped char is literal
+            i += 2
+            continue
+        if ch == ">":
+            nxt = cmd[i + 1] if i + 1 < n else ""
+            prev = cmd[i - 1] if i > 0 else ""
+            if nxt == ">":                   # '>>' append - not destructive
+                i += 2
+                continue
+            if prev.isdigit() or prev == "&":  # 2> / &> fd-prefixed - out of scope
+                i += 1
+                continue
+            # Read the target token, quote-aware, skipping spaces and a leading
+            # '|' (the '>|' noclobber-override form).
+            j = i + 1
+            while j < n and cmd[j] in " \t|":
+                j += 1
+            q = None
+            buf: List[str] = []
+            while j < n:
+                c = cmd[j]
+                if q:
+                    if c == q:
+                        q = None
+                    else:
+                        buf.append(c)
+                    j += 1
+                    continue
+                if c in ("'", '"'):
+                    q = c
+                    j += 1
+                    continue
+                if c in " \t|;&<>\n":
+                    break
+                buf.append(c)
+                j += 1
+            tgt = "".join(buf)
+            if not tgt or tgt.startswith("/dev/"):
+                i += 1                       # sink or empty - keep scanning
+                continue
+            return tgt
+        i += 1
+    return None
+
+
 # --------------------------------------------------------------------------
 # Classification result
 # --------------------------------------------------------------------------
@@ -244,6 +362,14 @@ def _classify_segment(cmd: str) -> dict:
         if rx.search(cmd):
             matched, atype = rid, action_type
             break
+
+    # Fallback: a truncating output redirection ('> file') has no command verb
+    # for the regex rules above to catch, but it overwrites the file from byte 0.
+    # Only fires when no stronger rule already matched. Recoverable (the target
+    # is snapshotted via recovery.extract_path_operand), so it is NOT added to
+    # _LOCAL_UNRECOVERABLE.
+    if matched is None and redirect_target(cmd):
+        matched, atype = "fs_redirect_truncate", "shell"
 
     is_sql_read = bool(_SQL_READ.search(cmd))
     is_sql_mutating = bool(_SQL_MUTATING.search(cmd))

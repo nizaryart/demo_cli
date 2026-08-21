@@ -20,7 +20,7 @@ from typing import List, Optional, Tuple
 import os
 
 from . import approval, preview as preview_mod, recovery
-from .classify import Classification, classify_pipeline, is_sql_preview_candidate
+from .classify import Classification, classify_pipeline, is_sql_preview_candidate, redirect_target
 from .config import Config, load_config
 from .context import Context, Intent, build_context, compare_intent
 from .decide import (ALLOW, ASK, BLOCKING, CONTEXT_MISMATCH, DRY_RUN, ESCALATE,
@@ -84,6 +84,16 @@ class Guard:
 
         c = classify_pipeline(command)
 
+        # A redirection to a file that does NOT yet exist CREATES it - there is
+        # nothing to truncate, so it is not destructive. classify.py is
+        # filesystem-blind (string only), so correct that here where we can stat.
+        if c.matched_rule == "fs_redirect_truncate":
+            rt = redirect_target(command)
+            if not rt or not os.path.exists(os.path.abspath(rt)):
+                c.is_destructive = False
+                c.is_mutating = False
+                c.matched_rule = None
+
         # The concrete file list an rm / mv will touch (brace/glob-expanded),
         # surfaced so the preview can PRINT it - the file count the agent was
         # actually asking for (claude-code#76626). Empty for non rm / mv.
@@ -112,6 +122,18 @@ class Guard:
                     target_path = ap
 
         target = recovery.resolve_target(command, explicit_db, db_url, target_path)
+
+        # Trou #004: refuse a PARTIAL snapshot. For a filesystem delete/move whose
+        # full operand set we could NOT resolve to an in-root capture (multiple
+        # targets, or $()/backtick/globstar expansion we cannot evaluate), the
+        # operand extractor returns None. resolve_target may still find a stray
+        # .db name - but that covers only PART of what the command destroys. A
+        # partial snapshot dressed up as REVERSIBLE is the exact lie this tool
+        # exists to prevent, so drop the target and let the mutation escalate
+        # honestly instead of claiming a recovery we did not fully take.
+        if target_path is None and target is not None and recovery.is_fs_delete(command):
+            target = None
+
         label = target.label if target else None
 
         # Declared-first environment: config target match feeds the context.

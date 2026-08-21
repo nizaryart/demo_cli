@@ -51,6 +51,25 @@ def posture(disposition: str) -> str:
 
 INVARIANT = "mutating_actions_must_be_recoverable_and_match_the_declared_context"
 
+# Approach B: external surfaces aren't locally recoverable, but the PROVIDER
+# usually keeps its own version history. Concise "where to restore" pointers -
+# destinations only, no UI steps/URLs (those go stale). Generic fallback below.
+_RECOVERY_HINTS = {
+    "saas_deploy": "deploy rollback / previous theme version",
+    "saas_cms": "page/post version history or trash",
+    "paas_destroy": "DB backups (PITR) or release rollback",
+    "object_storage": "bucket versioning, if enabled",
+    "remote_database": "the database's PITR / snapshot",
+    "vcs_remote_state": "branch/tag protection or a fresh clone's reflog",
+    "external_payment": "the provider dashboard (refund/void) - not always possible",
+    "schema_migration": "the migration tool's downgrade",
+    "remote_vcs_history": "a teammate's un-force-pushed clone or the remote's reflog",
+}
+
+
+def _recovery_hint(surface: Optional[str]) -> str:
+    return _RECOVERY_HINTS.get(surface or "", "its version history / rollback")
+
 
 @dataclass
 class Decision:
@@ -116,6 +135,7 @@ def decide(
             next_steps=[
                 "Confirm the external effect is intended and authorised.",
                 "Supply a structural approval token, or perform it outside the agent.",
+                f"If it already ran, restore from the provider: {_recovery_hint(c.nonrecoverable_surface)}.",
             ],
         )
 
