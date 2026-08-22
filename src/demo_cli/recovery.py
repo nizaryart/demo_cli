@@ -16,6 +16,7 @@ import datetime
 import json
 import os
 import re
+import shlex
 import glob as _glob
 import shutil
 import subprocess
@@ -23,7 +24,7 @@ import uuid
 from dataclasses import dataclass
 from typing import List, Optional
 
-from .classify import redirect_target
+from .classify import POSIX, join_continuations, redirect_target
 from .context import redact
 
 _PG_URL = re.compile(r"\bpostgres(?:ql)?://\S+", re.I)
@@ -182,6 +183,31 @@ def _expand_braces(token: str) -> List[str]:
     return result
 
 
+def _tokenize(cmd: str) -> List[str]:
+    """Split a command line into words the way a shell would - respecting quotes.
+
+    `cmd.split()` cuts on whitespace and knows nothing about quotes, so
+
+        Remove-Item -Recurse -Force "C:\\Program Files\\MyApp"
+        rm -rf "/home/nizar/my project"
+
+    each became TWO operands, the target could not be pinned down, and nothing
+    was snapshotted. That is not a Windows bug - it is every path containing a
+    space, on every platform.
+
+    shlex is Python's shell lexer. POSIX mode keeps a quoted path whole AND
+    leaves Windows backslashes alone (inside double quotes a backslash is only
+    special before a few characters, and a drive letter is not one of them).
+
+    shlex raises on unbalanced quotes. A malformed command must degrade to the
+    old behaviour, never crash the guard - same fail-open rule as the hooks.
+    """
+    try:
+        return shlex.split(cmd)
+    except ValueError:
+        return cmd.strip().split()
+
+
 def _path_operands(cmd: str) -> List[str]:
     """Crude operand extraction: drop the leading command word(s) and any flags,
     keep the rest as candidate paths. Not a shell parser - good enough to find
@@ -195,7 +221,7 @@ def _path_operands(cmd: str) -> List[str]:
     them ourselves is the only way to know what the command will actually
     destroy - which is also, exactly, the thing the user needed to see.
     """
-    toks = cmd.strip().split()
+    toks = _tokenize(cmd)
     i = 0
     # Skip the shell prefix: leading env-var assignments and sudo come BEFORE the
     # command word. (After the command word, `X=1` would be a real filename, so
@@ -239,7 +265,7 @@ def _ps_remove_item_operand(cmd: str) -> Optional[str]:
     """
     if not _PS_REMOVE_RE.search(cmd):
         return None
-    tokens = cmd.strip().split()[1:]  # drop the leading Remove-Item / ri
+    tokens = _tokenize(cmd)[1:]  # drop the leading Remove-Item / ri
     targets: List[str] = []
     i = 0
     while i < len(tokens):
@@ -316,7 +342,7 @@ def expanded_operands(cmd: str) -> List[str]:
     return [p for p in _path_operands(cmd) if os.path.exists(p)]
 
 
-def extract_path_operand(cmd: str) -> Optional[str]:
+def extract_path_operand(cmd: str, dialect: str = POSIX) -> Optional[str]:
     """Return the filesystem path an rm / mv will affect, or None.
 
     Honesty rule (the invariant): never snapshot a SUBSET and imply full
@@ -354,6 +380,9 @@ def extract_path_operand(cmd: str) -> Optional[str]:
       after the snapshot. Immediately after the rm (the flagship flow) this is a
       non-issue; the window only matters if other writes land before undo.
     """
+    # A command written across two lines is still one command; fold it before
+    # looking for operands, or the path on the second line is simply not seen.
+    cmd = join_continuations(cmd, dialect)
     if _RM_RE.search(cmd):
         # Collect every operand BEFORE deciding anything. Filtering to
         # os.path.exists() first and only then counting was the bug: an

@@ -223,13 +223,71 @@ _SQL_TRUNCATE = re.compile(r"\bTRUNCATE\b", re.I)
 # Pipeline splitting
 # --------------------------------------------------------------------------
 
-def split_segments(cmd: str) -> List[str]:
+# --------------------------------------------------------------------------
+# Shell dialects
+# --------------------------------------------------------------------------
+#
+# bash and PowerShell agree that a command can continue on the next line, and
+# disagree on how to write it. The character is not interchangeable: a trailing
+# backtick in bash opens a command substitution, and a trailing backslash in
+# PowerShell is a literal backslash ending the command. Joining on the wrong one
+# would MERGE two separate commands, which can stop an anchored rule such as
+# rm_local (`^\s*rm`) from matching - a silent miss, the worst outcome. So the
+# caller states which shell the text came from; this module never guesses.
+POSIX = "posix"
+POWERSHELL = "powershell"
+_CONTINUATION = {POSIX: "\\", POWERSHELL: "`"}
+
+
+def join_continuations(cmd: str, dialect: str = POSIX) -> str:
+    """Fold a multi-line command back into one line.
+
+        bash            rm -rf \\        PowerShell     Remove-Item `
+                          /tmp/build                        -Recurse C:\\build
+
+    Both are ONE command. Without this, split_segments treats the newline as a
+    separator, cuts the command in two, and the operand extractor loses the path
+    that lives on the second line - so nothing is snapshotted. Present in bash
+    today, not only in PowerShell.
+
+    Idempotent: joining an already-joined string changes nothing.
+
+    Windows line endings are normalised first. Without that, the look-ahead
+    below meets the CR of a CRLF pair, decides this is not end-of-line, and the
+    whole fix silently does nothing on the one platform it was written for.
+    """
+    cmd = cmd.replace("\r\n", "\n")
+    ch = _CONTINUATION.get(dialect, "\\")
+    out: List[str] = []
+    i, n = 0, len(cmd)
+    while i < n:
+        c = cmd[i]
+        if c == ch:
+            # A continuation only counts at end of line: skip trailing blanks
+            # and require a newline immediately after.
+            j = i + 1
+            while j < n and cmd[j] in " \t":
+                j += 1
+            if j < n and cmd[j] == "\n":
+                out.append(" ")          # keep a word boundary where the join was
+                i = j + 1
+                continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def split_segments(cmd: str, dialect: str = POSIX) -> List[str]:
     """Split a command line on shell separators (| || && ; newline) while
     respecting single and double quotes. Returns trimmed, non-empty segments.
 
     This is a pragmatic splitter, not a full shell parser; it exists so a
     destructive step hidden after a safe one in a chain is still classified.
+
+    Line continuations are folded first, so a command written across two lines
+    is judged as the single command it is.
     """
+    cmd = join_continuations(cmd, dialect)
     segments: List[str] = []
     buf: List[str] = []
     quote = None
@@ -318,8 +376,8 @@ def redirect_target(cmd: str) -> Optional[str]:
                     q = c
                     j += 1
                     continue
-                if c in " \t|;&<>\n":
-                    break
+                if c in " \t|;&<>\n\r":
+                    break                       # \r: CRLF, or the name absorbs it
                 buf.append(c)
                 j += 1
             tgt = "".join(buf)
@@ -428,12 +486,13 @@ def classify(cmd: str) -> Classification:
     )
 
 
-def classify_pipeline(cmd: str) -> Classification:
+def classify_pipeline(cmd: str, dialect: str = POSIX) -> Classification:
     """Classify a possibly chained / piped command. Each segment is classified
     on its own and the pipeline inherits the strongest signal. Opaque remote
     execution is detected on the full string because the pipe *is* the payload.
     """
-    segments = split_segments(cmd)
+    cmd = join_continuations(cmd, dialect)
+    segments = split_segments(cmd, dialect)
     seg_results = [_classify_segment(seg) for seg in segments]
     if not seg_results:
         seg_results = [_classify_segment(cmd)]

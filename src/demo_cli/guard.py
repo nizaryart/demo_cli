@@ -20,7 +20,8 @@ from typing import List, Optional, Tuple
 import os
 
 from . import approval, preview as preview_mod, recovery
-from .classify import Classification, classify_pipeline, is_sql_preview_candidate, redirect_target
+from .classify import (POSIX, Classification, classify_pipeline,
+                       is_sql_preview_candidate, redirect_target)
 from .config import Config, load_config
 from .context import Context, Intent, build_context, compare_intent
 from .decide import (ALLOW, ASK, BLOCKING, CONTEXT_MISMATCH, DRY_RUN, ESCALATE,
@@ -78,11 +79,16 @@ class Guard:
         approval_token: Optional[str] = None,
         agent_id: str = "unknown",
         session_id: str = "unknown",
+        dialect: str = POSIX,
     ) -> GuardResult:
+        """`dialect` says which shell wrote this text - POSIX or POWERSHELL.
+        It decides how line continuations are folded, and the two spellings are
+        not interchangeable (see classify.join_continuations). The adapters know
+        it from the tool name; everything else keeps the POSIX default."""
         intent = intent or Intent()
         command = command.strip()
 
-        c = classify_pipeline(command)
+        c = classify_pipeline(command, dialect)
 
         # A redirection to a file that does NOT yet exist CREATES it - there is
         # nothing to truncate, so it is not destructive. classify.py is
@@ -105,7 +111,7 @@ class Guard:
         # project root so we never try to copy a home/system tree, and honest
         # about multi-path rm (extract_path_operand returns None -> escalate).
         if not target_path and not explicit_db and not db_url:
-            cand = recovery.extract_path_operand(command)
+            cand = recovery.extract_path_operand(command, dialect)
             if cand:
                 ap = os.path.abspath(cand)
                 root = os.path.abspath(self.config.project_root or os.getcwd())

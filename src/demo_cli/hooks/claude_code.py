@@ -29,6 +29,7 @@ import os
 import sys
 from typing import Dict
 
+from ..classify import POSIX, POWERSHELL
 from ..config import load_config
 from ..context import Intent
 from ..guard import Guard
@@ -116,11 +117,15 @@ def run_pretooluse(stdin, stdout) -> int:
             command = (tool_input.get("command") or "").strip()
             if not command:
                 return 0
+            # Claude Code fires the same event shape for both shells, and the
+            # tool name is the only reliable signal of which one wrote the text.
+            # A Windows box can run either, so os.name is NOT a safe guess.
             result = guard.evaluate(
                 command,
                 intent=Intent(reasoning=description),
                 agent_id=data.get("agent_id", "claude-code"),
                 session_id=data.get("session_id", "unknown"),
+                dialect=POWERSHELL if tool_name == "PowerShell" else POSIX,
             )
         else:
             # Edit / Write / MultiEdit -> file_path ; NotebookEdit -> notebook_path
