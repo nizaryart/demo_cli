@@ -205,6 +205,7 @@ def _hook_selftest(tool_name: str, command: str) -> bool:
     exist - and running it once per shell tool is what catches a Windows
     install where only the Bash matcher got registered (PowerShell commands
     would otherwise silently skip the hook)."""
+    import contextlib
     import io
     import json
     import os
@@ -237,7 +238,14 @@ def _hook_selftest(tool_name: str, command: str) -> bool:
         }
 
         output = io.StringIO()
-        run_pretooluse(io.StringIO(json.dumps(payload)), output)
+        # Swallow the hook's stderr. It is a real run, so it emits the loud
+        # "recovery point captured, undo with demo_cli undo <id>" banner - but
+        # the canary lives in a temp directory that is deleted immediately, so
+        # printing it would tell the user to undo something that no longer
+        # exists, and would greet anyone running `doctor` for reassurance with
+        # two alarming messages about deletions they never made.
+        with contextlib.redirect_stderr(io.StringIO()):
+            run_pretooluse(io.StringIO(json.dumps(payload)), output)
 
         raw = output.getvalue().strip()
         if not raw:

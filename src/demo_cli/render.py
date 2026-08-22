@@ -311,9 +311,13 @@ def _entry_size_safe(e) -> int:
 def render_doctor(checks, version: str) -> None:
     out = ["", c(f"demo_cli {version}", "dim") + "  doctor", ""]
     glyphs = {"ok": ("[+]", "green"), "warn": ("[!]", "yellow"), "fail": ("[x]", "red")}
+    # Size the label column to the longest label actually present. A fixed 26
+    # silently fused the columns for "hook self-test (PowerShell)", which is 27
+    # characters - in the one report a user reads when something is wrong.
+    width = max((len(label) for _, label, _ in checks), default=26) + 2
     for status, label, detail in checks:
         g, col = glyphs.get(status, ("[?]", "gray"))
-        line = "  " + c(g, col) + " " + label.ljust(26) + c(detail, "dim")
+        line = "  " + c(g, col) + " " + label.ljust(width) + c(detail, "dim")
         out.append(line)
     fails = sum(1 for s, _, _ in checks if s == "fail")
     warns = sum(1 for s, _, _ in checks if s == "warn")
