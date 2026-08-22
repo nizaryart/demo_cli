@@ -310,6 +310,90 @@ def _ps_remove_item_operand(cmd: str) -> Optional[str]:
     return target
 
 
+# The PowerShell cmdlets that overwrite or empty ONE named file, and the ones
+# that clobber a DESTINATION. Kept separate from Remove-Item's reader, which has
+# its own tested behaviour we do not want to disturb.
+_PS_CONTENT_RE = re.compile(r"^\s*(?:Clear-Content|clc|Set-Content|Out-File|New-Item)\b", re.I)
+_PS_DEST_RE = re.compile(r"^\s*(?:Move-Item|Copy-Item|Rename-Item)\b", re.I)
+
+_PS_DEST_FLAGS = {"-destination", "-newname"}
+# Flags whose NEXT token is a value, not a path. Without this list
+# `Set-Content -Path x -Value "hello"` yields two candidate targets and looks
+# ambiguous, so a perfectly ordinary overwrite would escalate instead of being
+# snapshotted.
+_PS_VALUE_FLAGS = {"-value", "-encoding", "-erroraction", "-itemtype", "-filter",
+                   "-include", "-exclude", "-stream", "-width", "-name"}
+
+
+def _ps_named_operands(cmd: str) -> List[str]:
+    """Candidate target paths from a PowerShell cmdlet call, in order.
+
+    -Path / -LiteralPath / -Destination / -NewName name a target explicitly;
+    value-carrying flags are skipped WITH their value; anything else that does
+    not start with '-' is a positional target.
+    """
+    toks = _tokenize(cmd, windows_paths=True)[1:]     # drop the cmdlet itself
+    out: List[str] = []
+    i = 0
+    while i < len(toks):
+        tok = toks[i]
+        low = tok.lower()
+        if low in _PS_PATH_FLAGS or low in _PS_DEST_FLAGS:
+            i += 1
+            if i < len(toks):
+                out.append(toks[i].strip("'\""))
+            i += 1
+            continue
+        if low in _PS_VALUE_FLAGS:
+            i += 2                                     # flag and its value
+            continue
+        if tok.startswith("-"):
+            i += 1                                     # switch with no value
+            continue
+        out.append(tok.strip("'\""))
+        i += 1
+    return out
+
+
+def _ps_write_target(cmd: str) -> Optional[str]:
+    """The one file a content cmdlet overwrites or empties, or None.
+
+    Exactly one operand, no wildcard - the same honesty rule Remove-Item uses:
+    a target this cannot pin down exactly must not be snapshotted at all.
+    """
+    ops = _ps_named_operands(cmd)
+    if len(ops) != 1:
+        return None
+    target = ops[0]
+    if not target or any(ch in target for ch in "*?[]"):
+        return None
+    return target
+
+
+def _ps_dest_target(cmd: str) -> Optional[str]:
+    """What a Move/Copy/Rename -Force will CLOBBER: the destination, not the
+    source. Mirrors the mv branch of extract_path_operand."""
+    ops = _ps_named_operands(cmd)
+    if len(ops) < 2:
+        return None
+    dst = ops[-1]
+    if any(ch in dst for ch in "*?[]"):
+        return None
+    return dst
+
+
+def ps_named_target(cmd: str) -> Optional[str]:
+    """The path a PowerShell write/clobber names, WITHOUT checking that it
+    exists. The guard needs the distinction: a name that resolves but is not on
+    disk means the command CREATES rather than destroys, while a name that does
+    not resolve at all is ambiguous and must still escalate."""
+    if _PS_CONTENT_RE.search(cmd):
+        return _ps_write_target(cmd)
+    if _PS_DEST_RE.search(cmd):
+        return _ps_dest_target(cmd)
+    return None
+
+
 def _too_broad(path: str) -> bool:
     """Capture surfaces we refuse however small they measure: the filesystem
     root, a Windows drive root, and $HOME. `rm ~/a ~/b` must never quietly
@@ -433,6 +517,12 @@ def extract_path_operand(cmd: str, dialect: str = POSIX) -> Optional[str]:
         return None
     if _PS_REMOVE_RE.search(cmd):
         target = _ps_remove_item_operand(cmd)
+        return target if target and os.path.exists(target) else None
+    if _PS_CONTENT_RE.search(cmd):
+        target = _ps_write_target(cmd)
+        return target if target and os.path.exists(target) else None
+    if _PS_DEST_RE.search(cmd):
+        target = _ps_dest_target(cmd)
         return target if target and os.path.exists(target) else None
     # Truncating output redirection ('> file'): snapshot the file it overwrites.
     # Uses the same quote-aware detector as the classifier, so classify (is it

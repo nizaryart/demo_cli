@@ -66,6 +66,32 @@ _DESTRUCTIVE_RULES = [
     # positional operand and snapshots it), so NOT in _LOCAL_UNRECOVERABLE.
     # Listed AFTER ps_remove_item_rf so the -Recurse -Force nuke keeps its id.
     ("ps_remove_item", "shell", r"^\s*(?:Remove-Item|ri)\b[^|;&]*"),
+    # ---- PowerShell content destroyers -----------------------------------
+    # Windows had ONE rule (Remove-Item) while POSIX had a dozen. These close
+    # the parity gap. Deliberately narrow, in three ways:
+    #
+    #  * APPEND IS NOT DESTROY. Add-Content and `Out-File -Append` only add to
+    #    the end of a file, exactly like `>>` versus `>`. Add-Content is absent
+    #    from this table entirely; Out-File carries a negative lookahead.
+    #  * -Force IS THE DESTRUCTIVE PART for move/copy/rename. Without it those
+    #    cmdlets REFUSE to overwrite an existing destination, so flagging the
+    #    bare form would be a false positive. Same discipline as git -d vs -D.
+    #  * SHORT ALIASES ARE OMITTED on purpose. PowerShell aliases Set-Content to
+    #    `sc`, but `sc.exe` is the Windows Service Control tool and `sc query` is
+    #    an ordinary read - matching it would flag safe commands. `mi`/`cpi`/
+    #    `rni`/`ren` are likewise too short to match safely. Accepted trade:
+    #    an agent writing the short form is missed. A false positive that gets
+    #    the guard uninstalled costs more than a miss.
+    ("ps_clear_content", "shell", r"^\s*(?:Clear-Content|clc)\b[^|;&]*"),
+    ("ps_set_content", "shell",
+     r"^\s*(?:Set-Content|Out-File)\b(?![^|;&]*\s-(?:Append|NoClobber)\b)[^|;&]*"),
+    ("ps_move_force", "shell", r"^\s*Move-Item\b(?=[^|;&]*\s-Force\b)[^|;&]*"),
+    ("ps_copy_force", "shell", r"^\s*Copy-Item\b(?=[^|;&]*\s-Force\b)[^|;&]*"),
+    ("ps_rename_force", "shell", r"^\s*Rename-Item\b(?=[^|;&]*\s-Force\b)[^|;&]*"),
+    ("ps_new_item_force", "shell", r"^\s*New-Item\b(?=[^|;&]*\s-Force\b)[^|;&]*"),
+    # Whole-volume operations. No snapshot can cover these, so they hard-stop -
+    # the Windows counterpart of mkfs.
+    ("ps_format_volume", "shell", r"\b(?:Format-Volume|Clear-Disk)\b"),
     ("rmdir_s", "shell", r"\brmdir\b.*\/[sS]"),
     ("del_force", "shell", r"\bdel\b.*\/[fFsS]"),
     ("mv_overwrite", "shell", r"\bmv\s+(?:-[a-z]*f[a-z]*\s+)?\S+\s+\S+"),
@@ -148,6 +174,7 @@ _LOCAL_UNRECOVERABLE = {
     "rmdir_s": "recursive_force_delete",
     "del_force": "recursive_force_delete",
     "fs_mkfs": "disk_format",
+    "ps_format_volume": "disk_format",
 }
 
 # Opaque remote execution: code is fetched and run in one step. It cannot be

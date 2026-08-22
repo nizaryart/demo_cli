@@ -29,6 +29,13 @@ from .decide import (ALLOW, ASK, BLOCKING, CONTEXT_MISMATCH, DRY_RUN, ESCALATE,
 from .receipts import Receipt, append_receipt
 
 
+# PowerShell rules whose target is created rather than destroyed when the path
+# is absent. Clear-Content is NOT here: it errors on a missing file rather than
+# creating one, so there is nothing to reinterpret.
+_CREATES_IF_MISSING = {"ps_set_content", "ps_new_item_force",
+                       "ps_move_force", "ps_copy_force", "ps_rename_force"}
+
+
 @dataclass
 class GuardResult:
     command: str
@@ -90,12 +97,27 @@ class Guard:
 
         c = classify_pipeline(command, dialect)
 
-        # A redirection to a file that does NOT yet exist CREATES it - there is
-        # nothing to truncate, so it is not destructive. classify.py is
-        # filesystem-blind (string only), so correct that here where we can stat.
+        # Writing to a path that does NOT yet exist CREATES it - there is nothing
+        # to destroy. classify.py is filesystem-blind (string only), so the
+        # correction happens here, where we can stat.
+        #
+        # Extended past `>` to the PowerShell cmdlets with the same shape:
+        # Set-Content / Out-File / New-Item make a new file, and a
+        # Move/Copy/Rename -Force onto a free name clobbers nothing.
+        #
+        # The distinction that matters: a name that RESOLVES but is absent from
+        # disk means creation, so the flag is cleared. A name that does not
+        # resolve at all is AMBIGUOUS and keeps its classification, so it still
+        # escalates - never quietly waved through.
         if c.matched_rule == "fs_redirect_truncate":
             rt = redirect_target(command)
             if not rt or not os.path.exists(os.path.abspath(rt)):
+                c.is_destructive = False
+                c.is_mutating = False
+                c.matched_rule = None
+        elif c.matched_rule in _CREATES_IF_MISSING:
+            named = recovery.ps_named_target(command)
+            if named and not os.path.exists(os.path.abspath(named)):
                 c.is_destructive = False
                 c.is_mutating = False
                 c.matched_rule = None
