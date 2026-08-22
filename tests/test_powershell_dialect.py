@@ -223,3 +223,45 @@ def test_continuation_across_three_lines():
 def test_a_backslash_mid_line_is_not_a_continuation():
     """Only end-of-line counts. A backslash inside text is just a character."""
     assert join_continuations(r"rm C:\temp\file", POSIX) == r"rm C:\temp\file"
+
+
+# --------------------------------------------------------------------------
+# Tokenising a Windows path — the regression that only real Windows caught
+#
+# Chunk 2 introduced shlex and verified it on a QUOTED path, where a backslash
+# happens to survive. Unquoted, POSIX-mode shlex treats backslash as an escape
+# and eats it, so every Windows path became garbage, no target resolved, and 15
+# tests failed on Windows against a clean baseline.
+#
+# These run on every platform by passing windows_paths explicitly, so the Linux
+# suite would now catch the same mistake without needing a Windows machine.
+# --------------------------------------------------------------------------
+
+def test_unquoted_windows_path_survives_tokenising():
+    """The exact regression. Backslash is a PATH SEPARATOR here, not an escape."""
+    toks = recovery._tokenize(r"rm -rf C:\Users\pc\Temp\x.txt", windows_paths=True)
+    assert toks == ["rm", "-rf", r"C:\Users\pc\Temp\x.txt"], toks
+
+
+def test_quoted_windows_path_with_spaces_survives_tokenising():
+    toks = recovery._tokenize(r'Remove-Item -Force "C:\Program Files\App"',
+                              windows_paths=True)
+    assert toks[-1] == r"C:\Program Files\App", toks
+
+
+def test_posix_escaped_space_still_works_on_posix():
+    """The counterpart. These two settings are mutually exclusive - backslash
+    cannot be both an escape and a path separator - which is why the tokenizer
+    follows the platform instead of picking one globally."""
+    toks = recovery._tokenize(r"rm -rf /home/me/my\ project", windows_paths=False)
+    assert toks[-1] == "/home/me/my project", toks
+
+
+def test_unbalanced_quotes_degrade_on_windows_too():
+    assert recovery._tokenize('rm -rf "unclosed', windows_paths=True) == ["rm", "-rf", '"unclosed']
+
+
+def test_remove_item_operand_reads_an_unquoted_windows_path():
+    """End of the chain: the operand reader must return a usable path."""
+    assert recovery._ps_remove_item_operand(
+        r"Remove-Item -Recurse -Force C:\Users\pc\build") == r"C:\Users\pc\build"

@@ -183,7 +183,7 @@ def _expand_braces(token: str) -> List[str]:
     return result
 
 
-def _tokenize(cmd: str) -> List[str]:
+def _tokenize(cmd: str, windows_paths: Optional[bool] = None) -> List[str]:
     """Split a command line into words the way a shell would - respecting quotes.
 
     `cmd.split()` cuts on whitespace and knows nothing about quotes, so
@@ -195,15 +195,36 @@ def _tokenize(cmd: str) -> List[str]:
     was snapshotted. That is not a Windows bug - it is every path containing a
     space, on every platform.
 
-    shlex is Python's shell lexer. POSIX mode keeps a quoted path whole AND
-    leaves Windows backslashes alone (inside double quotes a backslash is only
-    special before a few characters, and a drive letter is not one of them).
+    shlex is Python's shell lexer, but its POSIX mode treats backslash as an
+    ESCAPE character - and on Windows a backslash is a PATH SEPARATOR. Left
+    enabled it silently destroys every unquoted Windows path:
+
+        rm -rf C:\\Users\\pc\\Temp\\x.txt   ->   'C:UserspcTempx.txt'
+
+    which then does not exist, so no target resolves and everything escalates.
+    (Regression found only by running the suite on real Windows: 15 failures
+    against a clean baseline. The chunk-2 check tested a QUOTED path, where
+    backslash happens to survive, and generalised from it.)
+
+    There is no single correct setting - the two shells genuinely disagree:
+
+        rm -rf C:\\Users\\x        needs escaping OFF   (Windows path)
+        rm -rf my\\ project        needs escaping ON    (POSIX escaped space)
+
+    so it follows the platform, with an explicit override for callers that know
+    they are reading PowerShell.
 
     shlex raises on unbalanced quotes. A malformed command must degrade to the
     old behaviour, never crash the guard - same fail-open rule as the hooks.
     """
+    if windows_paths is None:
+        windows_paths = os.name == "nt"
+    lex = shlex.shlex(cmd, posix=True)
+    lex.whitespace_split = True          # split on whitespace, not shell punctuation
+    if windows_paths:
+        lex.escape = ""                  # backslash is a path separator, not an escape
     try:
-        return shlex.split(cmd)
+        return list(lex)
     except ValueError:
         return cmd.strip().split()
 
@@ -265,7 +286,7 @@ def _ps_remove_item_operand(cmd: str) -> Optional[str]:
     """
     if not _PS_REMOVE_RE.search(cmd):
         return None
-    tokens = _tokenize(cmd)[1:]  # drop the leading Remove-Item / ri
+    tokens = _tokenize(cmd, windows_paths=True)[1:]  # PowerShell: \\ is a path sep
     targets: List[str] = []
     i = 0
     while i < len(tokens):
