@@ -277,8 +277,15 @@ def cmd_doctor(a) -> int:
     checks.append(("ok" if pyok else "fail", "python >= 3.9",
                    f"{sys.version_info.major}.{sys.version_info.minor}"))
     checks.append(("ok", "mode", cfg.mode))
-    checks.append(("ok" if cfg.source_path else "warn", "config",
-                   cfg.source_path or "using defaults (run: demo_cli init)"))
+    # "found" is not "usable". A .demo_cli.toml written by PowerShell carries a
+    # UTF-8 BOM, fails to parse, and used to disable the guard silently while
+    # this line still reported ok because source_path was set.
+    if cfg.config_error:
+        checks.append(("fail", "config parses", f"NO - {cfg.config_error}"))
+    elif cfg.source_path:
+        checks.append(("ok", "config parses", cfg.source_path))
+    else:
+        checks.append(("warn", "config", "using defaults (run: demo_cli init)"))
 
     ws = cfg.workspace
     writable = True
@@ -327,6 +334,38 @@ def cmd_doctor(a) -> int:
                                "hook did NOT intercept a test command - see logs"))
             except Exception as exc:
                 checks.append(("warn", f"hook self-test ({tool_name})", f"could not run ({exc})"))
+
+    # THE question every other check only approximates: has this guard actually
+    # run? Config, registration and PATH are all paperwork - a receipt written
+    # by an AGENT is evidence. Three separate times the failure mode has been
+    # "installed, looks fine, protecting nothing" (Codex config shape, Codex
+    # stale session, Windows BOM), and each time a receipt would have said so.
+    import datetime as _dt
+    from .receipts import load_receipts
+    rows = load_receipts(cfg.receipts_path)
+    by_agent = {}
+    for r in rows:
+        aid = r.get("agent_id", "unknown")
+        by_agent[aid] = max(by_agent.get(aid, ""), r.get("timestamp", ""))
+    agents = [a for a in by_agent if a not in ("cli", "unknown")]
+    if agents:
+        newest = max(by_agent[a] for a in agents)
+        try:
+            age = _dt.datetime.now(_dt.timezone.utc) - _dt.datetime.fromisoformat(newest)
+            when = f"{int(age.total_seconds() // 60)} min ago" if age.total_seconds() < 86400 \
+                   else f"{age.days}d ago"
+        except Exception:
+            when = newest[:19]
+        checks.append(("ok", "ACTIVE (agent receipts)",
+                       f"{', '.join(sorted(agents))} - last {when}"))
+    elif rows:
+        checks.append(("warn", "ACTIVE (agent receipts)",
+                       "receipts exist but only from the CLI - no agent has been "
+                       "gated yet. Run one command through the agent to confirm."))
+    else:
+        checks.append(("warn", "ACTIVE (agent receipts)",
+                       "NONE - nothing has ever been gated here. Installed is not "
+                       "the same as protecting; run one command through the agent."))
 
     render.render_doctor(checks, __version__)
     return 0 if all(s != "fail" for s, _, _ in checks) else 1

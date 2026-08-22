@@ -22,7 +22,7 @@ import os
 from . import approval, preview as preview_mod, recovery
 from .classify import (POSIX, Classification, classify_pipeline,
                        is_sql_preview_candidate, redirect_target)
-from .config import Config, load_config
+from .config import Config, config_error_message, load_config
 from .context import Context, Intent, build_context, compare_intent
 from .decide import (ALLOW, ASK, BLOCKING, CONTEXT_MISMATCH, DRY_RUN, ESCALATE,
                      REVERSIBLE, Decision, decide)
@@ -75,6 +75,42 @@ class Guard:
         self.config = config or load_config()
         self.mode = mode or self.config.mode
 
+    def _refuse_broken_config(self, command: str, agent_id: str,
+                              session_id: str) -> GuardResult:
+        """Block, loudly and actionably, when .demo_cli.toml cannot be read.
+
+        A config that is MISSING means "no opinion" and falls back to defaults.
+        A config that is PRESENT but unreadable means the user asked for
+        protection we cannot deliver - so we refuse rather than proceed
+        unguarded. This is fail-closed on the USER'S config, and it does not
+        change the separate rule that our OWN bugs still fail open.
+        """
+        c = Classification(is_destructive=False, is_mutating=False,
+                           matched_rule="config_unreadable", segments=[command])
+        ctx = build_context(command, cwd=self.config.project_root)
+        decision = Decision(
+            ESCALATE,
+            config_error_message(self.config),
+            recoverable=False,
+            next_steps=[
+                f"Fix {self.config.source_path}",
+                "or delete it to fall back to shadow mode (observe only)",
+                "a UTF-8 BOM is the usual cause when PowerShell wrote the file",
+            ],
+        )
+        receipt = Receipt(
+            action_raw=command, action_type="config", target_environment=ctx.environment,
+            decision=decision.decision, reason=decision.reason, mode=self.mode,
+            matched_rule="config_unreadable", classification="safe",
+            context=ctx.as_dict(), agent_id=agent_id, session_id=session_id,
+        )
+        try:
+            append_receipt(self.config.receipts_path, receipt)
+        except Exception:
+            pass          # the receipt is evidence, not a precondition for refusing
+        return GuardResult(command=command, classification=c, context=ctx,
+                           decision=decision, mode=self.mode, receipt=receipt)
+
     def evaluate(
         self,
         command: str,
@@ -94,6 +130,9 @@ class Guard:
         it from the tool name; everything else keeps the POSIX default."""
         intent = intent or Intent()
         command = command.strip()
+
+        if self.config.config_error:
+            return self._refuse_broken_config(command, agent_id, session_id)
 
         c = classify_pipeline(command, dialect)
 
@@ -253,6 +292,9 @@ class Guard:
         from .classify import Classification
 
         intent = intent or Intent()
+        if self.config.config_error:
+            return self._refuse_broken_config(f"{tool_name} {file_path}",
+                                              agent_id, session_id)
         ap = os.path.abspath(file_path)
         exists = os.path.exists(ap)
         is_dir = exists and os.path.isdir(ap)

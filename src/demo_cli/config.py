@@ -67,6 +67,20 @@ except ModuleNotFoundError:  # pragma: no cover - exercised on 3.9/3.10
                 "Install demo_cli on Python 3.11+, or `pip install tomli`."
             )
 
+def config_error_message(cfg) -> str:
+    """The one wording used everywhere a broken config is reported. Says what
+    is wrong, where, why everything is blocked, and how to get out of it -
+    a block with no way forward is its own kind of failure."""
+    return (
+        f"Cannot read {CONFIG_NAME}: {cfg.config_error}\n"
+        "Every command is blocked while this file is unreadable, because you "
+        "asked for protection and demo_cli cannot tell what you asked for.\n"
+        "Fix the file, or delete it to fall back to shadow mode (observe only).\n"
+        "If PowerShell wrote it, a UTF-8 BOM is the usual cause: "
+        "Set-Content -Encoding utf8NoBOM, or `demo_cli init` to rewrite it."
+    )
+
+
 CONFIG_NAME = ".demo_cli.toml"
 VALID_MODES = ("shadow", "enforce")
 VALID_RECOVERY = ("snapshot", "attest", "none")
@@ -91,6 +105,12 @@ class Config:
     targets: List[TargetRule] = field(default_factory=list)
     egress: dict = field(default_factory=dict)  # [egress] table for the egress guard
     source_path: Optional[str] = None  # path of the loaded config, if any
+    # Set when a .demo_cli.toml EXISTS but could not be parsed. Deliberately a
+    # field rather than an exception: an exception gets swallowed by the hooks'
+    # catch-all and turns into fail-OPEN, which is how a BOM silently disabled
+    # the whole guard on Windows. A value on the object cannot be caught by
+    # accident - the guard has to look at it and decide.
+    config_error: Optional[str] = None
 
     # ---- resolved paths (always project-local, never install-local) ----
     @property
@@ -144,7 +164,16 @@ def load_config(start: Optional[str] = None) -> Config:
     if not os.path.exists(path):
         return cfg
 
-    data = _load_toml(path)
+    try:
+        data = _load_toml(path)
+    except Exception as exc:
+        # A config that exists but cannot be read is NOT the same as no config.
+        # No config means "no opinion" -> defaults. A broken one means the user
+        # asked for protection and we cannot tell what they asked for, so the
+        # guard refuses instead of quietly proceeding unprotected.
+        cfg.source_path = path
+        cfg.config_error = f"{path}: {exc}"
+        return cfg
     cfg.source_path = path
 
     mode = str(data.get("mode", cfg.mode)).strip().lower()
