@@ -26,19 +26,38 @@ import os
 from dataclasses import dataclass, field
 from typing import List, Optional
 
+def _read_toml_bytes(path):
+    """Config file contents with any UTF-8 byte-order mark removed.
+
+    Windows PowerShell 5.1's `Out-File -Encoding utf8` - the obvious way to
+    write a config file on Windows - prefixes the file with a BOM (EF BB BF).
+    TOML parsers reject it:
+
+        TOMLDecodeError: Invalid statement (at line 1, column 1)
+
+    which the hook then catches as an internal error and fails OPEN. The result
+    is total, silent loss of protection: install-hook reports success, the hook
+    fires, and the guard steps aside on every single command, with the only
+    signal a stderr line the host discards. Found live on Windows, first command.
+
+    A BOM is an encoding marker, not content, so stripping it is correct rather
+    than lenient.
+    """
+    with open(path, "rb") as f:
+        return f.read().lstrip(b"\xef\xbb\xbf")
+
+
 try:  # Python 3.11+
     import tomllib as _toml
 
     def _load_toml(path):
-        with open(path, "rb") as f:
-            return _toml.load(f)
+        return _toml.loads(_read_toml_bytes(path).decode("utf-8"))
 except ModuleNotFoundError:  # pragma: no cover - exercised on 3.9/3.10
     try:
         import tomli as _toml
 
         def _load_toml(path):
-            with open(path, "rb") as f:
-                return _toml.load(f)
+            return _toml.loads(_read_toml_bytes(path).decode("utf-8"))
     except ModuleNotFoundError:  # pragma: no cover
         _toml = None
 

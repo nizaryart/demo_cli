@@ -265,3 +265,47 @@ def test_remove_item_operand_reads_an_unquoted_windows_path():
     """End of the chain: the operand reader must return a usable path."""
     assert recovery._ps_remove_item_operand(
         r"Remove-Item -Recurse -Force C:\Users\pc\build") == r"C:\Users\pc\build"
+
+
+# --------------------------------------------------------------------------
+# UTF-8 BOM in the config file
+#
+# Windows PowerShell 5.1's `Out-File -Encoding utf8` writes a BOM. TOML parsers
+# reject it, the hook catches the error and fails OPEN, and the guard steps
+# aside on every command - total, silent loss of protection while install-hook
+# reports success. Found on the first live command on Windows.
+# --------------------------------------------------------------------------
+
+BOM = b"\xef\xbb\xbf"
+
+
+def test_config_with_a_utf8_bom_still_parses(tmp_path):
+    (tmp_path / ".demo_cli.toml").write_bytes(BOM + b'mode = "enforce"\n')
+    from demo_cli.config import load_config
+    assert load_config(start=str(tmp_path)).mode == "enforce"
+
+
+def test_config_written_by_powershell_still_parses(tmp_path):
+    """The exact bytes PowerShell 5.1 produces: BOM plus CRLF."""
+    (tmp_path / ".demo_cli.toml").write_bytes(BOM + b'mode = "enforce"\r\n')
+    from demo_cli.config import load_config
+    assert load_config(start=str(tmp_path)).mode == "enforce"
+
+
+def test_a_bom_config_does_not_silently_disable_the_guard(tmp_path):
+    """The real damage was not the parse error - it was that enforce silently
+    became no-guard-at-all. Drive the whole guard to prove protection survives."""
+    (tmp_path / ".demo_cli.toml").write_bytes(BOM + b'mode = "enforce"\r\n')
+    victim = tmp_path / "hello.txt"
+    victim.write_text("PRECIOUS")
+    from demo_cli.config import load_config
+    from demo_cli.guard import Guard
+    r = Guard(config=load_config(start=str(tmp_path))).evaluate(f"rm {victim}")
+    assert r.decision.decision == "REVERSIBLE"
+    assert r.recovery_entry is not None
+
+
+def test_config_without_a_bom_is_unaffected(tmp_path):
+    (tmp_path / ".demo_cli.toml").write_bytes(b'mode = "shadow"\n')
+    from demo_cli.config import load_config
+    assert load_config(start=str(tmp_path)).mode == "shadow"
