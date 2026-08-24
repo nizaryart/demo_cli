@@ -106,18 +106,24 @@ def test_snapshot_bytes_refuses_when_there_is_nothing_to_capture(tmp_path):
 # this project treats as unacceptable.
 # --------------------------------------------------------------------------
 
-def test_recorded_target_is_absolute_so_undo_cannot_land_elsewhere():
-    """The regression test for W5."""
-    target = fsmount.absolute_target(os.path.join(os.sep, "mnt", "guarded"),
-                                     "notes.txt")
+def test_recorded_target_is_absolute_so_undo_cannot_land_elsewhere(tmp_path):
+    """The regression test for W5.
+
+    The mount point comes from tmp_path rather than being hand-built, because
+    "absolute" is not the same shape on both platforms: on Windows a path must
+    carry a DRIVE, so '\\mnt\\guarded' is drive-relative, not absolute, and
+    ntpath.isabs has rejected it since Python 3.13. mount() gets this right via
+    os.path.abspath; only a synthetic test input can get it wrong.
+    """
+    target = fsmount.absolute_target(str(tmp_path / "guarded"), "notes.txt")
     assert os.path.isabs(target), "a relative target resolves against cwd"
     assert target.endswith("notes.txt")
 
 
-def test_nested_virtual_paths_keep_their_structure():
-    target = fsmount.absolute_target(os.path.join(os.sep, "mnt", "guarded"),
-                                     "src/app.py")
-    assert target == os.path.join(os.sep, "mnt", "guarded", "src", "app.py")
+def test_nested_virtual_paths_keep_their_structure(tmp_path):
+    mount = tmp_path / "guarded"
+    target = fsmount.absolute_target(str(mount), "src/app.py")
+    assert target == str(mount / "src" / "app.py")
 
 
 def test_without_a_mountpoint_the_virtual_path_is_returned_unchanged():
