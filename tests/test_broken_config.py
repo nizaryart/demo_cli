@@ -108,3 +108,79 @@ def test_a_valid_config_with_a_bom_does_not_block(tmp_path):
     g = _guard(tmp_path)
     assert g.config.mode == "enforce"
     assert g.evaluate("ls").decision.decision != ESCALATE
+
+
+# --------------------------------------------------------------------------
+# `init --mode` — so nobody has to hand-write the config
+#
+# The BOM incident happened because the obvious way to make a config on Windows
+# is PowerShell, and PowerShell adds a BOM. `init` writes the file properly;
+# `--mode` removes the last reason to edit it by hand.
+# --------------------------------------------------------------------------
+
+def _init(tmp_path, monkeypatch, *args):
+    import sys
+    from demo_cli.cli import main
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["demo_cli", "init", *args])
+    return main()
+
+
+def test_init_defaults_to_shadow(tmp_path, monkeypatch):
+    """Observe-only until asked otherwise."""
+    _init(tmp_path, monkeypatch)
+    assert 'mode = "shadow"' in (tmp_path / ".demo_cli.toml").read_text()
+
+
+def test_init_can_write_enforce_directly(tmp_path, monkeypatch):
+    _init(tmp_path, monkeypatch, "--mode", "enforce")
+    assert 'mode = "enforce"' in (tmp_path / ".demo_cli.toml").read_text()
+
+
+def test_init_never_writes_a_bom(tmp_path, monkeypatch):
+    """The regression that matters. A BOM makes the config unparseable, which
+    used to disable the guard on every command, silently."""
+    _init(tmp_path, monkeypatch, "--mode", "enforce")
+    assert (tmp_path / ".demo_cli.toml").read_bytes()[:3] != b"\xef\xbb\xbf"
+
+
+def test_a_config_written_by_init_is_actually_usable(tmp_path, monkeypatch):
+    """End to end: init it, load it, and get the mode back out."""
+    from demo_cli.config import load_config
+    _init(tmp_path, monkeypatch, "--mode", "enforce")
+    cfg = load_config(start=str(tmp_path))
+    assert cfg.mode == "enforce" and cfg.config_error is None
+
+
+# --------------------------------------------------------------------------
+# doctor knows every host, not just Claude Code
+# --------------------------------------------------------------------------
+
+def test_doctor_reports_each_host_separately(tmp_path):
+    """It used to check only .claude, so a machine with Codex fully wired up
+    was told 'not installed' by the one command whose job is answering
+    'am I protected'."""
+    from demo_cli.cli import _host_hook_status
+    from demo_cli.config import Config
+    labels = [label for label, _ in _host_hook_status(Config(project_root=str(tmp_path)))]
+    assert labels == ["claude code", "cursor", "codex"]
+
+
+def test_doctor_detects_a_codex_hook(tmp_path):
+    from demo_cli.cli import _host_hook_status
+    from demo_cli.config import Config
+    from demo_cli.hooks.codex import install_into_hooks_json
+    install_into_hooks_json(str(tmp_path / ".codex" / "hooks.json"))
+    status = dict(_host_hook_status(Config(project_root=str(tmp_path))))
+    assert status["codex"] is not None, "a real Codex hook must be seen"
+
+
+def test_doctor_detects_a_cursor_hook(tmp_path):
+    """Cursor's config shape is flat, not nested - a checker written only for
+    the nested shape silently misses it."""
+    from demo_cli.cli import _host_hook_status
+    from demo_cli.config import Config
+    from demo_cli.hooks.cursor import install_into_hooks_json
+    install_into_hooks_json(str(tmp_path / ".cursor" / "hooks.json"))
+    status = dict(_host_hook_status(Config(project_root=str(tmp_path))))
+    assert status["cursor"] is not None

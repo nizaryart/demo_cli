@@ -183,19 +183,53 @@ def cmd_receipt(a) -> int:
     return 0
 
 
-def _hook_installed(path) -> bool:
+# Every host demo_cli can hook, and where each keeps its registration.
+# `nested` distinguishes the two config shapes: Claude Code and Codex wrap
+# handlers in a group ({matcher, hooks:[{type, command}]}), Cursor lists them
+# flat ({command, failClosed}).
+#            label          directory   filename         event                   command                nested
+_HOSTS = [
+    ("claude code", ".claude", "settings.json", "PreToolUse",            "demo_cli hook",        True),
+    ("cursor",      ".cursor", "hooks.json",    "beforeShellExecution",  "demo_cli hook-cursor", False),
+    ("codex",       ".codex",  "hooks.json",    "PreToolUse",            "demo_cli hook-codex",  True),
+]
+
+
+def _hook_installed(path, event: str = "PreToolUse",
+                    command: str = "demo_cli hook", nested: bool = True) -> bool:
     if not os.path.exists(path):
         return False
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8-sig") as f:
             data = json.load(f)
     except Exception:
         return False
-    for block in (data.get("hooks", {}) or {}).get("PreToolUse", []) or []:
-        for h in (block or {}).get("hooks", []) or []:
-            if h.get("command") == "demo_cli hook":
+    for block in (data.get("hooks", {}) or {}).get(event, []) or []:
+        if not isinstance(block, dict):
+            continue
+        handlers = (block.get("hooks") or []) if nested else [block]
+        for h in handlers:
+            if isinstance(h, dict) and h.get("command") == command:
                 return True
     return False
+
+
+def _host_hook_status(cfg):
+    """[(label, path_or_None)] - where each host's hook is registered, if it is.
+
+    doctor used to report a single 'claude code hook' row and look only in
+    .claude, so a machine with Codex fully wired up was told 'not installed' by
+    the one command whose job is answering 'am I protected'."""
+    out = []
+    for label, directory, filename, event, command, nested in _HOSTS:
+        found = None
+        for base in (cfg.project_root, os.path.expanduser("~")):
+            path = os.path.join(base, directory, filename)
+            if _hook_installed(path, event, command, nested):
+                found = path
+                break
+        out.append((label, found))
+    return out
 
 
 def _hook_selftest(tool_name: str, command: str) -> bool:
@@ -313,9 +347,12 @@ def cmd_doctor(a) -> int:
     git = bool(shutil.which("git"))
     checks.append(("ok" if git else "warn", "git", "found" if git else "missing (branch/remote context off)"))
 
-    hook = _any_hook_installed(cfg)
-    checks.append(("ok" if hook else "warn", "claude code hook",
-                   "installed" if hook else "not installed (run: demo_cli install-hook)"))
+    hosts = _host_hook_status(cfg)
+    for label, path in hosts:
+        flag = {"codex": " --codex", "cursor": " --cursor"}.get(label, "")
+        checks.append(("ok" if path else "warn", f"hook: {label}",
+                       path or f"not installed (demo_cli install-hook{flag})"))
+    hook = _any_hook_installed(cfg)   # Claude Code specifically - gates the self-test below
 
     # THE check that actually predicts protection: is `demo_cli` resolvable on
     # PATH? Claude Code launches the hook as a bare `demo_cli hook` command in a
@@ -420,9 +457,17 @@ def cmd_init(a) -> int:
     if os.path.exists(path) and not a.force:
         print(f"{CONFIG_NAME} already exists. Use --force to overwrite.")
         return 1
+    template = _CONFIG_TEMPLATE
+    mode = getattr(a, "mode", None)
+    if mode:
+        template = template.replace('mode = "shadow"', f'mode = "{mode}"', 1)
+    # encoding="utf-8" writes NO byte-order mark. That matters: PowerShell's
+    # Out-File -Encoding utf8 adds one, TOML parsers reject it, and the guard
+    # used to fail open on every command as a result. `init` exists partly so a
+    # user never has to hand-write this file.
     with open(path, "w", encoding="utf-8") as f:
-        f.write(_CONFIG_TEMPLATE)
-    print(f"Wrote {path}")
+        f.write(template)
+    print(f"Wrote {path}" + (f" (mode = {mode})" if mode else ""))
     return 0
 
 
@@ -743,6 +788,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     it = sub.add_parser("init", parents=[common], help=f"write a starter {CONFIG_NAME}")
     it.add_argument("--force", action="store_true")
+    it.add_argument("--mode", choices=("shadow", "enforce"), default=None,
+                    help="write the config in this mode (default: shadow). Saves "
+                         "hand-editing the file, which on Windows is how a BOM "
+                         "gets in and silently disables the guard.")
     it.set_defaults(func=cmd_init)
 
     ih = sub.add_parser("install-hook", parents=[common],
