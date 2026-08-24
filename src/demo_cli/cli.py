@@ -601,6 +601,29 @@ def cmd_install_shell_guard(a) -> int:
     return 0
 
 
+def cmd_mount(a) -> int:
+    """Mount the Windows filesystem guard - the behavioural layer for Windows,
+    where ptrace does not exist. Everything written through the mount is
+    intercepted below the syscall boundary, so obfuscation in the command text
+    cannot route around it."""
+    from .fsmount import available, mount
+    if not available():
+        if os.name != "nt":
+            print("The filesystem guard is Windows-only (WinFsp).")
+            print("On Linux the equivalent layer is:  demo_cli run <cmd>")
+        else:
+            print("winfspy is not importable. Install WinFsp from winfsp.dev")
+            print("with the Developer feature enabled, then: pip install winfspy")
+        return 1
+    if os.path.exists(a.mountpoint):
+        print(f"{a.mountpoint} already exists.")
+        print("WinFsp CREATES the mount point itself, so it must not exist yet.")
+        print("Pick a new path, e.g. a 'myproject-guarded' beside your project.")
+        return 1
+    mount(a.mountpoint, debug=a.debug)
+    return 0
+
+
 def cmd_egress(a) -> int:
     """Start the egress guard: an mitmproxy addon that gates destructive external
     / SaaS API calls on the network wire. Shells out to the installed `mitmdump`
@@ -762,6 +785,15 @@ def build_parser() -> argparse.ArgumentParser:
                         help="(internal) evaluate a raw shell command; used by the shell-guard DEBUG trap")
     gs.add_argument("argv", nargs=argparse.REMAINDER)
     gs.set_defaults(func=cmd_guard_shell)
+
+    mt = sub.add_parser("mount", parents=[common],
+                        help="mount the filesystem guard [Windows]")
+    mt.add_argument("mountpoint",
+                    help="a path that does NOT yet exist (WinFsp creates it), "
+                         "or a drive letter like X: (a directory is preferred - "
+                         "Claude Code will not use a bare drive root as its cwd)")
+    mt.add_argument("--debug", action="store_true", help="verbose WinFsp logging")
+    mt.set_defaults(func=cmd_mount)
 
     eg = sub.add_parser("egress", parents=[common],
                         help="gate destructive external/SaaS API calls via an HTTP proxy (needs mitmdump)")

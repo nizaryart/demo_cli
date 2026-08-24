@@ -675,6 +675,36 @@ def snapshot(target: Optional[Target], recovery_dir: str, strategy: str = "snaps
     return None
 
 
+def snapshot_bytes(name: str, data: bytes, recovery_dir: str,
+                   action: Optional[str] = None,
+                   target: Optional[str] = None) -> Optional[dict]:
+    """Capture content we already HOLD, rather than a path we can copy.
+
+    `snapshot()` copies a file off the filesystem. A guard that intercepts a
+    destructive operation *before* it happens sometimes holds the bytes with no
+    path to read them from - an in-memory filesystem, a stream, a buffer about
+    to be overwritten. This writes those bytes to a recovery point with an
+    entry of exactly the same shape, so `undo`, `log`, `diff` and `verify`
+    cannot tell the difference and need no special case.
+
+    `target` is what the bytes came from, for the ledger; `name` only decides
+    the filename of the backup.
+    """
+    if data is None:
+        return None
+    os.makedirs(recovery_dir, exist_ok=True)
+    ts, rid = _ts(), _new_id()
+    base = os.path.basename(str(name).replace("\\", "/").rstrip("/")) or "file"
+    bak = os.path.join(recovery_dir, f"{base}.{ts}.{rid}.bak")
+    with open(bak, "wb") as f:
+        f.write(data)
+    entry = {"id": rid, "kind": "file", "target": target or name,
+             "recovery_point": bak, "ts": ts,
+             "action": redact(action) if action else None}
+    _record(recovery_dir, entry)
+    return entry
+
+
 def load_entries(recovery_dir: str) -> List[dict]:
     idx = _index_path(recovery_dir)
     entries: List[dict] = []
