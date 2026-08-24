@@ -29,7 +29,19 @@ from .context import redact
 
 _PG_URL = re.compile(r"\bpostgres(?:ql)?://\S+", re.I)
 _DB_FILE = re.compile(r"[\w./\\-]+\.db\b")
-_IGNORE = shutil.ignore_patterns(".git", "node_modules", "__pycache__", ".demo_cli", ".demo_cli_recovery")
+# The single source of truth for "directories not worth guarding". Real work
+# touches these constantly - one `git status` walks hundreds of files under
+# .git - so snapshotting or receipting them buries the ledger in noise.
+#
+# Shared deliberately: syscall_guard (Linux) and fsguard (Windows) both filter
+# on it, and copytree derives its exclusion list from it below. Three separate
+# copies had already drifted apart before this was unified; adding an entry must
+# fix every platform at once, not one of them.
+IGNORED_DIRS = frozenset({
+    ".git", "node_modules", "__pycache__", ".demo_cli", ".demo_cli_recovery",
+})
+
+_IGNORE = shutil.ignore_patterns(*sorted(IGNORED_DIRS))
 
 # Upper bound on what we will copy for a directory snapshot. A snapshot we
 # cannot take quickly is not a recovery we should silently promise: above this

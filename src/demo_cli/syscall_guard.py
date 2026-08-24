@@ -167,7 +167,10 @@ def _resolve(pid: int, regs: _Regs, path_idx: int, dirfd_idx: Optional[int]) -> 
 # Scope filter (avoid the noise problem: only in-project, pre-existing files)
 # --------------------------------------------------------------------------
 
-_IGNORE_PARTS = {".git", "node_modules", "__pycache__", ".demo_cli", ".demo_cli_recovery"}
+# Shared with fsguard (Windows) and with copytree's exclusion list - see
+# recovery.IGNORED_DIRS. Kept as one set so a new entry cannot fix one platform
+# and silently miss the other.
+_IGNORE_PARTS = recovery.IGNORED_DIRS
 
 
 def _in_scope(path: str, root: str) -> bool:
