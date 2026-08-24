@@ -58,6 +58,33 @@ def available() -> bool:
         return False
 
 
+def absolute_target(mountpoint: Optional[str], virtual: str) -> str:
+    """Turn a mount-relative virtual path into a real filesystem path.
+
+    'src/app.py' -> 'C:\\Users\\pc\\Desktop\\fslab\\guarded\\src\\app.py'
+
+    WHY THIS EXISTS (defect W5, found 2026-08-24 by the last test of the day).
+    WinFsp speaks in paths relative to the mount, so a verdict names
+    'notes.txt'. Recording that bare string in the ledger is a lie of
+    omission: `recovery.restore_entry` does `shutil.copy2(recovery_point,
+    target)`, and a relative target resolves against whatever directory
+    `demo_cli undo` is run from. Run inside the mount it was correct; run one
+    level up - which still finds the recovery index, because .demo_cli lives
+    there - undo wrote the file OUTSIDE the mount and reported RESTORED. The
+    file the user wanted back was still gone.
+
+    A ledger entry must mean the same thing from every working directory.
+
+    Module-level rather than a method so it can be tested off Windows: the
+    class it serves cannot even be constructed without winfspy, which is the
+    same reason fsguard.py holds the judgement logic and this file holds only
+    the plumbing.
+    """
+    if not mountpoint:
+        return virtual
+    return os.path.join(mountpoint, virtual.replace("/", os.sep))
+
+
 def _require_windows() -> None:
     if os.name != "nt":
         raise RuntimeError(
@@ -73,9 +100,15 @@ def _require_windows() -> None:
         ) from None
 
 
-def build_operations(config: Config, volume_label: str = "demo_cli"):
+def build_operations(config: Config, volume_label: str = "demo_cli",
+                     mountpoint: Optional[str] = None):
     """Build the guarded filesystem. winfspy is imported here, not at module
-    scope, so this file stays importable on any platform."""
+    scope, so this file stays importable on any platform.
+
+    `mountpoint` is what makes recorded targets absolute - see `_absolute`. It
+    is optional only so the class can be constructed in tests without a mount;
+    `mount()` always supplies it.
+    """
     _require_windows()
 
     from pathlib import PureWindowsPath
@@ -91,11 +124,16 @@ def build_operations(config: Config, volume_label: str = "demo_cli"):
         deadlock the mount.
         """
 
-        def __init__(self, label: str, cfg: Config, read_only: bool = False):
+        def __init__(self, label: str, cfg: Config, read_only: bool = False,
+                     mountpoint: Optional[str] = None):
             super().__init__(label, read_only)
             self.cfg = cfg
+            self.mountpoint = mountpoint
             self.captured = 0
             self.skipped = 0
+
+        def _absolute(self, virtual: str) -> str:
+            return absolute_target(self.mountpoint, virtual)
 
         # ------------------------------------------------------------------
         # A bug in winfspy's own reference implementation, not ours.
@@ -178,9 +216,12 @@ def build_operations(config: Config, volume_label: str = "demo_cli"):
                 # from a thread pool and only the decorated bodies are locked.
                 data = bytes(file_obj.data[: file_obj.file_size])
                 entry = recovery.snapshot_bytes(
+                    # `name` only decides the .bak filename, so the short
+                    # virtual path is right there. `target` is where `undo`
+                    # will WRITE, so it must be absolute - see _absolute.
                     verdict.target, data, self.cfg.recovery_dir,
                     action=f"{verdict.kind} {verdict.target}",
-                    target=verdict.target,
+                    target=self._absolute(verdict.target),
                 )
             except Exception as exc:                      # pragma: no cover
                 reason = f"could not capture {verdict.target}: {exc}"
@@ -212,7 +253,7 @@ def build_operations(config: Config, volume_label: str = "demo_cli"):
             except Exception as exc:                      # pragma: no cover
                 sys.stderr.write(f"demo_cli [fs] receipt error: {exc}\n")
 
-    return GuardedFileSystem(volume_label, config)
+    return GuardedFileSystem(volume_label, config, mountpoint=mountpoint)
 
 
 def mount(mountpoint: str, config: Optional[Config] = None,
@@ -232,10 +273,14 @@ def mount(mountpoint: str, config: Optional[Config] = None,
     from winfspy.plumbing.win32_filetime import filetime_now
 
     config = config or load_config()
-    operations = build_operations(config, label)
 
-    path = Path(mountpoint)
+    # Resolved before the filesystem is built: the operations object needs the
+    # mount point to record absolute targets, and a relative mountpoint would
+    # reintroduce exactly the cwd-dependence W5 was about.
+    path = Path(os.path.abspath(mountpoint))
     is_drive = path.parent == path
+
+    operations = build_operations(config, label, mountpoint=str(path))
 
     fs = FileSystem(
         str(path), operations,

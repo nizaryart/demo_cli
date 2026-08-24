@@ -810,7 +810,16 @@ def restore_entry(entry: dict) -> bool:
     if kind in ("sqlite", "file"):
         if not rp or not os.path.exists(rp):
             return False
-        shutil.copy2(rp, target)
+        # A failed copy must REPORT failure, not raise. cmd_undo has no
+        # try/except, so an exception here becomes a traceback and the caller
+        # learns nothing about whether their file came back. The realistic
+        # cause is a target whose directory no longer exists - an unmounted
+        # filesystem guard, a deleted parent, a removable drive. Returning
+        # False renders as ESCALATE, which is the honest answer.
+        try:
+            shutil.copy2(rp, target)
+        except OSError:
+            return False
         return True
     if kind == "dir":
         if not rp or not os.path.isdir(rp):
@@ -822,7 +831,10 @@ def restore_entry(entry: dict) -> bool:
         # restores the whole directory, which is exactly what makes the recovery
         # a provable superset - and also why an edit made to an unrelated file in
         # that directory after the snapshot would be rolled back here.
-        shutil.copytree(rp, target, dirs_exist_ok=True)
+        try:
+            shutil.copytree(rp, target, dirs_exist_ok=True)
+        except OSError:
+            return False        # same reasoning as the file branch above
         return True
     if kind == "postgres":
         if not shutil.which("pg_restore") or not rp or not os.path.exists(rp):

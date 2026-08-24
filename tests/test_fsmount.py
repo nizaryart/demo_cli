@@ -89,3 +89,75 @@ def test_snapshot_bytes_captures_empty_content(tmp_path):
 
 def test_snapshot_bytes_refuses_when_there_is_nothing_to_capture(tmp_path):
     assert recovery.snapshot_bytes(r"\a.txt", None, str(tmp_path)) is None
+
+
+# --------------------------------------------------------------------------
+# Defect W5 - where a restore LANDS, not merely whether a snapshot was taken
+#
+# Found live on 2026-08-24, after 39 fsguard tests and 10 fsmount tests had
+# passed. Every one of those asserts on the capture side, because that is the
+# side we wrote. None asked the other question: `undo` said RESTORED - did the
+# bytes arrive where the user is looking?
+#
+# They did not. WinFsp names paths relative to the mount, so the ledger stored
+# 'notes.txt'; restore_entry copies to that string; run undo one directory up
+# and the file lands outside the mount while the tool reports success. A
+# recovery that claims to have happened and did not is the one failure class
+# this project treats as unacceptable.
+# --------------------------------------------------------------------------
+
+def test_recorded_target_is_absolute_so_undo_cannot_land_elsewhere():
+    """The regression test for W5."""
+    target = fsmount.absolute_target(os.path.join(os.sep, "mnt", "guarded"),
+                                     "notes.txt")
+    assert os.path.isabs(target), "a relative target resolves against cwd"
+    assert target.endswith("notes.txt")
+
+
+def test_nested_virtual_paths_keep_their_structure():
+    target = fsmount.absolute_target(os.path.join(os.sep, "mnt", "guarded"),
+                                     "src/app.py")
+    assert target == os.path.join(os.sep, "mnt", "guarded", "src", "app.py")
+
+
+def test_without_a_mountpoint_the_virtual_path_is_returned_unchanged():
+    """Only reachable when the class is built directly, never via mount().
+    Recording something wrong would be worse than recording something short."""
+    assert fsmount.absolute_target(None, "notes.txt") == "notes.txt"
+
+
+def test_undo_lands_in_the_same_place_whatever_the_cwd(tmp_path, monkeypatch):
+    """The end-to-end shape of W5, reproduced without WinFsp.
+
+    Capture as the mount would, then restore from an UNRELATED directory. With
+    a relative target this wrote into that unrelated directory and returned
+    True - the live failure, exactly.
+    """
+    mount = tmp_path / "guarded"
+    mount.mkdir()
+    (mount / "notes.txt").write_bytes(b"replaced")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+
+    entry = recovery.snapshot_bytes(
+        "notes.txt", b"original", str(tmp_path / "rec"),
+        target=fsmount.absolute_target(str(mount), "notes.txt"))
+
+    (mount / "notes.txt").unlink()
+    monkeypatch.chdir(elsewhere)
+    assert recovery.restore_entry(entry) is True
+
+    assert (mount / "notes.txt").read_bytes() == b"original"
+    assert not (elsewhere / "notes.txt").exists(), "restored to the wrong place"
+
+
+def test_a_restore_that_cannot_write_reports_failure_instead_of_raising(tmp_path):
+    """cmd_undo has no try/except, so an exception here is a traceback and the
+    user learns nothing about whether their file came back. The realistic
+    cause is a target whose directory is gone - undo after unmounting the
+    filesystem guard. False renders as ESCALATE, which is the honest answer.
+    """
+    entry = recovery.snapshot_bytes(
+        "notes.txt", b"original", str(tmp_path / "rec"),
+        target=str(tmp_path / "unmounted" / "notes.txt"))
+    assert recovery.restore_entry(entry) is False
