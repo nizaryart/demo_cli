@@ -24,7 +24,8 @@ import uuid
 from dataclasses import dataclass
 from typing import List, Optional
 
-from .classify import POSIX, join_continuations, redirect_target
+from .classify import (POSIX, join_continuations, redirect_target,
+                       substitute_assignments)
 from .context import redact
 
 _PG_URL = re.compile(r"\bpostgres(?:ql)?://\S+", re.I)
@@ -500,6 +501,13 @@ def extract_path_operand(cmd: str, dialect: str = POSIX) -> Optional[str]:
     # A command written across two lines is still one command; fold it before
     # looking for operands, or the path on the second line is simply not seen.
     cmd = join_continuations(cmd, dialect)
+    # `T=notes.txt; rm $T` names its target in the same string it uses it in.
+    # Resolving that here rather than in the classifier keeps the change to
+    # WHAT WE SNAPSHOT, and leaves WHETHER IT IS DESTRUCTIVE alone: `rm $T` is
+    # already classified as an rm either way. Returns the command untouched
+    # unless every reference resolved, so this can only ever narrow an
+    # escalation into a precise snapshot, never widen anything.
+    cmd = substitute_assignments(cmd, dialect)
     if _RM_RE.search(cmd):
         # Collect every operand BEFORE deciding anything. Filtering to
         # os.path.exists() first and only then counting was the bug: an

@@ -304,6 +304,156 @@ def join_continuations(cmd: str, dialect: str = POSIX) -> str:
     return "".join(out)
 
 
+# --------------------------------------------------------------------------
+# Same-line variable substitution
+#
+# The guard reads the TEXT of a command; it never runs it. So whenever the path
+# is not literally in the text, the target cannot be resolved and the action
+# escalates. Measured on 2026-08-24, four shapes cause that:
+#
+#     rm $(cat list.txt)        the shell would run `cat` to find out. We must
+#                               not, so this stays unresolvable - permanently.
+#     python cleanup.py         the paths are inside another file.
+#     rm $TARGET                set in an earlier, separate command. On Linux
+#                               the agent's bash session persists, so the value
+#                               exists somewhere we cannot reach from the hook
+#                               process. On Windows it does not even exist:
+#                               Claude Code spawns a fresh `powershell
+#                               -NoProfile` per tool call, so nothing survives.
+#     T=notes.txt; rm $T        THE ASSIGNMENT AND THE USE ARE IN THE SAME
+#                               STRING. Nothing has to be executed, guessed, or
+#                               asked for. This one is simply readable, and
+#                               this function reads it.
+#
+# Only the last shape is handled here, deliberately. Globs and brace expansion
+# are already resolved in recovery._path_operands; the first three cannot be
+# resolved by any pre-execution guard and continue to escalate.
+# --------------------------------------------------------------------------
+
+# NAME=value, optionally exported, at the start of the line or after a
+# separator. The value is a quoted string or a run of unremarkable characters.
+_POSIX_ASSIGN = re.compile(
+    r"""(?:^|(?<=[;&|]))\s*(?:export\s+)?
+        ([A-Za-z_]\w*)=("[^"]*"|'[^']*'|[^\s;&|<>]*)""",
+    re.VERBOSE)
+# $name = value. `env:` is included because that is the form an agent actually
+# uses on Windows ($env:TARGET = "x"), observed live.
+_PS_ASSIGN = re.compile(
+    r"""(?:^|(?<=[;|]))\s*
+        \$((?:env:)?[A-Za-z_]\w*)\s*=\s*("[^"]*"|'[^']*'|[^\s;|<>]+)""",
+    re.VERBOSE)
+
+_POSIX_REF = re.compile(r"\$\{([A-Za-z_]\w*)\}|\$([A-Za-z_]\w*)")
+_PS_REF = re.compile(r"\$\{((?:env:)?[A-Za-z_]\w*)\}|\$((?:env:)?[A-Za-z_]\w*)")
+
+_ASSIGN = {POSIX: _POSIX_ASSIGN, POWERSHELL: _PS_ASSIGN}
+_REF = {POSIX: _POSIX_REF, POWERSHELL: _PS_REF}
+
+# A value we refuse to substitute. Every character here can change the SHAPE of
+# the command rather than merely filling in a word:
+#
+#   $ and `   the value is itself unresolved, or contains a command
+#             substitution. Substituting would turn "I cannot tell" into
+#             something that LOOKS resolved. That is the exact lie this
+#             project exists to prevent.
+#   ; & |     one command would silently become two, and the classifier would
+#             then judge a command line that was never written.
+#   < > \n    redirection and line structure, same reasoning.
+#
+# When a value is refused the name is simply left unknown, which leaves its
+# references unresolved, which makes the whole substitution fail closed below.
+_UNSAFE_VALUE = re.compile(r"[$`;&|<>\n]")
+
+
+def _assignment_survives(cmd: str, end: int) -> bool:
+    """False when the assignment runs in a subshell and its value never
+    reaches the command that uses it.
+
+        T=a | tee x ; rm $T      the assignment is one stage of a PIPELINE,
+        T=a & b      ; rm $T     and backgrounding forks - both run it in a
+                                 subshell, so the parent's T is never set.
+                                 Substituting would name a file the shell
+                                 never touched, and report a snapshot of it.
+
+        T=a && rm $T             `&&` and `||` are sequencing, not forking.
+        T=a || rm $T             The value survives. So does `T=a > out`.
+        T=a ;  rm $T
+
+    An unquoted value cannot CONTAIN these characters - the value pattern
+    stops before them - so `_UNSAFE_VALUE` never sees them and this check is
+    the only thing standing between the two cases. Doubled operators are
+    sequencing; single ones fork.
+    """
+    rest = cmd[end:].lstrip(" \t")
+    if rest.startswith("&&") or rest.startswith("||"):
+        return True
+    return not rest.startswith("&") and not rest.startswith("|")
+
+
+def substitute_assignments(cmd: str, dialect: str = POSIX) -> str:
+    """Resolve variables assigned earlier in the SAME command string.
+
+        T=notes.txt; rm $T              ->  T=notes.txt; rm notes.txt
+        $t = "notes.txt"; rm $t         ->  $t = "notes.txt"; rm notes.txt
+
+    Returns the command UNCHANGED unless every variable reference in it could
+    be resolved. That is the honesty rule for this function, and it is the
+    whole reason it is safe to use:
+
+        rm $T $OTHER      with only T known
+
+    Substituting T alone yields `rm notes.txt $OTHER`, where $OTHER is now an
+    ordinary-looking operand that happens not to exist. Two operands collapse
+    to their common directory, and the guard would consider snapshotting a
+    directory for a command it still cannot read. Partial knowledge presented
+    as complete is worse than admitted ignorance, so a single unresolved
+    reference discards the whole substitution and the action escalates exactly
+    as it does today.
+
+    Nothing is executed. Values are read out of the string itself.
+    """
+    assign_re, ref_re = _ASSIGN.get(dialect), _REF.get(dialect)
+    if not assign_re or "$" not in cmd:
+        return cmd
+
+    # Where each name was last assigned, and the spans of the assignments
+    # themselves. A PowerShell assignment's left side ($t = ...) matches the
+    # reference pattern too, so those spans have to be skipped or the target
+    # of the assignment would be substituted with its own value.
+    values: List[tuple] = []          # (position, name, value)
+    skip: List[tuple] = []            # (start, end) of assignment left-hand sides
+    for m in assign_re.finditer(cmd):
+        raw = m.group(2)
+        skip.append((m.start(), m.start(2)))
+        value = raw[1:-1] if len(raw) >= 2 and raw[0] in "\"'" and raw[-1] == raw[0] else raw
+        if not value or _UNSAFE_VALUE.search(value):
+            continue                  # refused: leave the name unknown
+        if not _assignment_survives(cmd, m.end(2)):
+            continue                  # ran in a subshell; the value is gone
+        values.append((m.start(), m.group(1), value))
+
+    if not values:
+        return cmd
+
+    resolved_all = True
+
+    def replace(m):
+        nonlocal resolved_all
+        if any(a <= m.start() < b for a, b in skip):
+            return m.group(0)         # this IS an assignment target
+        name = m.group(1) or m.group(2)
+        # The value in force HERE: the last assignment to this name that
+        # appears before this reference. Later assignments have not run yet.
+        latest = [v for pos, n, v in values if n == name and pos < m.start()]
+        if not latest:
+            resolved_all = False
+            return m.group(0)
+        return latest[-1]
+
+    out = ref_re.sub(replace, cmd)
+    return out if resolved_all else cmd
+
+
 def split_segments(cmd: str, dialect: str = POSIX) -> List[str]:
     """Split a command line on shell separators (| || && ; newline) while
     respecting single and double quotes. Returns trimmed, non-empty segments.
