@@ -688,6 +688,83 @@ def cmd_mount(a) -> int:
     return 0
 
 
+def _show_plan(plan, title: str, next_steps: List[str]) -> int:
+    """Print what is about to happen, then require the word 'yes'.
+
+    This command MOVES SOMEBODY'S PROJECT. It prints the exact before and after
+    paths and waits, every time, unless --yes is passed deliberately. A y/N
+    prompt is too easy to hit by reflex for an operation this size.
+    """
+    from . import protect as protect_mod
+
+    print(render.c(f"\ndemo_cli {__version__}  {title}\n", "dim"))
+    print(render.kv("project", plan.source))
+    print(render.kv("files move to", plan.backing))
+    print(render.kv("mount point", plan.mountpoint))
+    print(render.kv("lock backing", "yes (Administrators + SYSTEM only)"
+                    if plan.will_lock and protect_mod.is_elevated() else "no"))
+    for w in plan.warnings:
+        print("\n  " + render.c("! " + w, "yellow"))
+    for pr in plan.problems:
+        print("\n  " + render.c("x " + pr, "red"))
+    if not plan.ok:
+        print()
+        return 1
+    print()
+    for line in next_steps:
+        print("  " + render.c(line, "dim"))
+    print()
+    return 0
+
+
+def cmd_protect(a) -> int:
+    """Relocate a project so its own path can become the guarded mount point."""
+    from . import protect as protect_mod
+
+    plan = protect_mod.plan_protect(a.project, getattr(a, "backing", None),
+                                    lock=not getattr(a, "no_lock", False))
+    mount_cmd = f"demo_cli mount {plan.mountpoint} --backing {plan.backing}"
+    rc = _show_plan(plan, "protect", ["After this, start the guard with:",
+                                      f"  {mount_cmd}",
+                                      "Undo at any time with:",
+                                      f"  demo_cli unprotect {plan.source}"])
+    if rc:
+        return rc
+    if not getattr(a, "yes", False):
+        if input("  Type 'yes' to move your project: ").strip().lower() != "yes":
+            print("  Nothing was changed.\n")
+            return 1
+    for step in protect_mod.protect(plan):
+        print("  " + render.c(step, "green"))
+    print("\n  " + render.c(f"Now run:  {mount_cmd}", "dim") + "\n")
+    return 0
+
+
+def cmd_unprotect(a) -> int:
+    """Move a protected project back and remove the lock."""
+    from . import protect as protect_mod
+
+    plan = protect_mod.plan_unprotect(a.project, getattr(a, "backing", None))
+    print(render.c(f"\ndemo_cli {__version__}  unprotect\n", "dim"))
+    print(render.kv("files move back to", plan.source))
+    print(render.kv("from", plan.backing))
+    for w in plan.warnings:
+        print("\n  " + render.c("! " + w, "yellow"))
+    for pr in plan.problems:
+        print("\n  " + render.c("x " + pr, "red"))
+    print()
+    if not plan.ok:
+        return 1
+    if not getattr(a, "yes", False):
+        if input("  Type 'yes' to restore: ").strip().lower() != "yes":
+            print("  Nothing was changed.\n")
+            return 1
+    for step in protect_mod.unprotect(plan):
+        print("  " + render.c(step, "green"))
+    print()
+    return 0
+
+
 def cmd_egress(a) -> int:
     """Start the egress guard: an mitmproxy addon that gates destructive external
     / SaaS API calls on the network wire. Shells out to the installed `mitmdump`
@@ -870,6 +947,27 @@ def build_parser() -> argparse.ArgumentParser:
                          "on unmount - fine for a demo, not for real work")
     mt.add_argument("--debug", action="store_true", help="verbose WinFsp logging")
     mt.set_defaults(func=cmd_mount)
+
+    pr = sub.add_parser("protect", parents=[common],
+                        help="relocate a project so its path becomes the guarded mount [Windows]")
+    pr.add_argument("project", help="the project directory to protect")
+    pr.add_argument("--backing", metavar="DIR",
+                    help="where the real files go (default: <project>.real)")
+    pr.add_argument("--no-lock", action="store_true",
+                    help="skip the ACL lock on the backing directory. Without "
+                         "the lock anything can write to it directly and "
+                         "bypass the guard entirely")
+    pr.add_argument("--yes", action="store_true",
+                    help="skip the confirmation prompt (this command MOVES your project)")
+    pr.set_defaults(func=cmd_protect)
+
+    up = sub.add_parser("unprotect", parents=[common],
+                        help="move a protected project back and remove the lock")
+    up.add_argument("project", help="the project directory to restore")
+    up.add_argument("--backing", metavar="DIR",
+                    help="where the real files are (default: <project>.real)")
+    up.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+    up.set_defaults(func=cmd_unprotect)
 
     eg = sub.add_parser("egress", parents=[common],
                         help="gate destructive external/SaaS API calls via an HTTP proxy (needs mitmdump)")
