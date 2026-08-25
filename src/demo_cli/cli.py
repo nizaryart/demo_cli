@@ -83,7 +83,7 @@ def _resolve_entry(cfg, a):
 
 
 def cmd_undo(a) -> int:
-    cfg = load_config()
+    cfg = load_config(getattr(a, "root", None))
     entry = _resolve_entry(cfg, a)
     ok = recovery.restore_entry(entry) if entry else False
     # Pass the ledger we searched: "not found" is unactionable without it, and
@@ -96,7 +96,7 @@ def cmd_undo(a) -> int:
 
 
 def cmd_diff(a) -> int:
-    cfg = load_config()
+    cfg = load_config(getattr(a, "root", None))
     entry = _resolve_entry(cfg, a)
     if not entry:
         print(render.c("No recovery point matched. Try `demo_cli log`.", "red"))
@@ -106,13 +106,13 @@ def cmd_diff(a) -> int:
 
 
 def cmd_log(a) -> int:
-    cfg = load_config()
+    cfg = load_config(getattr(a, "root", None))
     render.render_log(recovery.load_entries(cfg.recovery_dir), __version__)
     return 0
 
 
 def cmd_verify(a) -> int:
-    cfg = load_config()
+    cfg = load_config(getattr(a, "root", None))
     v = verify_chain(cfg.receipts_path)
     render.render_verify(v, __version__)
     return 0 if v.ok else 1
@@ -744,6 +744,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--version", action="version", version=f"demo_cli {__version__}")
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--no-color", action="store_true", help="disable coloured output")
+    common.add_argument("--root", metavar="DIR",
+                        help="project whose ledger to use, instead of resolving one "
+                             "from the current directory. A filesystem guard mounted "
+                             "elsewhere writes elsewhere; this is how you reach it")
     sub = p.add_subparsers(dest="cmd")
 
     ch = sub.add_parser("check", parents=[common], help="evaluate one command before it runs")

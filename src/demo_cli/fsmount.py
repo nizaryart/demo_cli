@@ -97,6 +97,33 @@ def absolute_target(mountpoint: Optional[str], virtual: str) -> str:
     return os.path.join(mountpoint, virtual.replace("/", os.sep))
 
 
+def config_anchor(mountpoint: str, backing: Optional[str] = None) -> str:
+    """Which directory the mount's config and ledger are resolved from.
+
+    NOT the current directory, which is what load_config() defaults to.
+    Observed three times in two days: the same lab mounted from three
+    different shells put its recovery points in three different ledgers, and
+    `demo_cli undo` answered "No recovery points found" while the files sat
+    intact somewhere else entirely. Twenty minutes went into the second one.
+
+    A mount's scope is the mountpoint, so the ledger has to follow the thing
+    being protected rather than the shell that launched the protection - which
+    the mount may well outlive, and is exactly what --detach is for.
+
+        backing given   the backing directory. It holds the real files and it
+                        always exists.
+        otherwise       the mount point's PARENT. The mount point itself
+                        cannot be used: WinFsp has not created it yet, and
+                        find_project_root would walk from a path that is not
+                        there.
+
+    Module level so it can be tested off Windows, like absolute_target.
+    """
+    if backing:
+        return os.path.abspath(backing)
+    return os.path.dirname(os.path.abspath(mountpoint)) or os.path.abspath(mountpoint)
+
+
 def _require_windows() -> None:
     if os.name != "nt":
         raise RuntimeError(
@@ -765,16 +792,30 @@ def mount(mountpoint: str, config: Optional[Config] = None,
     from winfspy import FileSystem
     from winfspy.plumbing.win32_filetime import filetime_now
 
-    config = config or load_config()
-
     # Resolved before the filesystem is built: the operations object needs the
     # mount point to record absolute targets, and a relative mountpoint would
     # reintroduce exactly the cwd-dependence W5 was about.
     path = Path(os.path.abspath(mountpoint))
     is_drive = path.parent == path
+    backing = os.path.abspath(backing) if backing else None
+
+    # THE CONFIG IS ANCHORED TO WHAT IS BEING GUARDED, NOT TO THE SHELL.
+    #
+    # load_config() defaults to walking up from the current directory, which
+    # for a mount is whatever the user happened to be standing in. Observed
+    # three times in two days: the same lab mounted from three directories put
+    # its recovery points in three different ledgers, and `demo_cli undo`
+    # answered "No recovery points found" while the files sat intact somewhere
+    # else. Twenty minutes went into the second one.
+    #
+    # A mount's scope is the mountpoint. The ledger has to follow the thing
+    # being protected, not the shell that launched the protection - the mount
+    # may outlive that shell entirely, which is precisely what --detach is for.
+    #
+    if config is None:
+        config = load_config(config_anchor(str(path), backing))
 
     if backing:
-        backing = os.path.abspath(backing)
         # The backing directory must not be inside the mount point, or the
         # filesystem would be storing its own contents through itself.
         try:
@@ -817,9 +858,11 @@ def mount(mountpoint: str, config: Optional[Config] = None,
                "  in-memory: contents are LOST on unmount; snapshots are on real disk.\n")
     sys.stderr.write(
         f"demo_cli filesystem guard mounted at {path}\n"
+        f"  project root    -> {config.project_root}\n"
         f"  recovery points -> {config.recovery_dir}\n"
         f"  receipts        -> {config.receipts_path}\n"
         + storage +
+        f"  undo from anywhere:  demo_cli undo <id> --root {config.project_root}\n"
         f"  Ctrl+C to unmount.\n")
     try:
         import time

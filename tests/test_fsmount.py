@@ -157,6 +157,60 @@ def test_undo_lands_in_the_same_place_whatever_the_cwd(tmp_path, monkeypatch):
     assert not (elsewhere / "notes.txt").exists(), "restored to the wrong place"
 
 
+# --------------------------------------------------------------------------
+# Where the mount's ledger lives
+#
+# Found live on 2026-08-25, three times in two days. `demo_cli mount` called
+# load_config() with no argument, which resolves the project root from the
+# CURRENT DIRECTORY - so the same lab mounted from three different shells wrote
+# its recovery points into three different ledgers, and `undo` reported "No
+# recovery points found" while the files sat intact somewhere else.
+#
+# A mount guards the mountpoint. Its ledger has to follow that, not the shell.
+# --------------------------------------------------------------------------
+
+def test_the_ledger_follows_the_backing_directory(tmp_path):
+    """Stage 2: the backing directory holds the real files and always exists,
+    so it is the honest anchor."""
+    backing = tmp_path / "project.real"
+    backing.mkdir()
+    anchor = fsmount.config_anchor(str(tmp_path / "guarded"), str(backing))
+    assert anchor == str(backing)
+
+
+def test_without_a_backing_the_ledger_follows_the_mount_point_parent(tmp_path):
+    """Stage 1: the mount point itself does not exist yet - WinFsp creates it -
+    so resolving from it would walk up from a path that is not there."""
+    anchor = fsmount.config_anchor(str(tmp_path / "guarded"))
+    assert anchor == str(tmp_path)
+
+
+def test_the_anchor_never_depends_on_the_current_directory(tmp_path, monkeypatch):
+    """THE regression test. Same arguments from two different shells must
+    produce the same ledger."""
+    backing = tmp_path / "real"
+    backing.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+
+    monkeypatch.chdir(tmp_path)
+    first = fsmount.config_anchor(str(tmp_path / "guarded"), str(backing))
+    monkeypatch.chdir(elsewhere)
+    second = fsmount.config_anchor(str(tmp_path / "guarded"), str(backing))
+    assert first == second
+
+    monkeypatch.chdir(elsewhere)
+    stage1_a = fsmount.config_anchor(str(tmp_path / "guarded"))
+    monkeypatch.chdir(tmp_path)
+    stage1_b = fsmount.config_anchor(str(tmp_path / "guarded"))
+    assert stage1_a == stage1_b == str(tmp_path)
+
+
+def test_a_relative_mountpoint_still_yields_an_absolute_anchor(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert os.path.isabs(fsmount.config_anchor("guarded"))
+
+
 def test_a_restore_that_cannot_write_reports_failure_instead_of_raising(tmp_path):
     """cmd_undo has no try/except, so an exception here is a traceback and the
     user learns nothing about whether their file came back. False renders as
