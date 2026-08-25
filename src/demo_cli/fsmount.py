@@ -9,14 +9,25 @@ WINDOWS ONLY. `winfspy` is imported lazily inside `build_operations`, never at
 module scope, so importing this file on Linux is harmless - the same
 arrangement `syscall_guard.py` uses for its `ctypes.CDLL("libc.so.6")`.
 
-Stage 1 (this file) mounts an IN-MEMORY filesystem. That is deliberate: it
-proves interception, snapshotting and undo end to end without also having to
-write a correct passthrough filesystem, which is 600+ lines whose failure mode
-is corrupting the user's real files. Recovery points are written to the REAL
-disk, so they survive the mount.
+TWO STAGES LIVE HERE, and they make the SAME DECISIONS. Both drive fsguard.py;
+only storage differs.
 
-Stage 2, not built: passthrough over real storage. The hooks below do not
-change; only where the bytes live does.
+  build_operations              STAGE 1, in memory. Contents are LOST on
+                                unmount. Built first on purpose: it proved
+                                interception, snapshotting and undo end to end
+                                without also requiring a correct filesystem,
+                                whose failure mode is corrupting real files
+                                rather than losing scratch ones. Keep it - it
+                                is the cheap way to exercise the hooks.
+  build_passthrough_operations  STAGE 2, over a real backing directory
+                                (fspassthrough.Backing). Files survive
+                                unmounting, so this is the one a person can
+                                work in.
+
+Recovery points go to the REAL disk in both cases, so they outlive the mount
+either way. That Stage 2 needed no change at all to fsguard.py, and only one
+line of `_capture`, is the return on having split judgement from plumbing
+before writing either.
 
 --------------------------------------------------------------------------
 WHY THESE FOUR HOOKS, AND NOT THE OBVIOUS ONES
@@ -37,6 +48,7 @@ all, so neither is a usable signal.
 """
 from __future__ import annotations
 
+import errno
 import os
 import sys
 from typing import Optional
@@ -283,8 +295,9 @@ def build_passthrough_operations(config: Config, backing_dir: str,
     _require_windows()
 
     from winfspy import (BaseFileSystemOperations, CREATE_FILE_CREATE_OPTIONS,
-                         FILE_ATTRIBUTE, NTStatusDirectoryNotEmpty,
-                         NTStatusEndOfFile, NTStatusNotADirectory,
+                         FILE_ATTRIBUTE, NTStatusAccessDenied,
+                         NTStatusDirectoryNotEmpty, NTStatusEndOfFile,
+                         NTStatusError, NTStatusNotADirectory,
                          NTStatusObjectNameCollision, NTStatusObjectNameNotFound)
     from winfspy.plumbing.security_descriptor import SecurityDescriptor
     from winfspy.plumbing.win32_filetime import filetime_now
@@ -300,6 +313,44 @@ def build_passthrough_operations(config: Config, backing_dir: str,
         look like it was written in 1601, and tools that compare timestamps
         (make, git, an editor's reload prompt) start behaving strangely."""
         return int(unix_seconds * 10_000_000) + EPOCH_AS_FILETIME
+
+    def guarded(fn):
+        """Turn any leaked OSError into a proper NTSTATUS.
+
+        An unhandled exception inside a filesystem operation is not a bug
+        report, it is a broken filesystem: winfspy prints a traceback and the
+        caller gets a generic "I/O device error" with no idea what happened -
+        which is exactly what the first live passthrough run produced. Windows
+        has status codes for all of these; using them means the shell prints
+        "access denied" or "file exists" and the mount stays healthy.
+
+        NTStatus exceptions pass through untouched: they are the intended
+        signalling mechanism, not errors.
+        """
+        import functools
+
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            try:
+                return fn(*args, **kwargs)
+            except NTStatusError:
+                raise
+            except PathEscape:
+                raise NTStatusObjectNameNotFound()
+            except FileExistsError:
+                raise NTStatusObjectNameCollision()
+            except FileNotFoundError:
+                raise NTStatusObjectNameNotFound()
+            except NotADirectoryError:
+                raise NTStatusNotADirectory()
+            except PermissionError:
+                raise NTStatusAccessDenied()
+            except OSError as exc:
+                if exc.errno == errno.ENOTEMPTY:
+                    raise NTStatusDirectoryNotEmpty()
+                sys.stderr.write(f"demo_cli [fs] {fn.__name__}: {exc}\n")
+                raise NTStatusAccessDenied()
+        return wrapper
 
     class Handle:
         """One open file or directory. WinFsp hands this back on every call.
@@ -364,6 +415,7 @@ def build_passthrough_operations(config: Config, backing_dir: str,
         # Volume
         # ------------------------------------------------------------------
 
+        @guarded
         def get_volume_info(self):
             """Real free space from the backing volume. Reporting a made-up
             number makes installers and editors refuse to write, or write
@@ -373,6 +425,7 @@ def build_passthrough_operations(config: Config, backing_dir: str,
             return {"total_size": usage.total, "free_size": usage.free,
                     "volume_label": self._label}
 
+        @guarded
         def set_volume_label(self, volume_label):
             self._label = volume_label
 
@@ -380,13 +433,16 @@ def build_passthrough_operations(config: Config, backing_dir: str,
         # Lookup, create, open
         # ------------------------------------------------------------------
 
+        @guarded
         def get_security_by_name(self, file_name):
             info = self._info(file_name)
             return info["file_attributes"], self._sd.handle, self._sd.size
 
+        @guarded
         def get_security(self, file_context):
             return self._sd
 
+        @guarded
         def set_security(self, file_context, security_information,
                          modification_descriptor):
             # Deliberately a no-op. Per-file ACLs inside the mount would
@@ -394,6 +450,7 @@ def build_passthrough_operations(config: Config, backing_dir: str,
             # provide; the backing ACL is the real boundary.
             pass
 
+        @guarded
         def create(self, file_name, create_options, granted_access,
                    file_attributes, security_descriptor, allocation_size):
             virtual = normalize(file_name)
@@ -419,6 +476,7 @@ def build_passthrough_operations(config: Config, backing_dir: str,
             except NotADirectoryError:
                 raise NTStatusNotADirectory()
 
+        @guarded
         def open(self, file_name, create_options, granted_access):
             virtual = normalize(file_name)
             try:
@@ -434,6 +492,7 @@ def build_passthrough_operations(config: Config, backing_dir: str,
                 # mount cannot show read-only content at all.
                 return Handle(virtual, False, self.backing.open_fd(virtual, write=False))
 
+        @guarded
         def close(self, file_context):
             if file_context.fd is not None:
                 try:
@@ -442,9 +501,11 @@ def build_passthrough_operations(config: Config, backing_dir: str,
                     pass
                 file_context.fd = None
 
+        @guarded
         def get_file_info(self, file_context):
             return self._info(file_context.virtual)
 
+        @guarded
         def set_basic_info(self, file_context, file_attributes, creation_time,
                            last_access_time, last_write_time, change_time,
                            file_info) -> dict:
@@ -454,6 +515,7 @@ def build_passthrough_operations(config: Config, backing_dir: str,
             # touch for no benefit the caller can observe.
             return self._info(file_context.virtual)
 
+        @guarded
         def flush(self, file_context) -> None:
             if file_context.fd is not None:
                 os.fsync(file_context.fd)
@@ -462,12 +524,14 @@ def build_passthrough_operations(config: Config, backing_dir: str,
         # Reading
         # ------------------------------------------------------------------
 
+        @guarded
         def read(self, file_context, offset, length):
             size = self.backing.size_of_fd(file_context.fd)
             if offset >= size:
                 raise NTStatusEndOfFile()
             return self.backing.read_at(file_context.fd, offset, length)
 
+        @guarded
         def read_directory(self, file_context, marker):
             virtual = file_context.virtual
             if not self.backing.is_dir(virtual):
@@ -500,6 +564,7 @@ def build_passthrough_operations(config: Config, backing_dir: str,
             # a recursive delete produces.
             return []
 
+        @guarded
         def get_dir_info_by_name(self, file_context, file_name):
             parent = file_context.virtual
             child = f"{parent}/{file_name}" if parent else file_name
@@ -509,6 +574,7 @@ def build_passthrough_operations(config: Config, backing_dir: str,
         # Writing
         # ------------------------------------------------------------------
 
+        @guarded
         def write(self, file_context, buffer, offset, write_to_end_of_file,
                   constrained_io):
             fd = file_context.fd
@@ -528,6 +594,7 @@ def build_passthrough_operations(config: Config, backing_dir: str,
         # The four destructive hooks - IDENTICAL DECISIONS TO STAGE 1
         # ------------------------------------------------------------------
 
+        @guarded
         def cleanup(self, file_context, file_name, flags) -> None:
             verdict = fsguard.on_cleanup(file_name or file_context.virtual, flags)
             if verdict.destructive:
@@ -540,6 +607,7 @@ def build_passthrough_operations(config: Config, backing_dir: str,
                     # removes a tree leaf-first and will come back for it.
                     pass
 
+        @guarded
         def set_file_size(self, file_context, new_size, set_allocation_size):
             fd = file_context.fd
             current = self.backing.size_of_fd(fd)
@@ -551,6 +619,7 @@ def build_passthrough_operations(config: Config, backing_dir: str,
             elif new_size < current:
                 self.backing.set_size_fd(fd, new_size)
 
+        @guarded
         def rename(self, file_context, file_name, new_file_name, replace_if_exists):
             # The DESTINATION is what dies, and nothing else will announce it:
             # no cleanup, no can_delete. This is Claude Code's Write tool on
@@ -560,6 +629,18 @@ def build_passthrough_operations(config: Config, backing_dir: str,
                                         dest_exists=self.backing.exists(dest))
             if verdict.destructive:
                 self._capture(verdict)
+
+            # Release our own descriptor first. FILE_SHARE_DELETE (see
+            # fspassthrough._open_fd_windows) is what makes the rename legal at
+            # all; dropping the handle as well costs nothing and removes the
+            # last thing on our side that could hold the file. The handle is
+            # reopened afterwards because WinFsp keeps using this context.
+            fd, file_context.fd = file_context.fd, None
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
             try:
                 self.backing.rename(normalize(file_name), dest, replace_if_exists)
                 file_context.virtual = dest
@@ -567,7 +648,15 @@ def build_passthrough_operations(config: Config, backing_dir: str,
                 raise NTStatusObjectNameCollision()
             except PathEscape:
                 raise NTStatusObjectNameNotFound()
+            finally:
+                if not file_context.is_dir:
+                    try:
+                        file_context.fd = self.backing.open_fd(file_context.virtual)
+                    except OSError:
+                        pass        # reads through this context will fail; the
+                                    # rename itself already succeeded or raised
 
+        @guarded
         def overwrite(self, file_context, file_attributes,
                       replace_file_attributes, allocation_size) -> None:
             fd = file_context.fd
@@ -577,6 +666,7 @@ def build_passthrough_operations(config: Config, backing_dir: str,
                 self._capture(verdict)
             self.backing.set_size_fd(fd, 0)
 
+        @guarded
         def can_delete(self, file_context, file_name: str) -> None:
             virtual = normalize(file_name)
             if self.backing.is_dir(virtual) and self.backing.listdir(virtual):

@@ -204,12 +204,17 @@ class Backing:
         """A raw OS file descriptor. Raw rather than a buffered object because
         WinFsp reads and writes at explicit offsets from several threads, and a
         Python file object's internal position is shared state we would then
-        have to lock."""
+        have to lock.
+
+        On Windows this goes through CreateFileW rather than os.open, for one
+        reason: FILE_SHARE_DELETE. See _open_fd_windows - without it the
+        passthrough cannot perform the single most important operation it
+        exists to guard.
+        """
         real = self.resolve(virtual)
-        flags = os.O_RDWR if write else os.O_RDONLY
-        if hasattr(os, "O_BINARY"):             # Windows
-            flags |= os.O_BINARY
-        return os.open(real, flags)
+        if os.name == "nt":
+            return _open_fd_windows(real, write)
+        return os.open(real, os.O_RDWR if write else os.O_RDONLY)
 
     @staticmethod
     def read_at(fd: int, offset: int, length: int) -> bytes:
@@ -313,6 +318,59 @@ class Backing:
 import threading
 
 _POSITION_LOCK = threading.Lock()
+
+
+# --------------------------------------------------------------------------
+# Windows: opening a file that can still be renamed and deleted
+#
+# THE DEFECT THIS FIXES, found on the first live passthrough run (2026-08-25):
+#
+#     os.replace('temp.txt', 'keep.txt')
+#     PermissionError: [WinError 32] The process cannot access the file
+#     because it is being used by another process
+#
+# We were the other process. WinFsp calls rename() while handing us a file
+# context that holds OUR OWN descriptor on the source, and Windows refuses to
+# rename or delete a file with an open handle unless every handle was opened
+# with FILE_SHARE_DELETE. Python's os.open never sets it, and exposes no way
+# to ask - so the only route is CreateFileW directly.
+#
+# This is not an edge case. rename-onto-an-existing-file IS Claude Code's Write
+# tool on every save, and the operation with no delete signal is the entire
+# reason the Windows guard exists. Without share-delete, the passthrough
+# cannot perform the one thing it was built to watch.
+#
+# POSIX has no equivalent problem: an open file can always be renamed or
+# unlinked, so the plain os.open path above is correct there.
+# --------------------------------------------------------------------------
+
+_GENERIC_READ = 0x80000000
+_GENERIC_WRITE = 0x40000000
+_SHARE_READ_WRITE_DELETE = 0x01 | 0x02 | 0x04
+_OPEN_EXISTING = 3
+_FILE_ATTRIBUTE_NORMAL = 0x80
+
+
+def _open_fd_windows(real: str, write: bool) -> int:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD,
+                                     wintypes.DWORD, wintypes.LPVOID,
+                                     wintypes.DWORD, wintypes.DWORD,
+                                     wintypes.HANDLE]
+    access = _GENERIC_READ | (_GENERIC_WRITE if write else 0)
+    handle = kernel32.CreateFileW(real, access, _SHARE_READ_WRITE_DELETE, None,
+                                  _OPEN_EXISTING, _FILE_ATTRIBUTE_NORMAL, None)
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    # open_osfhandle takes ownership: closing the returned fd closes the
+    # handle, so there is exactly one thing to release.
+    return msvcrt.open_osfhandle(handle, os.O_BINARY if write
+                                 else (os.O_BINARY | os.O_RDONLY))
 
 
 def _read_at_seek(fd: int, offset: int, length: int) -> bytes:
