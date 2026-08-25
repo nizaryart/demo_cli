@@ -663,14 +663,28 @@ def cmd_mount(a) -> int:
             print("On Linux the equivalent layer is:  demo_cli run <cmd>")
         else:
             print("winfspy is not importable. Install WinFsp from winfsp.dev")
-            print("with the Developer feature enabled, then: pip install winfspy")
+            print("winfspy is not importable. Install WinFsp from winfsp.dev")
+            print("with the Developer feature enabled, then:")
+            print("  pipx inject demo-cli winfspy      (if demo_cli came from pipx)")
+            print("  pip install winfspy               (otherwise)")
         return 1
     if os.path.exists(a.mountpoint):
         print(f"{a.mountpoint} already exists.")
         print("WinFsp CREATES the mount point itself, so it must not exist yet.")
         print("Pick a new path, e.g. a 'myproject-guarded' beside your project.")
         return 1
-    mount(a.mountpoint, debug=a.debug)
+    backing = getattr(a, "backing", None)
+    if backing and not os.path.isdir(backing):
+        print(f"The backing directory {backing} does not exist.")
+        print("It is where your files actually live. To convert an existing")
+        print("project, move it aside first so its own path is free for the mount.")
+        return 1
+    if not backing:
+        # Said before the mount starts, not buried in the banner afterwards.
+        print("NOTE: no --backing given, so this mount is IN MEMORY.")
+        print("      Everything written inside it is LOST when you unmount.")
+        print("      For real work: demo_cli mount <path> --backing <where files live>")
+    mount(a.mountpoint, debug=a.debug, backing=backing)
     return 0
 
 
@@ -846,6 +860,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="a path that does NOT yet exist (WinFsp creates it), "
                          "or a drive letter like X: (a directory is preferred - "
                          "Claude Code will not use a bare drive root as its cwd)")
+    mt.add_argument("--backing", metavar="DIR",
+                    help="directory holding the real files (STAGE 2). Without "
+                         "it the mount is in memory and its contents are LOST "
+                         "on unmount - fine for a demo, not for real work")
     mt.add_argument("--debug", action="store_true", help="verbose WinFsp logging")
     mt.set_defaults(func=cmd_mount)
 

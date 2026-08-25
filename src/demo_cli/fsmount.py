@@ -256,14 +256,417 @@ def build_operations(config: Config, volume_label: str = "demo_cli",
     return GuardedFileSystem(volume_label, config, mountpoint=mountpoint)
 
 
+def build_passthrough_operations(config: Config, backing_dir: str,
+                                 volume_label: str = "demo_cli",
+                                 mountpoint: Optional[str] = None):
+    """STAGE 2: the same guard, over a real directory instead of memory.
+
+    Stage 1 keeps files in a Python dict and loses everything on unmount,
+    which makes it a laboratory instrument. This maps every operation onto a
+    real backing directory, so the mount can be unmounted and the work is
+    still there.
+
+    THE FOUR DESTRUCTIVE HOOKS AND ALL OF fsguard.py ARE UNCHANGED. Only where
+    the bytes live changes - the payoff of having split judgement from
+    plumbing at the start, collected a second time.
+
+    Written against the installed winfspy 0.8.4 source rather than from
+    documentation, for the same reason the hooks were: three of the four probe
+    findings contradicted what the API's own method names imply.
+
+    NO GLOBAL LOCK, unlike winfspy's memfs. memfs must serialise because its
+    state is a shared dict; ours is the operating system, whose individual
+    calls are already atomic, and whose positional reads and writes take an
+    offset instead of moving a shared file position (fspassthrough.read_at).
+    Serialising here would throw away the concurrency for nothing.
+    """
+    _require_windows()
+
+    from winfspy import (BaseFileSystemOperations, CREATE_FILE_CREATE_OPTIONS,
+                         FILE_ATTRIBUTE, NTStatusDirectoryNotEmpty,
+                         NTStatusEndOfFile, NTStatusNotADirectory,
+                         NTStatusObjectNameCollision, NTStatusObjectNameNotFound)
+    from winfspy.plumbing.security_descriptor import SecurityDescriptor
+    from winfspy.plumbing.win32_filetime import filetime_now
+
+    from .fspassthrough import Backing, PathEscape, normalize
+
+    EPOCH_AS_FILETIME = 116444736000000000
+    ALLOCATION_UNIT = 4096
+
+    def _filetime(unix_seconds: float) -> int:
+        """os.stat gives seconds since 1970; Windows wants 100ns units since
+        1601. Getting this wrong does not fail loudly - it makes every file
+        look like it was written in 1601, and tools that compare timestamps
+        (make, git, an editor's reload prompt) start behaving strangely."""
+        return int(unix_seconds * 10_000_000) + EPOCH_AS_FILETIME
+
+    class Handle:
+        """One open file or directory. WinFsp hands this back on every call.
+
+        Holds the VIRTUAL path, not the real one: every translation goes
+        through Backing.resolve, which is the single place containment is
+        enforced. Caching a resolved path here would be a second door.
+        """
+        __slots__ = ("virtual", "is_dir", "fd")
+
+        def __init__(self, virtual, is_dir, fd=None):
+            self.virtual, self.is_dir, self.fd = virtual, is_dir, fd
+
+    class PassthroughOperations(BaseFileSystemOperations):
+
+        def __init__(self, label: str, backing: Backing, cfg: Config,
+                     mount: Optional[str] = None):
+            super().__init__()
+            if len(label) > 31:
+                raise ValueError("`volume_label` must be 31 characters max")
+            self.backing = backing
+            self.cfg = cfg
+            self.mountpoint = mount
+            self.captured = 0
+            self.skipped = 0
+            self._label = label
+            # One descriptor for everything. The backing directory's own ACL
+            # is the real access control - and under `demo_cli protect` that
+            # ACL is the whole point, because it is what stops anyone writing
+            # to the backing directory behind the mount's back.
+            self._sd = SecurityDescriptor.from_string(
+                "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)")
+
+        # ------------------------------------------------------------------
+        # Translation
+        # ------------------------------------------------------------------
+
+        def _info(self, virtual: str) -> dict:
+            try:
+                a = self.backing.attrs(virtual)
+            except PathEscape:
+                raise NTStatusObjectNameNotFound()
+            except FileNotFoundError:
+                raise NTStatusObjectNameNotFound()
+            attrs = (FILE_ATTRIBUTE.FILE_ATTRIBUTE_DIRECTORY if a.is_dir
+                     else FILE_ATTRIBUTE.FILE_ATTRIBUTE_ARCHIVE)
+            if a.readonly:
+                attrs |= FILE_ATTRIBUTE.FILE_ATTRIBUTE_READONLY
+            allocation = ((a.size + ALLOCATION_UNIT - 1) // ALLOCATION_UNIT) * ALLOCATION_UNIT
+            return {
+                "file_attributes": attrs,
+                "allocation_size": allocation,
+                "file_size": a.size,
+                "creation_time": _filetime(a.ctime),
+                "last_access_time": _filetime(a.atime),
+                "last_write_time": _filetime(a.mtime),
+                "change_time": _filetime(a.mtime),
+                "index_number": 0,
+            }
+
+        # ------------------------------------------------------------------
+        # Volume
+        # ------------------------------------------------------------------
+
+        def get_volume_info(self):
+            """Real free space from the backing volume. Reporting a made-up
+            number makes installers and editors refuse to write, or write
+            until the disk genuinely fills."""
+            import shutil as _sh
+            usage = _sh.disk_usage(self.backing.root)
+            return {"total_size": usage.total, "free_size": usage.free,
+                    "volume_label": self._label}
+
+        def set_volume_label(self, volume_label):
+            self._label = volume_label
+
+        # ------------------------------------------------------------------
+        # Lookup, create, open
+        # ------------------------------------------------------------------
+
+        def get_security_by_name(self, file_name):
+            info = self._info(file_name)
+            return info["file_attributes"], self._sd.handle, self._sd.size
+
+        def get_security(self, file_context):
+            return self._sd
+
+        def set_security(self, file_context, security_information,
+                         modification_descriptor):
+            # Deliberately a no-op. Per-file ACLs inside the mount would
+            # suggest a protection the backing directory does not actually
+            # provide; the backing ACL is the real boundary.
+            pass
+
+        def create(self, file_name, create_options, granted_access,
+                   file_attributes, security_descriptor, allocation_size):
+            virtual = normalize(file_name)
+            try:
+                if self.backing.exists(virtual):
+                    raise NTStatusObjectNameCollision()
+                parent = "/".join(virtual.split("/")[:-1])
+                if parent and not self.backing.is_dir(parent):
+                    raise NTStatusObjectNameNotFound()
+                is_dir = bool(create_options
+                              & CREATE_FILE_CREATE_OPTIONS.FILE_DIRECTORY_FILE)
+                if is_dir:
+                    self.backing.make_dir(virtual)
+                    return Handle(virtual, True)
+                self.backing.make_file(virtual)
+                return Handle(virtual, False, self.backing.open_fd(virtual))
+            except PathEscape:
+                raise NTStatusObjectNameNotFound()
+            except FileExistsError:
+                raise NTStatusObjectNameCollision()
+            except FileNotFoundError:
+                raise NTStatusObjectNameNotFound()
+            except NotADirectoryError:
+                raise NTStatusNotADirectory()
+
+        def open(self, file_name, create_options, granted_access):
+            virtual = normalize(file_name)
+            try:
+                if not self.backing.exists(virtual):
+                    raise NTStatusObjectNameNotFound()
+                if self.backing.is_dir(virtual):
+                    return Handle(virtual, True)
+                return Handle(virtual, False, self.backing.open_fd(virtual))
+            except PathEscape:
+                raise NTStatusObjectNameNotFound()
+            except PermissionError:
+                # A file we may read but not write still has to OPEN, or the
+                # mount cannot show read-only content at all.
+                return Handle(virtual, False, self.backing.open_fd(virtual, write=False))
+
+        def close(self, file_context):
+            if file_context.fd is not None:
+                try:
+                    os.close(file_context.fd)
+                except OSError:
+                    pass
+                file_context.fd = None
+
+        def get_file_info(self, file_context):
+            return self._info(file_context.virtual)
+
+        def set_basic_info(self, file_context, file_attributes, creation_time,
+                           last_access_time, last_write_time, change_time,
+                           file_info) -> dict:
+            # Timestamps and attributes are not mutated on the backing file.
+            # They destroy nothing, the OS maintains them, and writing them
+            # back would mean converting FILETIME to Unix time on every
+            # touch for no benefit the caller can observe.
+            return self._info(file_context.virtual)
+
+        def flush(self, file_context) -> None:
+            if file_context.fd is not None:
+                os.fsync(file_context.fd)
+
+        # ------------------------------------------------------------------
+        # Reading
+        # ------------------------------------------------------------------
+
+        def read(self, file_context, offset, length):
+            size = self.backing.size_of_fd(file_context.fd)
+            if offset >= size:
+                raise NTStatusEndOfFile()
+            return self.backing.read_at(file_context.fd, offset, length)
+
+        def read_directory(self, file_context, marker):
+            virtual = file_context.virtual
+            if not self.backing.is_dir(virtual):
+                raise NTStatusNotADirectory()
+
+            entries = []
+            if virtual:                       # '.' and '..' only below the root
+                parent = "/".join(virtual.split("/")[:-1])
+                entries.append({"file_name": ".", **self._info(virtual)})
+                entries.append({"file_name": "..", **self._info(parent)})
+            for name in self.backing.listdir(virtual):
+                child = f"{virtual}/{name}" if virtual else name
+                try:
+                    entries.append({"file_name": name, **self._info(child)})
+                except Exception:
+                    # A file deleted between listdir and stat is normal on a
+                    # live filesystem. Skipping it beats failing the listing.
+                    continue
+            entries.sort(key=lambda e: e["file_name"])
+
+            if marker is None:
+                return entries
+            for i, entry in enumerate(entries):
+                if entry["file_name"] == marker:
+                    return entries[i + 1:]
+            # THE winfspy memfs BUG, avoided rather than inherited: falling off
+            # this loop returns None, ll_read_directory raises TypeError, and a
+            # recursive delete leaves the tree HALF DELETED behind a generic
+            # I/O error. The marker naming a just-deleted entry is exactly what
+            # a recursive delete produces.
+            return []
+
+        def get_dir_info_by_name(self, file_context, file_name):
+            parent = file_context.virtual
+            child = f"{parent}/{file_name}" if parent else file_name
+            return {"file_name": file_name, **self._info(child)}
+
+        # ------------------------------------------------------------------
+        # Writing
+        # ------------------------------------------------------------------
+
+        def write(self, file_context, buffer, offset, write_to_end_of_file,
+                  constrained_io):
+            fd = file_context.fd
+            size = self.backing.size_of_fd(fd)
+            if write_to_end_of_file:
+                offset = size
+            if constrained_io:
+                # "Write only within the current file size" - the caller wants
+                # no extension. Silently growing the file here would corrupt
+                # the caller's own bookkeeping.
+                if offset >= size:
+                    return 0
+                buffer = bytes(buffer)[: size - offset]
+            return self.backing.write_at(fd, bytes(buffer), offset)
+
+        # ------------------------------------------------------------------
+        # The four destructive hooks - IDENTICAL DECISIONS TO STAGE 1
+        # ------------------------------------------------------------------
+
+        def cleanup(self, file_context, file_name, flags) -> None:
+            verdict = fsguard.on_cleanup(file_name or file_context.virtual, flags)
+            if verdict.destructive:
+                self._capture(verdict)
+            if flags & fsguard.FSP_CLEANUP_DELETE:
+                try:
+                    self.backing.remove(file_context.virtual)
+                except OSError:
+                    # A non-empty directory is not deleted here; Windows
+                    # removes a tree leaf-first and will come back for it.
+                    pass
+
+        def set_file_size(self, file_context, new_size, set_allocation_size):
+            fd = file_context.fd
+            current = self.backing.size_of_fd(fd)
+            verdict = fsguard.on_set_file_size(file_context.virtual, new_size, current)
+            if verdict.destructive:
+                self._capture(verdict)
+            if not set_allocation_size:
+                self.backing.set_size_fd(fd, new_size)
+            elif new_size < current:
+                self.backing.set_size_fd(fd, new_size)
+
+        def rename(self, file_context, file_name, new_file_name, replace_if_exists):
+            # The DESTINATION is what dies, and nothing else will announce it:
+            # no cleanup, no can_delete. This is Claude Code's Write tool on
+            # every save, and the single reason this layer exists.
+            dest = normalize(new_file_name)
+            verdict = fsguard.on_rename(file_name, new_file_name, replace_if_exists,
+                                        dest_exists=self.backing.exists(dest))
+            if verdict.destructive:
+                self._capture(verdict)
+            try:
+                self.backing.rename(normalize(file_name), dest, replace_if_exists)
+                file_context.virtual = dest
+            except FileExistsError:
+                raise NTStatusObjectNameCollision()
+            except PathEscape:
+                raise NTStatusObjectNameNotFound()
+
+        def overwrite(self, file_context, file_attributes,
+                      replace_file_attributes, allocation_size) -> None:
+            fd = file_context.fd
+            exists = self.backing.size_of_fd(fd) > 0
+            verdict = fsguard.on_overwrite(file_context.virtual, exists=exists)
+            if verdict.destructive:
+                self._capture(verdict)
+            self.backing.set_size_fd(fd, 0)
+
+        def can_delete(self, file_context, file_name: str) -> None:
+            virtual = normalize(file_name)
+            if self.backing.is_dir(virtual) and self.backing.listdir(virtual):
+                raise NTStatusDirectoryNotEmpty()
+
+        # ------------------------------------------------------------------
+        # Snapshot + receipt
+        # ------------------------------------------------------------------
+
+        def _capture(self, verdict: fsguard.Verdict) -> None:
+            """Preserve the bytes about to be destroyed.
+
+            The ONE substantive difference from Stage 1: the content is read
+            off the backing filesystem instead of copied out of a Python
+            bytearray. Everything after that - the recovery entry, the
+            receipt, the honesty of the ledger - is identical.
+
+            Never raises: a fault in the guard must not break the filesystem
+            somebody is working in. A failure is recorded as an ESCALATE
+            receipt rather than passing silently.
+            """
+            if self.backing.is_dir(verdict.target):
+                # Directories hold no bytes of their own; their contents are
+                # deleted leaf-first and each file gets its own verdict.
+                self.skipped += 1
+                return
+
+            entry, reason = None, None
+            try:
+                data = self.backing.read_all(verdict.target)
+                entry = recovery.snapshot_bytes(
+                    verdict.target, data, self.cfg.recovery_dir,
+                    action=f"{verdict.kind} {verdict.target}",
+                    target=absolute_target(self.mountpoint, verdict.target),
+                )
+            except Exception as exc:                      # pragma: no cover
+                reason = f"could not capture {verdict.target}: {exc}"
+
+            self._receipt(verdict, entry, reason)
+            if entry:
+                self.captured += 1
+                sys.stderr.write(
+                    f"demo_cli [fs] {verdict.kind}: {verdict.target} "
+                    f"snapshotted ({entry['id']}) - undo: demo_cli undo {entry['id']}\n")
+
+        def _receipt(self, verdict, entry, failure: Optional[str]) -> None:
+            try:
+                ctx = build_context(verdict.target or "", cwd=self.cfg.project_root)
+                append_receipt(self.cfg.receipts_path, Receipt(
+                    action_raw=f"[fs] {verdict.kind} {verdict.target}",
+                    action_type="filesystem",
+                    target_environment=ctx.environment,
+                    decision="REVERSIBLE" if entry else "ESCALATE",
+                    reason=failure or f"Snapshotted before {verdict.reason}.",
+                    mode="enforce-fs",
+                    matched_rule=f"fs_{verdict.kind}",
+                    classification="destructive",
+                    recovery_point=entry["recovery_point"] if entry else None,
+                    context=ctx.as_dict(),
+                    agent_id="fsguard",
+                    session_id="passthrough",
+                ))
+            except Exception as exc:                      # pragma: no cover
+                sys.stderr.write(f"demo_cli [fs] receipt error: {exc}\n")
+
+    return PassthroughOperations(volume_label, Backing(backing_dir), config,
+                                 mountpoint)
+
+
 def mount(mountpoint: str, config: Optional[Config] = None,
-          label: str = "demo_cli", debug: bool = False):
+          label: str = "demo_cli", debug: bool = False,
+          backing: Optional[str] = None):
     """Mount the guarded filesystem and block until interrupted.
 
     `mountpoint` may be a drive letter (`X:`) or a directory path. A directory
     is strongly preferred: Claude Code refuses to use a bare drive root as its
     working directory, while a directory mount it accepts with no special
     flags. WinFsp CREATES the path as a junction, so it must NOT already exist.
+
+    `backing` selects the stage, and the difference matters to whoever is
+    about to work in this directory:
+
+        None            STAGE 1, in memory. Contents are LOST on unmount.
+                        A laboratory instrument - fine for proving the guard,
+                        not fine for real work.
+        a directory     STAGE 2, passthrough. Files live in that directory and
+                        survive unmounting.
+
+    The two share fsguard.py and every destructive decision. Only storage
+    differs.
     """
     _require_windows()
 
@@ -280,7 +683,20 @@ def mount(mountpoint: str, config: Optional[Config] = None,
     path = Path(os.path.abspath(mountpoint))
     is_drive = path.parent == path
 
-    operations = build_operations(config, label, mountpoint=str(path))
+    if backing:
+        backing = os.path.abspath(backing)
+        # The backing directory must not be inside the mount point, or the
+        # filesystem would be storing its own contents through itself.
+        try:
+            if os.path.commonpath([backing, str(path)]) == str(path):
+                raise RuntimeError(
+                    f"the backing directory {backing} is inside the mount point "
+                    f"{path}; they must be separate.")
+        except ValueError:
+            pass                       # different drives: fine
+        operations = build_passthrough_operations(config, backing, label, str(path))
+    else:
+        operations = build_operations(config, label, mountpoint=str(path))
 
     fs = FileSystem(
         str(path), operations,
@@ -303,11 +719,17 @@ def mount(mountpoint: str, config: Optional[Config] = None,
     )
 
     fs.start()
+    # The storage line is deliberately blunt. Somebody who does not read it and
+    # works in a Stage 1 mount loses everything on Ctrl+C, so it says so in
+    # those words rather than in a euphemism.
+    storage = (f"  backing         -> {backing}  (files SURVIVE unmount)\n"
+               if backing else
+               "  in-memory: contents are LOST on unmount; snapshots are on real disk.\n")
     sys.stderr.write(
         f"demo_cli filesystem guard mounted at {path}\n"
         f"  recovery points -> {config.recovery_dir}\n"
         f"  receipts        -> {config.receipts_path}\n"
-        f"  in-memory: contents are LOST on unmount; snapshots are on real disk.\n"
+        + storage +
         f"  Ctrl+C to unmount.\n")
     try:
         import time
