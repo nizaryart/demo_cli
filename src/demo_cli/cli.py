@@ -883,6 +883,15 @@ def cmd_unmount(a) -> int:
         return 0
     try:
         os.kill(st.pid, signal.SIGTERM)
+    except PermissionError:
+        # Expected, and a GOOD sign: the guard runs elevated so the backing
+        # directory is out of reach, which also means a non-elevated process
+        # cannot kill it. An agent cannot stop the thing watching it. Say what
+        # to do rather than reporting a bare access error.
+        print(f"Could not stop pid {st.pid}: access denied.")
+        print("  The guard runs elevated, which is why an ordinary process")
+        print("  cannot kill it. Stop it from an Administrator shell.")
+        return 1
     except Exception as exc:
         print(f"Could not stop pid {st.pid}: {exc}")
         print("  The record is left in place; the guard may still be running.")

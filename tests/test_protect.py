@@ -150,6 +150,28 @@ def test_the_mount_point_is_the_original_path(project):
 # Getting back out
 # --------------------------------------------------------------------------
 
+def test_a_failed_unlock_is_reported_not_swallowed(project, monkeypatch):
+    """unprotect appended the "unlocked" line only on success and carried on
+    otherwise, so a project came home still Administrators-only with its owner
+    shut out and nothing in the output to explain it. Observed live on the
+    round-trip test 2026-08-25."""
+    monkeypatch.setattr(P, "is_elevated", lambda: True)
+    monkeypatch.setattr(P, "unlock_directory", lambda _: False)
+    monkeypatch.setattr(P, "lock_directory", lambda _: True)
+    original = str(project)
+    P.protect(P.plan_protect(original))
+    steps = P.unprotect(P.plan_unprotect(original))
+    assert any("COULD NOT UNLOCK" in s for s in steps)
+
+
+def test_an_unelevated_unprotect_says_the_acl_was_left_alone(project, monkeypatch):
+    monkeypatch.setattr(P, "is_elevated", lambda: False)
+    original = str(project)
+    P.protect(P.plan_protect(original))
+    steps = P.unprotect(P.plan_unprotect(original))
+    assert any("not elevated" in s for s in steps)
+
+
 def test_protect_then_unprotect_is_a_round_trip(project, monkeypatch):
     """Nobody should run a command that relocates their project without a way
     back - and a way back that only works when everything is healthy is not

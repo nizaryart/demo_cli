@@ -210,8 +210,21 @@ def unprotect(plan: Plan) -> List[str]:
     if not plan.ok:
         raise ValueError("; ".join(plan.problems))
     done = []
-    if is_elevated() and unlock_directory(plan.backing):
-        done.append(f"unlocked {plan.backing}")
+    # A failed unlock is SAID, not skipped. The first version appended the
+    # "unlocked" line only on success and carried on otherwise, so a project
+    # came home still locked to Administrators with its owner shut out and
+    # nothing in the output to explain it. Handing something back in a state
+    # the user cannot use, silently, is the failure this project is about.
+    if is_elevated():
+        if unlock_directory(plan.backing):
+            done.append(f"unlocked {plan.backing}")
+        else:
+            done.append(f"COULD NOT UNLOCK {plan.backing} - the restored "
+                        f"project will still be Administrators-only. Fix with: "
+                        f"icacls <path> /inheritance:e ; icacls <path> /reset /T")
+    else:
+        done.append("not elevated: the ACL was left as it is. If the backing "
+                    "was locked, re-run this from an Administrator shell.")
     os.rename(plan.backing, plan.source)
     done.append(f"moved {plan.backing} -> {plan.source}")
     return done
@@ -263,10 +276,22 @@ def lock_directory(path: str) -> bool:
 
 
 def unlock_directory(path: str) -> bool:
-    """Give the directory back to its owner and restore inheritance."""
+    """Give the directory back to its owner and restore inheritance.
+
+    THREE separate icacls calls, because combining them does not work and
+    failed silently when it was one. `/inheritance:e /reset` in a single
+    invocation exits non-zero - icacls will not take both - so unprotect moved
+    the project home STILL LOCKED, with its owner shut out of it and no
+    message saying so. Observed 2026-08-25 on the round-trip test.
+
+    Order matters: re-enable inheritance first, so the /reset that follows has
+    a parent ACL to inherit; then push the same down to the children.
+    """
     if os.name != "nt" or not shutil.which("icacls"):
         return False
-    if not _run(["icacls", path, "/inheritance:e", "/reset"]):
+    if not _run(["icacls", path, "/inheritance:e"]):
+        return False
+    if not _run(["icacls", path, "/reset"]):
         return False
     return _reset_children(path)
 
