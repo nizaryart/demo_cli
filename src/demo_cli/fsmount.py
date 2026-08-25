@@ -371,12 +371,17 @@ def build_passthrough_operations(config: Config, backing_dir: str,
                 raise NTStatusObjectNameNotFound()
             except NotADirectoryError:
                 raise NTStatusNotADirectory()
-            except PermissionError:
-                raise NTStatusAccessDenied()
             except OSError as exc:
                 if exc.errno == errno.ENOTEMPTY:
                     raise NTStatusDirectoryNotEmpty()
-                sys.stderr.write(f"demo_cli [fs] {fn.__name__}: {exc}\n")
+                # EVERY converted failure is logged, including the permission
+                # ones. The first version stayed silent for PermissionError
+                # because "access denied" felt self-explanatory - and then a
+                # read through the mount failed with an empty log and nothing
+                # to debug from. A guard that swallows the interesting failure
+                # is the recurring bug in this project; the caller gets a clean
+                # NTSTATUS either way, so the log costs nothing.
+                sys.stderr.write(f"demo_cli [fs] {fn.__name__} denied: {exc}\n")
                 raise NTStatusAccessDenied()
         return wrapper
 
