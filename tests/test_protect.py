@@ -196,6 +196,57 @@ def test_lock_state_is_unknown_rather_than_false_off_windows(tmp_path):
     assert P.is_locked(str(tmp_path)) is None
 
 
+def test_lock_state_is_read_by_counting_entries_not_by_naming_principals(monkeypatch):
+    """Parsing icacls by principal NAME is wrong on any localised Windows.
+
+    The real output from the development machine, which is French:
+
+        C:\\...\\myproj.real BUILTIN\\Administrateurs:(OI)(CI)(F)
+                             NT AUTHORITY\\SYSTEM:(OI)(CI)(F)
+
+    The first version of is_locked looked for "BUILTIN\\Users" and $USERNAME
+    and would have called this UNLOCKED. Rights strings like (OI)(CI)(F) are
+    not localised, so counting entries and checking their rights works in any
+    language.
+    """
+    import subprocess
+    path = r"C:\Users\pc\Desktop\lab\myproj.real"
+    out = (f"{path} BUILTIN\\Administrateurs:(OI)(CI)(F)\n"
+           "                                    NT AUTHORITY\\SYSTEM:(OI)(CI)(F)\n"
+           "\nSuccessfully processed 1 files; Failed processing 0 files\n")
+
+    monkeypatch.setattr(P.os, "name", "nt")
+    monkeypatch.setattr(P.shutil, "which", lambda _: "icacls")
+    monkeypatch.setattr(subprocess, "run",
+                        lambda *a, **k: subprocess.CompletedProcess(a, 0, out, ""))
+    assert P.is_locked(path) is True
+
+
+def test_a_directory_the_user_can_still_reach_is_not_locked(monkeypatch):
+    import subprocess
+    path = r"C:\Users\pc\Desktop\lab\myproj.real"
+    out = (f"{path} BUILTIN\\Administrateurs:(OI)(CI)(F)\n"
+           "                                    NT AUTHORITY\\SYSTEM:(OI)(CI)(F)\n"
+           "                                    DESKTOP-1\\pc:(OI)(CI)(F)\n"
+           "\nSuccessfully processed 1 files; Failed processing 0 files\n")
+    monkeypatch.setattr(P.os, "name", "nt")
+    monkeypatch.setattr(P.shutil, "which", lambda _: "icacls")
+    monkeypatch.setattr(subprocess, "run",
+                        lambda *a, **k: subprocess.CompletedProcess(a, 0, out, ""))
+    assert P.is_locked(path) is False
+
+
+def test_icacls_reporting_failures_is_not_a_success(monkeypatch):
+    """icacls with /C exits 0 having failed on every file. That is how the
+    one-pass lock reported success while leaving a directory of unreadable
+    files, so the count is checked as well as the exit code."""
+    import subprocess
+    monkeypatch.setattr(subprocess, "run",
+                        lambda *a, **k: subprocess.CompletedProcess(
+                            a, 0, "Successfully processed 0 files; Failed processing 7 files", ""))
+    assert P._run(["icacls", "x"]) is False
+
+
 def test_the_acl_uses_sids_not_localised_names():
     """"Administrators" is localised - on a French or Arabic Windows the name
     differs and icacls fails with a message nobody would connect to a locale."""

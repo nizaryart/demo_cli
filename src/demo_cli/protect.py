@@ -57,6 +57,7 @@ guard uninstalled, and says exactly what it will do first.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -229,33 +230,83 @@ def unprotect(plan: Plan) -> List[str]:
 def lock_directory(path: str) -> bool:
     """Grant the directory to SYSTEM and Administrators only.
 
-    /inheritance:r removes inherited permissions - without it the user's
-    inherited Full Control survives and the lock does nothing at all, silently,
-    which is the worst possible outcome for a security control.
+    TWO PASSES, and the reason is a defect found live on 2026-08-25.
+
+    The first version did it in one:
+
+        icacls <dir> /inheritance:r /grant:r <sid>:(OI)(CI)F ... /T /C
+
+    (OI) and (CI) are CONTAINER-inheritance flags: meaningful on a directory,
+    meaningless on a file. /T applies the whole operation to every existing
+    child, where /inheritance:r succeeds - stripping the inherited access - and
+    the (OI)(CI) grant is rejected. /C then swallows the per-file error and
+    icacls still exits 0.
+
+    Every pre-existing file was left with an EMPTY DACL: unreadable by anyone,
+    including Administrators, including the owner's own elevated shell. Files
+    created afterwards were fine, because they inherited from the directory -
+    which is why the failure looked so strange, with `dir` working, new files
+    readable, and the user's original notes.txt denied to everybody.
+
+    So: grant on the directory alone, then reset the children so they INHERIT
+    it. /reset is what restores an inherited ACL, and it is the only thing that
+    can repair a file whose DACL is already empty.
     """
     if os.name != "nt" or not shutil.which("icacls"):
         return False
     args = ["icacls", path, "/inheritance:r"]
     for sid in _ACL_PRINCIPALS:
         args += ["/grant:r", f"{sid}:(OI)(CI)F"]
-    args += ["/T", "/C", "/Q"]
-    return _run(args)
+    if not _run(args):
+        return False
+    return _reset_children(path)
 
 
 def unlock_directory(path: str) -> bool:
     """Give the directory back to its owner and restore inheritance."""
     if os.name != "nt" or not shutil.which("icacls"):
         return False
-    return _run(["icacls", path, "/inheritance:e", "/reset", "/T", "/C", "/Q"])
+    if not _run(["icacls", path, "/inheritance:e", "/reset"]):
+        return False
+    return _reset_children(path)
+
+
+def _reset_children(path: str) -> bool:
+    """Make every existing child inherit the directory's ACL.
+
+    Skipped for an empty directory: `icacls <dir>\\*` matches nothing there and
+    reports a failure that means nothing went wrong.
+    """
+    try:
+        if not os.listdir(path):
+            return True
+    except OSError:
+        return False
+    return _run(["icacls", os.path.join(path, "*"), "/reset", "/T", "/Q"])
 
 
 def _run(args: List[str]) -> bool:
+    """Run icacls and believe it only when it says nothing failed.
+
+    NO /C. That flag means "continue past errors", and icacls then exits 0
+    having failed on every single file - which is how the one-pass lock above
+    reported success while leaving a directory of unreadable files. The exit
+    code is only meaningful once icacls is allowed to stop.
+
+    The "Failed processing N files" line is also checked, because /T walks a
+    tree and a single unreachable entry should not be reported as a clean
+    lock. That string is not localised by icacls even on a French Windows -
+    verified on one - but a mismatch only ever makes this return the exit code
+    alone, never a false success.
+    """
     try:
-        r = subprocess.run(args, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.PIPE, timeout=120)
-        return r.returncode == 0
+        r = subprocess.run(args, capture_output=True, text=True, timeout=120)
     except Exception:
         return False
+    if r.returncode != 0:
+        return False
+    m = re.search(r"Failed processing (\d+)", (r.stdout or "") + (r.stderr or ""))
+    return not (m and int(m.group(1)) > 0)
 
 
 def is_locked(path: str) -> Optional[bool]:
@@ -271,10 +322,28 @@ def is_locked(path: str) -> Optional[bool]:
         r = subprocess.run(["icacls", path], capture_output=True, text=True, timeout=30)
         if r.returncode != 0:
             return None
-        # Locked means no entry for anyone outside the two principals. Checking
-        # for the ABSENCE of the interactive user is more robust than parsing
-        # the whole descriptor, which is localised and format-unstable.
-        out = r.stdout
-        return "BUILTIN\\Users" not in out and os.environ.get("USERNAME", "\0") not in out
     except Exception:
         return None
+
+    # Count the access-control entries rather than recognising principal NAMES.
+    # The first version looked for "BUILTIN\\Users" and the USERNAME, which is
+    # wrong on any localised Windows - the machine this was developed against
+    # reports "BUILTIN\\Administrateurs". Rights strings like (OI)(CI)(F) are
+    # NOT localised, so counting entries and checking their rights works in any
+    # language.
+    #
+    # Locked == exactly the two principals we granted, each with inheritable
+    # full control, and nothing else.
+    aces = []
+    for i, line in enumerate((r.stdout or "").splitlines()):
+        line = line.strip()
+        if not line or line.startswith("Successfully") or line.startswith("Failed"):
+            continue
+        if i == 0:
+            line = line[len(path):].strip()     # first line carries the path
+        if ":" in line:
+            aces.append(line)
+    if not aces:
+        return None
+    return len(aces) == len(_ACL_PRINCIPALS) and \
+        all("(OI)(CI)(F)" in a.replace(" ", "") for a in aces)
