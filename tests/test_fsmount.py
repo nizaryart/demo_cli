@@ -159,11 +159,18 @@ def test_undo_lands_in_the_same_place_whatever_the_cwd(tmp_path, monkeypatch):
 
 def test_a_restore_that_cannot_write_reports_failure_instead_of_raising(tmp_path):
     """cmd_undo has no try/except, so an exception here is a traceback and the
-    user learns nothing about whether their file came back. The realistic
-    cause is a target whose directory is gone - undo after unmounting the
-    filesystem guard. False renders as ESCALATE, which is the honest answer.
+    user learns nothing about whether their file came back. False renders as
+    ESCALATE, which is the honest answer.
+
+    The target here is under a FILE rather than a directory, so the parent
+    cannot be created at all. A merely MISSING parent is no longer a failure:
+    since 2026-08-25 restore_entry recreates it, because a recursive delete
+    removes the directory too and every file captured from one was otherwise
+    unrestorable - see test_ledger_durability.
     """
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory")
     entry = recovery.snapshot_bytes(
         "notes.txt", b"original", str(tmp_path / "rec"),
-        target=str(tmp_path / "unmounted" / "notes.txt"))
+        target=str(blocker / "notes.txt"))
     assert recovery.restore_entry(entry) is False

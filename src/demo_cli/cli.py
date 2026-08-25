@@ -86,7 +86,12 @@ def cmd_undo(a) -> int:
     cfg = load_config()
     entry = _resolve_entry(cfg, a)
     ok = recovery.restore_entry(entry) if entry else False
-    render.render_restore(entry, ok, __version__)
+    # Pass the ledger we searched: "not found" is unactionable without it, and
+    # the recovery dir follows the project root, which follows the directory a
+    # guard was started from.
+    render.render_restore(entry, ok, __version__,
+                          recovery_dir=cfg.recovery_dir,
+                          requested_id=getattr(a, "id", None))
     return 0 if ok else 1
 
 

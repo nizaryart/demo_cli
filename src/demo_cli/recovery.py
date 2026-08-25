@@ -583,9 +583,49 @@ def _index_path(recovery_dir: str) -> str:
 
 
 def _record(recovery_dir: str, entry: dict) -> None:
+    """Append one entry to the recovery index, durably and under a lock.
+
+    This used to be a bare `open(..., "a")` and one `write`. Two ways that
+    fails, both observed on 2026-08-25 in a real index:
+
+    * A write interrupted before its newline (Ctrl+C on the filesystem guard)
+      leaves a partial line. The NEXT append then lands on that same line,
+      producing `{"id": "a", ..., "rec{"id": "b", ...}` - and load_entries
+      silently drops both records, because it skips anything that will not
+      parse. A recovery point that exists on disk becomes unreachable through
+      the ledger, which is indistinguishable from never having taken it.
+    * winfspy dispatches filesystem operations from a THREAD POOL, so two
+      snapshots really can append at the same moment.
+
+    receipts.py solved exactly this problem for the receipt chain - lock, then
+    flush, then fsync. Reusing its lock rather than writing a second one is
+    deliberate: two implementations of "append safely" is how they drift, and
+    the ledger that finds your files deserves the same care as the ledger that
+    proves what happened.
+
+    The newline-first check HEALS a previously truncated line instead of
+    compounding it: the broken record is left as its own unparseable line and
+    only it is lost, rather than taking the next record down with it.
+    """
+    from .receipts import _chain_lock          # local: avoids an import cycle
+
     os.makedirs(recovery_dir, exist_ok=True)
-    with open(_index_path(recovery_dir), "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry) + "\n")
+    path = _index_path(recovery_dir)
+    with _chain_lock(path):
+        needs_newline = False
+        try:
+            if os.path.getsize(path):
+                with open(path, "rb") as fh:
+                    fh.seek(-1, os.SEEK_END)
+                    needs_newline = fh.read(1) != b"\n"
+        except OSError:
+            pass                                # no file yet: nothing to heal
+        with open(path, "a", encoding="utf-8") as f:
+            if needs_newline:
+                f.write("\n")
+            f.write(json.dumps(entry) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
 
 
 def _ts() -> str:
@@ -605,14 +645,23 @@ def _max_snapshot_bytes() -> int:
     return int(mb * 1024 * 1024)
 
 
-def _dir_size(path: str, cap: int) -> int:
+def _dir_size(path: str, cap: int, ignore_dirs=None) -> int:
     """Sum file sizes under `path`, ignoring the same noise as the copy, and
     short-circuiting as soon as `cap` is exceeded (so we never walk a huge tree
-    just to find out it is huge)."""
+    just to find out it is huge).
+
+    `ignore_dirs` MUST be whatever the copy will skip. If the measurement
+    excludes a directory the copy then includes, the cap check passes and the
+    copy is unbounded - which is how a "256 MB cap" quietly copies gigabytes.
+    checkpoint.py keeps .git, so it passes its own set.
+
+    Until 2026-08-24 this held a hardcoded duplicate of IGNORED_DIRS, exactly
+    the drift the comment on that constant warns about.
+    """
+    ignore = IGNORED_DIRS if ignore_dirs is None else frozenset(ignore_dirs)
     total = 0
     for root, dirs, files in os.walk(path):
-        dirs[:] = [d for d in dirs if d not in
-                   (".git", "node_modules", "__pycache__", ".demo_cli", ".demo_cli_recovery")]
+        dirs[:] = [d for d in dirs if d not in ignore]
         for f in files:
             try:
                 total += os.path.getsize(os.path.join(root, f))
@@ -624,7 +673,7 @@ def _dir_size(path: str, cap: int) -> int:
 
 
 def snapshot(target: Optional[Target], recovery_dir: str, strategy: str = "snapshot",
-             action: Optional[str] = None) -> Optional[dict]:
+             action: Optional[str] = None, ignore_dirs=None) -> Optional[dict]:
     """Capture a recovery point for a target. Returns the recovery entry or None.
 
     `strategy` comes from config: "snapshot" captures; "none"/"attest" never
@@ -660,11 +709,15 @@ def snapshot(target: Optional[Target], recovery_dir: str, strategy: str = "snaps
         if not os.path.isdir(ref):
             return None
         # Honesty + safety: refuse to "recover" a tree we cannot copy quickly.
+        # The measurement and the copy must skip the SAME directories, or the
+        # cap does not bound anything - see _dir_size.
+        ignore = _IGNORE if ignore_dirs is None else \
+            shutil.ignore_patterns(*sorted(ignore_dirs))
         cap = _max_snapshot_bytes()
-        if _dir_size(ref, cap) > cap:
+        if _dir_size(ref, cap, ignore_dirs) > cap:
             return None
         snap = os.path.join(recovery_dir, f"{os.path.basename(ref.rstrip('/'))}.{ts}.{rid}.snapdir")
-        shutil.copytree(ref, snap, dirs_exist_ok=True, ignore=_IGNORE)
+        shutil.copytree(ref, snap, dirs_exist_ok=True, ignore=ignore)
         return _entry(snap)
 
     if kind == "postgres":
@@ -818,15 +871,29 @@ def restore_entry(entry: dict) -> bool:
     if kind in ("sqlite", "file"):
         if not rp or not os.path.exists(rp):
             return False
+        # Recreate the parent directory. A recursive delete removes the files
+        # first and the directory afterwards, so by the time anyone runs undo
+        # the file's parent is gone and copy2 has nowhere to write. The bytes
+        # were captured perfectly and were still unrestorable - confirmed live
+        # on 2026-08-25, where `undo` on tree/a.txt escalated for no reason
+        # other than tree/ no longer existing.
+        #
+        # Making the directory is not a liberty: the entry records an ABSOLUTE
+        # path, and putting a file back at that path means the path has to
+        # exist. Nothing else is created and nothing existing is touched.
+        parent = os.path.dirname(os.path.abspath(target))
         # A failed copy must REPORT failure, not raise. cmd_undo has no
         # try/except, so an exception here becomes a traceback and the caller
-        # learns nothing about whether their file came back. The realistic
-        # cause is a target whose directory no longer exists - an unmounted
-        # filesystem guard, a deleted parent, a removable drive. Returning
-        # False renders as ESCALATE, which is the honest answer.
+        # learns nothing about whether their file came back. Returning False
+        # renders as ESCALATE, which is the honest answer.
+        # ValueError as well as OSError: a path carrying an embedded null byte
+        # raises ValueError from os, not OSError, and a target string comes
+        # out of a ledger file that a bad write can corrupt.
         try:
+            if parent:
+                os.makedirs(parent, exist_ok=True)
             shutil.copy2(rp, target)
-        except OSError:
+        except (OSError, ValueError):
             return False
         return True
     if kind == "dir":

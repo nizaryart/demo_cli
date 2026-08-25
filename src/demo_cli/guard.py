@@ -19,7 +19,7 @@ from typing import List, Optional, Tuple
 
 import os
 
-from . import approval, preview as preview_mod, recovery
+from . import approval, checkpoint, preview as preview_mod, recovery
 from .classify import (POSIX, Classification, classify_pipeline,
                        is_sql_preview_candidate, redirect_target)
 from .config import Config, config_error_message, load_config
@@ -225,6 +225,23 @@ class Guard:
 
         entry = (recovery.snapshot(target, self.config.recovery_dir, strategy, action=command)
                  if (c.needs_recovery and not remote_pg) else None)
+
+        # LAST RESORT, never a first choice. Reached only when the command
+        # mutates something and no target could be resolved at all - `rm
+        # $(cat list.txt)`, `python cleanup.py`. Instead of escalating on "I
+        # cannot tell WHAT you will destroy", preserve everything it could
+        # destroy. If that copy cannot be made honestly, checkpoint.capture
+        # returns no entry and the escalation stands exactly as before.
+        #
+        # Placed here, BEFORE decide(): decide is still merely told whether a
+        # recovery exists. It never learns a checkpoint was involved, so it
+        # cannot reason its way into claiming one that did not happen.
+        checkpoint_skipped, checkpoint_taken = None, False
+        if checkpoint.should_checkpoint(c, target, self.config,
+                                        recovery_captured=entry is not None):
+            ck = checkpoint.capture(self.config, action=command)
+            entry, checkpoint_skipped, checkpoint_taken = ck.entry, ck.skipped, ck.ok
+
         recovery_captured = entry is not None
 
         # Preview affected rows for previewable SQL on a recoverable target.
@@ -243,12 +260,26 @@ class Guard:
             mismatches=mismatches, approval_ok=approval_ok, preview_count=preview_count,
         )
 
+        # Say which kind of recovery this is. A whole-workspace checkpoint is
+        # COARSE - undo restores the entire tree to its snapshot state, rolling
+        # back unrelated edits made afterwards. Someone reading the receipt has
+        # to be able to tell that from a one-file snapshot, and someone whose
+        # action was blocked has to be told why the checkpoint was refused.
+        reason = decision.reason
+        if checkpoint_taken:
+            reason = (f"{reason} Recovery is a whole-workspace checkpoint "
+                      f"(coarse): the target could not be resolved from the "
+                      f"command text, so everything it could destroy was "
+                      f"preserved. Undo restores the entire tree.")
+        elif checkpoint_skipped:
+            reason = f"{reason} {checkpoint.reason_text(checkpoint_skipped, self.config)}"
+
         receipt = Receipt(
             action_raw=command,
             action_type=c.action_type,
             target_environment=ctx.environment,
             decision=decision.decision,
-            reason=decision.reason,
+            reason=reason,
             mode=self.mode,
             matched_rule=c.matched_rule,
             classification="destructive" if c.is_destructive else ("mutating" if c.is_mutating else "safe"),

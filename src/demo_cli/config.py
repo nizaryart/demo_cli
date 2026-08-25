@@ -104,6 +104,10 @@ class Config:
     approval_key_env: Optional[str] = None
     targets: List[TargetRule] = field(default_factory=list)
     egress: dict = field(default_factory=dict)  # [egress] table for the egress guard
+    # [checkpoint] table. Off by default: copying the workspace before a
+    # command is a real cost, and a guard that becomes slow without being asked
+    # is a guard that gets uninstalled. See checkpoint.py.
+    checkpoint: dict = field(default_factory=dict)
     source_path: Optional[str] = None  # path of the loaded config, if any
     # Set when a .demo_cli.toml EXISTS but could not be parsed. Deliberately a
     # field rather than an exception: an exception gets swallowed by the hooks'
@@ -191,6 +195,10 @@ def load_config(start: Optional[str] = None) -> Config:
     eg = data.get("egress", {})
     if isinstance(eg, dict):
         cfg.egress = eg
+
+    ck = data.get("checkpoint", {})
+    if isinstance(ck, dict):
+        cfg.checkpoint = ck
 
     for raw in data.get("target", []) or []:
         if not isinstance(raw, dict) or "match" not in raw:

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import List
+from typing import List, Optional
 
 from .context import redact
 from .decide import (ALLOW, CONTEXT_MISMATCH, DRY_RUN, ESCALATE, REVERSIBLE,
@@ -219,7 +219,19 @@ def render_diff(entry: dict, lines: List[DiffLine], version: str) -> None:
     _print(out)
 
 
-def render_restore(entry, ok: bool, version: str) -> None:
+def render_restore(entry, ok: bool, version: str,
+                   recovery_dir: Optional[str] = None,
+                   requested_id: Optional[str] = None) -> None:
+    """`recovery_dir` and `requested_id` exist so a failure can say WHERE it
+    looked.
+
+    "No recovery points found" cost twenty minutes on 2026-08-25. Three
+    recovery points existed, complete and correct - in a different ledger,
+    because the filesystem guard had been started from a different directory
+    and its project root resolved elsewhere. The message named neither the id
+    nor the directory searched, so there was nothing to notice. Naming the
+    path would have ended it immediately.
+    """
     if ok and entry:
         _print(["", c(f"demo_cli {version}", "dim") + "  " + _label("RESTORED"), "",
                 c("Recovery", "green"),
@@ -227,10 +239,25 @@ def render_restore(entry, ok: bool, version: str) -> None:
                 kv("target", redact(entry["target"])),
                 kv("from", os.path.basename(entry["recovery_point"])),
                 "  " + c("Restored from the latest recovery point.", "green"), ""])
+        return
+
+    lines = ["", c(f"demo_cli {version}", "dim") + "  " + _label("ESCALATE"), ""]
+    if entry:
+        # The entry was found; the copy is what failed.
+        lines += ["  " + c("No recovery point could be restored.", "red"),
+                  kv("target", redact(entry.get("target", "?"))),
+                  "  " + c("The recovery point is present but could not be "
+                           "written back - check the target path is reachable.", "dim")]
     else:
-        _print(["", c(f"demo_cli {version}", "dim") + "  " + _label("ESCALATE"), "",
-                "  " + c("No recovery point could be restored." if entry
-                         else "No recovery points found.", "red"), ""])
+        what = f"No recovery point matched {requested_id!r}." if requested_id \
+            else "No recovery points found."
+        lines += ["  " + c(what, "red")]
+        if recovery_dir:
+            lines += [kv("searched", recovery_dir),
+                      "  " + c("A guard started from a different directory writes "
+                               "to a different ledger. `demo_cli log` lists this "
+                               "one.", "dim")]
+    _print(lines + [""])
 
 
 def _size(n: int) -> str:
