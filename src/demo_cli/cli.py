@@ -823,7 +823,13 @@ def _mount_detached(a, backing) -> int:
     if os.name == "nt":
         DETACHED_PROCESS = 0x00000008
         CREATE_NEW_PROCESS_GROUP = 0x00000200
-        kwargs["creationflags"] = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        # CREATE_NO_WINDOW as well: DETACHED_PROCESS alone still let Windows
+        # pop an empty console for python.exe, which looks like something went
+        # wrong and shows nothing, because the child's output is redirected to
+        # mount.log.
+        CREATE_NO_WINDOW = 0x08000000
+        kwargs["creationflags"] = (DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+                                   | CREATE_NO_WINDOW)
     else:
         kwargs["start_new_session"] = True
 
