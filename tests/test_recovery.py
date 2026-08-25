@@ -55,3 +55,89 @@ def test_snapshot_strategy_none_captures_nothing(tmp_path):
     _make_db(str(db))
     target = recovery.Target("sqlite", str(db), str(db))
     assert recovery.snapshot(target, str(tmp_path / "rec"), strategy="none") is None
+
+
+# --------------------------------------------------------------------------
+# Operand extraction dispatches on the SEGMENT, not the whole command line
+#
+# Every rule in extract_path_operand is anchored to the start of its input
+# (`^\s*...rm\b`), because a bare `rm` has to be a command word and not the
+# middle of a filename. Applied to a whole LINE that anchor also demanded the
+# verb come first, so anything chained in front matched nothing at all:
+#
+#     cd build && rm -rf ./out           -> None, escalated
+#     Write-Host hi; Remove-Item a.txt   -> None, escalated
+#
+# Never dangerous - an unresolved target escalates, so the action was blocked
+# rather than run unsnapshotted - but `cd x && rm y` is what agents actually
+# write, and a guard that blocks the common case instead of protecting it gets
+# uninstalled. Found on Windows 2026-08-25 by a PowerShell test that should
+# never have been platform-gated: the logic is pure string handling and the
+# failure reproduced on Linux immediately.
+# --------------------------------------------------------------------------
+import pytest
+
+from demo_cli.classify import POSIX, POWERSHELL
+
+
+@pytest.fixture
+def files(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "a.txt").write_text("a")
+    (tmp_path / "b.txt").write_text("b")
+    (tmp_path / "build").mkdir()
+    (tmp_path / "build" / "out.txt").write_text("out")
+    return tmp_path
+
+
+@pytest.mark.parametrize("cmd", [
+    "rm a.txt",
+    "echo hi; rm a.txt",
+    "cd . && rm a.txt",
+    "echo one; echo two; rm a.txt",
+    "cat a.txt | grep x; rm a.txt",
+])
+def test_a_chained_rm_still_resolves_its_target(files, cmd):
+    assert recovery.extract_path_operand(cmd, POSIX) == "a.txt"
+
+
+def test_a_chained_rm_in_a_subdirectory_resolves(files):
+    assert recovery.extract_path_operand("cd . && rm build/out.txt", POSIX) \
+        == "build/out.txt"
+
+
+@pytest.mark.parametrize("cmd", [
+    "Remove-Item a.txt",
+    "Write-Host hi; Remove-Item a.txt",
+    '$t = "a.txt"; Remove-Item $t',
+])
+def test_a_chained_powershell_delete_still_resolves(files, cmd):
+    assert recovery.extract_path_operand(cmd, POWERSHELL) == "a.txt"
+
+
+def test_a_chained_clear_content_resolves(files):
+    assert recovery.extract_path_operand(
+        "Write-Host hi; Clear-Content a.txt", POWERSHELL) == "a.txt"
+
+
+def test_two_destructive_segments_resolve_to_nothing(files):
+    """THE honesty rule. Picking the first would snapshot a.txt and let b.txt
+    die unrecorded while the receipt claimed a recovery - the partial-recovery
+    lie FIX #5 exists to prevent."""
+    assert recovery.extract_path_operand("rm a.txt; rm b.txt", POSIX) is None
+
+
+def test_two_destructive_segments_in_powershell_resolve_to_nothing(files):
+    assert recovery.extract_path_operand(
+        "Remove-Item a.txt; Remove-Item b.txt", POWERSHELL) is None
+
+
+def test_a_safe_command_before_a_destructive_one_is_not_the_target(files):
+    """`cd /tmp && rm a.txt` must not snapshot /tmp. The words of the leading
+    command used to leak in as operands, which is how the count stopped being
+    one and the whole thing gave up."""
+    assert recovery.extract_path_operand("cd /tmp && rm a.txt", POSIX) == "a.txt"
+
+
+def test_a_command_with_no_destructive_segment_resolves_to_nothing(files):
+    assert recovery.extract_path_operand("echo hi; ls -la", POSIX) is None

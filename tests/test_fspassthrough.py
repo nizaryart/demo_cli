@@ -145,11 +145,15 @@ def test_creating_over_an_existing_file_is_refused(backing):
 
 
 @pytest.mark.parametrize("data", [
-    b"hello",
-    b"",
-    b"\x00\x01\x02\xff\xfe",                 # binary, including NULs
-    b"line one\r\nline two\r\n",             # CRLF must survive verbatim
-    bytes(range(256)) * 400,                 # ~100 KB, all byte values
+    pytest.param(b"hello", id="ascii"),
+    pytest.param(b"", id="empty"),
+    pytest.param(b"\x00\x01\x02\xff\xfe", id="binary-with-nuls"),
+    pytest.param(b"line one\r\nline two\r\n", id="crlf"),
+    # Explicit id, not the default repr. pytest puts the test id in
+    # PYTEST_CURRENT_TEST, and Windows caps an environment variable at
+    # 32767 characters - so 100 KB of bytes in the id made this ERROR at
+    # SETUP on Windows while passing on Linux. Found 2026-08-25.
+    pytest.param(bytes(range(256)) * 400, id="100kb-all-byte-values"),
 ])
 def test_write_then_read_returns_the_same_bytes(backing, data):
     backing.make_file(r"\f.bin")

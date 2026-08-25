@@ -201,8 +201,11 @@ def test_substitution_does_not_defeat_the_too_broad_check(workspace):
     assert not r.receipt.recovery_point
 
 
-@pytest.mark.skipif(os.name != "nt", reason="needs real Windows paths")
-def test_powershell_variable_resolves_on_windows(tmp_path, monkeypatch):
+# NOT platform-gated. This was skipif(os.name != "nt") and therefore never
+# ran on Linux, which is how a resolution bug affecting BOTH dialects
+# reached Windows undetected. The logic is pure string handling; the only
+# thing Windows adds is path shape, and that is covered elsewhere.
+def test_a_powershell_variable_resolves_end_to_end(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     (tmp_path / "notes.txt").write_text("important")
     g = Guard(Config(mode="enforce", project_root=str(tmp_path)))

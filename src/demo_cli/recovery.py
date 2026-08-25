@@ -24,7 +24,7 @@ import uuid
 from dataclasses import dataclass
 from typing import List, Optional
 
-from .classify import (POSIX, join_continuations, redirect_target,
+from .classify import (POSIX, join_continuations, redirect_target, split_segments,
                        substitute_assignments)
 from .context import redact
 
@@ -280,6 +280,42 @@ def _path_operands(cmd: str) -> List[str]:
 _PS_PATH_FLAGS = {"-literalpath", "-path"}
 
 
+def sole_segment(cmd: str, rx, dialect: str = POSIX) -> Optional[str]:
+    """The ONE segment of a command line that `rx` matches, or None.
+
+    WHY THIS EXISTS (found 2026-08-25, on Windows, by a PowerShell test that
+    should never have been platform-gated).
+
+    Every operand extractor below is written as if its verb were the first
+    word on the line - `_path_operands` skips a leading run of assignments and
+    `sudo`, `_ps_remove_item_operand` drops exactly one token. Anything else in
+    front leaks in as an extra operand, the count stops being one, and the
+    extractor gives up:
+
+        echo hi; rm a.txt                  -> None
+        cd build && rm -rf ./out           -> None
+        Write-Host hi; Remove-Item a.txt   -> None
+        $t = "a.txt"; Remove-Item $t       -> None
+
+    None of that was dangerous - an unresolved target escalates, so the action
+    is blocked rather than run unsnapshotted - but `cd x && rm y` is what
+    agents actually write, and a guard that blocks the common case instead of
+    protecting it gets uninstalled. Narrowing to the matching segment fixes
+    every one of them, in both dialects, without touching the extractors.
+
+    THE HONESTY RULE, and the reason this returns None rather than the first
+    match: when TWO segments are destructive -
+
+        rm a.txt; rm b.txt
+
+    - picking one would snapshot a.txt and let b.txt die unrecorded, while the
+    receipt claimed a recovery. That is the partial-recovery lie FIX #5 exists
+    to prevent, so several matches means no target and an honest escalation.
+    """
+    matches = [s for s in split_segments(cmd, dialect) if rx.search(s)]
+    return matches[0] if len(matches) == 1 else None
+
+
 def _ps_remove_item_operand(cmd: str) -> Optional[str]:
     """Conservative PowerShell `Remove-Item` target extraction. Supports:
 
@@ -508,7 +544,21 @@ def extract_path_operand(cmd: str, dialect: str = POSIX) -> Optional[str]:
     # unless every reference resolved, so this can only ever narrow an
     # escalation into a precise snapshot, never widen anything.
     cmd = substitute_assignments(cmd, dialect)
-    if _RM_RE.search(cmd):
+
+    # DISPATCH ON THE SEGMENT, NOT THE LINE.
+    #
+    # Every rule below is anchored to the start of its input (`^\s*...rm\b`),
+    # because a bare `rm` has to be a command word and not the middle of a
+    # filename. Applied to a whole command LINE that anchor also means the verb
+    # must come first - so `cd build && rm -rf ./out` matched nothing at all and
+    # escalated, and that is what agents actually write. Found 2026-08-25.
+    #
+    # Several destructive segments (`rm a.txt; rm b.txt`) return None. Picking
+    # one would snapshot a.txt while b.txt died unrecorded, with the receipt
+    # claiming a recovery - the partial-recovery lie FIX #5 exists to prevent.
+    segments = split_segments(cmd, dialect) or [cmd]
+
+    def _rm(seg: str) -> Optional[str]:
         # Collect every operand BEFORE deciding anything. Filtering to
         # os.path.exists() first and only then counting was the bug: an
         # operand that is a real, literal path but happens not to exist on
@@ -520,14 +570,15 @@ def extract_path_operand(cmd: str, dialect: str = POSIX) -> Optional[str]:
         # wildcard operands are existence-filtered (by the glob expansion
         # inside _path_operands itself, since a glob that matches nothing
         # touches nothing).
-        ops = _path_operands(cmd)
+        ops = _path_operands(seg)
         if len(ops) == 1:
             return ops[0] if os.path.exists(ops[0]) else None
         if len(ops) > 1:
             return _common_capture_root(ops)
         return None
-    if _MV_RE.search(cmd):
-        ops = _path_operands(cmd)
+
+    def _mv(seg: str) -> Optional[str]:
+        ops = _path_operands(seg)
         if len(ops) >= 2:
             dst, src = ops[-1], ops[-2]
             if os.path.exists(dst):
@@ -535,15 +586,23 @@ def extract_path_operand(cmd: str, dialect: str = POSIX) -> Optional[str]:
             if os.path.exists(src):
                 return src
         return None
-    if _PS_REMOVE_RE.search(cmd):
-        target = _ps_remove_item_operand(cmd)
-        return target if target and os.path.exists(target) else None
-    if _PS_CONTENT_RE.search(cmd):
-        target = _ps_write_target(cmd)
-        return target if target and os.path.exists(target) else None
-    if _PS_DEST_RE.search(cmd):
-        target = _ps_dest_target(cmd)
-        return target if target and os.path.exists(target) else None
+
+    def _existing(fn):
+        def run(seg: str) -> Optional[str]:
+            target = fn(seg)
+            return target if target and os.path.exists(target) else None
+        return run
+
+    for rx, handler in ((_RM_RE, _rm),
+                        (_MV_RE, _mv),
+                        (_PS_REMOVE_RE, _existing(_ps_remove_item_operand)),
+                        (_PS_CONTENT_RE, _existing(_ps_write_target)),
+                        (_PS_DEST_RE, _existing(_ps_dest_target))):
+        matched = [seg for seg in segments if rx.search(seg)]
+        if not matched:
+            continue
+        return handler(matched[0]) if len(matched) == 1 else None
+
     # Truncating output redirection ('> file'): snapshot the file it overwrites.
     # Uses the same quote-aware detector as the classifier, so classify (is it
     # destructive?) and recovery (what to snapshot?) can never disagree.
