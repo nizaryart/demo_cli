@@ -629,7 +629,23 @@ _SHELL_GUARD_SNIPPET = r'''# >>> demo_cli shell guard >>>
 # A cheap pre-filter avoids spawning demo_cli for obviously-safe commands (it
 # shares the string classifier's frontier by design - obfuscation is the syscall
 # guard's job, not this).
-if [ -n "$BASH_VERSION" ] && command -v demo_cli >/dev/null 2>&1; then
+#
+# TWO ESCAPE HATCHES, and they exist because of a real lockout on 2026-08-25.
+# A syntax error committed to cli.py made `demo_cli` unimportable. This trap
+# runs on EVERY command in EVERY bash, it read the resulting non-zero exit as
+# "the guard refused", and every command in every shell started failing -
+# including the ones needed to fix the file. The recovery path was the one
+# thing that could not be done from a shell.
+#
+#   DEMO_CLI_DISABLE=1   turns the guard off entirely. `export` is a builtin
+#                        and matches no pattern below, so it still works from
+#                        a shell that is otherwise stuck.
+#   the sanity probe     below distinguishes "the guard said no" from "the
+#                        guard is broken". Our own failures must fail OPEN -
+#                        that is already the rule inside guard-shell, and a
+#                        package that will not even import is the same class
+#                        of failure, just earlier.
+if [ -n "$BASH_VERSION" ] && [ -z "$DEMO_CLI_DISABLE" ] && command -v demo_cli >/dev/null 2>&1; then
   case $- in *i*) shopt -s extdebug 2>/dev/null ;; esac
   __demo_cli_shell_guard() {
     case "$BASH_COMMAND" in
@@ -640,6 +656,15 @@ if [ -n "$BASH_VERSION" ] && command -v demo_cli >/dev/null 2>&1; then
       demo_cli*|__demo_cli_shell_guard*|eval\ *) return 0 ;;
       *rm\ *|*rmdir*|*mkfs*|*shred*|*truncate*|*\ dd\ *|*git\ *|*Remove-Item*|*\>\ *|*DROP\ *|*TRUNCATE\ *|*DELETE\ FROM*|*shutil.rmtree*)
         if ! demo_cli guard-shell "$BASH_COMMAND"; then
+          # Did the guard REFUSE, or is it broken? A package that cannot
+          # import exits non-zero too, and reading that as a refusal locks the
+          # user out of their own shell. One cheap probe tells them apart, and
+          # it only ever runs on the failure path.
+          if ! demo_cli --version >/dev/null 2>&1; then
+            echo "demo_cli: guard is not working (demo_cli itself will not run) - allowing." >&2
+            echo "demo_cli: silence it with  export DEMO_CLI_DISABLE=1" >&2
+            return 0
+          fi
           echo "demo_cli: blocked \"$BASH_COMMAND\" before it ran." >&2
           case $- in
             *i*) return 1 ;;                           # interactive: skip, keep the shell
@@ -721,6 +746,9 @@ def cmd_install_shell_guard(a) -> int:
     print(f"{'Already configured' if already else 'Set BASH_ENV'} in {rc} "
           "(gates non-interactive `bash -c` / !-mode; the interactive shell is left alone).")
     print("Relaunch Claude Code from a NEW terminal so !-mode inherits BASH_ENV.")
+    print()
+    print("If demo_cli ever stops working, the guard steps aside rather than")
+    print("blocking your shell. To turn it off outright:  export DEMO_CLI_DISABLE=1")
     return 0
 
 
@@ -735,7 +763,6 @@ def cmd_mount(a) -> int:
             print("The filesystem guard is Windows-only (WinFsp).")
             print("On Linux the equivalent layer is:  demo_cli run <cmd>")
         else:
-            print("winfspy is not importable. Install WinFsp from winfsp.dev")
             print("winfspy is not importable. Install WinFsp from winfsp.dev")
             print("with the Developer feature enabled, then:")
             print("  pipx inject demo-cli winfspy      (if demo_cli came from pipx)")

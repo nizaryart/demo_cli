@@ -73,3 +73,93 @@ def test_redirect_to_existing_file_still_snapshots(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     (tmp_path / "exists.txt").write_text("OLD")
     assert _decision("echo new > exists.txt", tmp_path) == "REVERSIBLE"
+
+
+# --------------------------------------------------------------------------
+# The escape hatches
+#
+# On 2026-08-25 a syntax error committed to cli.py made demo_cli unimportable.
+# This trap runs on EVERY command in EVERY bash, it read the resulting non-zero
+# exit as "the guard refused", and every command in every shell began failing -
+# including the ones needed to repair the file. The recovery path was the one
+# thing that could not be done from a shell.
+#
+# Our own failures fail OPEN. That is already the rule inside guard-shell; a
+# package that will not import is the same class of failure, only earlier.
+# --------------------------------------------------------------------------
+import shutil as _shutil
+import subprocess as _subprocess
+
+import pytest as _pytest
+
+from demo_cli.cli import _SHELL_GUARD_SNIPPET
+
+
+def _fake_demo_cli(directory, body):
+    path = os.path.join(directory, "demo_cli")
+    with open(path, "w") as f:
+        f.write(body)
+    os.chmod(path, 0o755)
+    return path
+
+
+@_pytest.fixture
+def guarded_shell(tmp_path):
+    """A real bash with the real snippet installed, and a stub demo_cli."""
+    binn = tmp_path / "bin"
+    binn.mkdir()
+    script = tmp_path / "guard.sh"
+    script.write_text(_SHELL_GUARD_SNIPPET)
+
+    def run(stub_body, env_extra=None):
+        _fake_demo_cli(str(binn), stub_body)
+        env = dict(os.environ)
+        env["PATH"] = f"{binn}{os.pathsep}" + env["PATH"]
+        env["BASH_ENV"] = str(script)
+        env.update(env_extra or {})
+        return _subprocess.run(["bash", "-c", "rm -f /tmp/nonexistent-xyz; echo RAN"],
+                               capture_output=True, text=True, env=env, timeout=30)
+    return run
+
+
+BROKEN = '#!/bin/sh\necho "SyntaxError: broken" >&2\nexit 1\n'
+BLOCKS = '#!/bin/sh\nif [ "$1" = "--version" ]; then echo 0.0; exit 0; fi\nexit 1\n'
+ALLOWS = '#!/bin/sh\nexit 0\n'
+
+
+@_pytest.mark.skipif(not _shutil.which("bash"), reason="needs bash")
+def test_a_broken_demo_cli_does_not_lock_the_shell(guarded_shell):
+    """THE regression test. Every invocation fails, as it did when the package
+    would not import - and the command must still run."""
+    r = guarded_shell(BROKEN)
+    assert "RAN" in r.stdout, "a broken guard must not block the shell"
+    assert "not working" in r.stderr, "and it must say why"
+
+
+@_pytest.mark.skipif(not _shutil.which("bash"), reason="needs bash")
+def test_a_working_guard_still_blocks(guarded_shell):
+    """The escape hatch must not become a hole: a guard that runs and refuses
+    is still a refusal."""
+    r = guarded_shell(BLOCKS)
+    assert "RAN" not in r.stdout
+    assert "blocked" in r.stderr
+
+
+@_pytest.mark.skipif(not _shutil.which("bash"), reason="needs bash")
+def test_the_kill_switch_turns_the_guard_off(guarded_shell):
+    """`export` is a builtin matching no pattern in the pre-filter, so this
+    still works from a shell that is otherwise stuck."""
+    r = guarded_shell(BLOCKS, {"DEMO_CLI_DISABLE": "1"})
+    assert "RAN" in r.stdout
+    assert "blocked" not in r.stderr
+
+
+@_pytest.mark.skipif(not _shutil.which("bash"), reason="needs bash")
+def test_an_allowing_guard_lets_the_command_through(guarded_shell):
+    r = guarded_shell(ALLOWS)
+    assert "RAN" in r.stdout
+
+
+def test_the_snippet_carries_both_escape_hatches():
+    assert "DEMO_CLI_DISABLE" in _SHELL_GUARD_SNIPPET
+    assert "--version" in _SHELL_GUARD_SNIPPET, "the broken-vs-refused probe"
