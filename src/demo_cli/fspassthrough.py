@@ -68,6 +68,25 @@ def normalize(virtual: Optional[str]) -> str:
     return virtual.replace("\\", "/").strip("/")
 
 
+def is_directory_not_empty(exc: OSError) -> bool:
+    """True for the ONE delete failure that is expected and harmless.
+
+    Windows removes a tree leaf-first, so a directory whose children are still
+    present is refused and revisited. Every other failure means the file the
+    caller asked to delete is still there, and must be reported rather than
+    swallowed.
+
+    Both spellings are checked. Python maps ERROR_DIR_NOT_EMPTY (145) to
+    ENOTEMPTY, but relying on that mapping alone would turn the expected case
+    into an alarming warning if it ever differed - and the whole point of this
+    predicate is to keep the alarm meaningful.
+
+    Module level so the distinction is testable off Windows: the code that
+    consumes it lives inside a winfspy subclass and cannot be constructed here.
+    """
+    return exc.errno == errno.ENOTEMPTY or getattr(exc, "winerror", None) == 145
+
+
 @dataclass
 class Attrs:
     """What the filesystem layer needs to answer get_file_info.

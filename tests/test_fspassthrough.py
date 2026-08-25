@@ -25,7 +25,8 @@ import threading
 
 import pytest
 
-from demo_cli.fspassthrough import Attrs, Backing, PathEscape, normalize
+from demo_cli.fspassthrough import (Attrs, Backing, PathEscape,
+                                    is_directory_not_empty, normalize)
 
 
 @pytest.fixture
@@ -301,6 +302,54 @@ def test_removing_a_NON_empty_directory_is_refused(backing):
     with pytest.raises(OSError):
         backing.remove(r"\tree")
     assert backing.exists(r"\tree\a.txt")
+
+
+# --------------------------------------------------------------------------
+# Telling the ONE harmless delete failure from every dangerous one
+#
+# cleanup() used to swallow every OSError, written for the non-empty-directory
+# case. On 2026-08-25 a Remove-Item printed no error, produced a
+# "[fs] delete ... snapshotted" line, and left the file in the backing
+# directory: the ledger recorded a destruction that never happened, and the
+# user's delete never happened either. Both silently.
+# --------------------------------------------------------------------------
+
+def test_a_non_empty_directory_is_the_expected_failure(backing):
+    backing.make_dir(r"\tree")
+    backing.make_file(r"\tree\a.txt")
+    try:
+        backing.remove(r"\tree")
+        pytest.fail("should have refused")
+    except OSError as exc:
+        assert is_directory_not_empty(exc), \
+            "Windows revisits this directory; it must not raise an alarm"
+
+
+def test_a_missing_file_is_NOT_the_expected_failure(backing):
+    """Anything other than 'not empty' means the file the caller asked to
+    delete is still there - or was never there - and has to be reported."""
+    try:
+        backing.remove(r"\nope.txt")
+        pytest.fail("should have raised")
+    except OSError as exc:
+        assert not is_directory_not_empty(exc)
+
+
+def test_a_permission_failure_is_NOT_swallowed():
+    """The shape of the bug: on Windows an open handle without
+    FILE_SHARE_DELETE makes the unlink fail with a permission error, which the
+    old blanket except turned into silence."""
+    exc = PermissionError(13, "Permission denied")
+    assert not is_directory_not_empty(exc)
+
+
+def test_the_windows_error_code_is_recognised_even_off_windows():
+    """Python maps ERROR_DIR_NOT_EMPTY (145) to ENOTEMPTY, but the predicate
+    checks both spellings so a mapping difference cannot turn the expected
+    case into a false alarm."""
+    exc = OSError(0, "dir not empty")
+    exc.winerror = 145
+    assert is_directory_not_empty(exc)
 
 
 # --------------------------------------------------------------------------

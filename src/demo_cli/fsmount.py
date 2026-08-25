@@ -329,7 +329,8 @@ def build_passthrough_operations(config: Config, backing_dir: str,
     from winfspy.plumbing.security_descriptor import SecurityDescriptor
     from winfspy.plumbing.win32_filetime import filetime_now
 
-    from .fspassthrough import Backing, PathEscape, normalize
+    from .fspassthrough import (Backing, PathEscape, is_directory_not_empty,
+                                normalize)
 
     EPOCH_AS_FILETIME = 116444736000000000
     ALLOCATION_UNIT = 4096
@@ -626,13 +627,51 @@ def build_passthrough_operations(config: Config, backing_dir: str,
             verdict = fsguard.on_cleanup(file_name or file_context.virtual, flags)
             if verdict.destructive:
                 self._capture(verdict)
-            if flags & fsguard.FSP_CLEANUP_DELETE:
+            if not flags & fsguard.FSP_CLEANUP_DELETE:
+                return
+
+            # Drop our own descriptor first. FILE_SHARE_DELETE makes the unlink
+            # legal with the handle open, but Windows then marks the file
+            # DELETE-PENDING and only removes it once every handle closes - so
+            # it would linger, visible, after a delete the user watched
+            # succeed. Closing here makes the removal immediate.
+            fd, file_context.fd = file_context.fd, None
+            if fd is not None:
                 try:
-                    self.backing.remove(file_context.virtual)
+                    os.close(fd)
                 except OSError:
-                    # A non-empty directory is not deleted here; Windows
-                    # removes a tree leaf-first and will come back for it.
                     pass
+
+            try:
+                self.backing.remove(file_context.virtual)
+            except OSError as exc:
+                if is_directory_not_empty(exc):
+                    # Expected and not a failure: Windows removes a tree
+                    # leaf-first and will come back for this directory once
+                    # its children are gone.
+                    return
+                # ANYTHING ELSE MUST BE SAID OUT LOUD.
+                #
+                # This used to be a bare `except OSError: pass`, written for
+                # the case above and silently swallowing every other one. On
+                # 2026-08-25 a Remove-Item printed no error, produced a
+                # "[fs] delete ... snapshotted" line, and left the file sitting
+                # in the backing directory. The ledger recorded a destruction
+                # that never happened, and the user's delete never happened
+                # either - both silently.
+                #
+                # cleanup() cannot return a status to Windows (it is void, and
+                # WinFsp ignores errors here), so raising would tell nobody.
+                # Saying so on stderr and in the ledger is the only honest
+                # option left.
+                sys.stderr.write(
+                    f"demo_cli [fs] DELETE FAILED: {file_context.virtual} "
+                    f"still exists ({exc.strerror or exc}). Any snapshot taken "
+                    f"for it describes a file that was not destroyed.\n")
+                if verdict.destructive:
+                    self._receipt(verdict, None,
+                                  f"delete did not complete: {exc.strerror or exc}. "
+                                  f"The file is unchanged.")
 
         @guarded
         def set_file_size(self, file_context, new_size, set_allocation_size):
