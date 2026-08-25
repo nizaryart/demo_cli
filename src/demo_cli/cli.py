@@ -677,14 +677,139 @@ def cmd_mount(a) -> int:
     if backing and not os.path.isdir(backing):
         print(f"The backing directory {backing} does not exist.")
         print("It is where your files actually live. To convert an existing")
-        print("project, move it aside first so its own path is free for the mount.")
+        print("project, run:  demo_cli protect <your project>")
         return 1
     if not backing:
         # Said before the mount starts, not buried in the banner afterwards.
         print("NOTE: no --backing given, so this mount is IN MEMORY.")
         print("      Everything written inside it is LOST when you unmount.")
-        print("      For real work: demo_cli mount <path> --backing <where files live>")
-    mount(a.mountpoint, debug=a.debug, backing=backing)
+        print("      For real work:  demo_cli protect <your project>")
+
+    if getattr(a, "foreground", False):
+        return _mount_foreground(a, backing)
+    return _mount_detached(a, backing)
+
+
+def _mount_foreground(a, backing) -> int:
+    """Run the mount in this process, printing to this terminal.
+
+    Now the opt-in rather than the default. Useful for debugging, and for
+    watching the [fs] lines live.
+    """
+    from . import fsmount, mountstate
+    from .fsmount import mount
+
+    cfg = load_config(fsmount.config_anchor(os.path.abspath(a.mountpoint), backing))
+    mountstate.write(cfg, os.getpid(), os.path.abspath(a.mountpoint), backing)
+    try:
+        mount(a.mountpoint, debug=a.debug, backing=backing)
+    finally:
+        mountstate.clear(cfg)
+    return 0
+
+
+def _mount_detached(a, backing) -> int:
+    """Start the guard as a background process that outlives this terminal.
+
+    THE DEFAULT, deliberately. The mount used to block, so closing the window
+    silently stopped all protection - and a guard that stops protecting you
+    without saying so is worse than one you never installed, because you go on
+    believing you are covered. That is the fourth costume of "installed but
+    inert" in this project; the other three each cost hours.
+
+    Detached, the [fs] lines have no terminal to reach, and those lines are
+    the only channel carrying recovery-point ids. They go to mount.log, and
+    doctor points at it.
+    """
+    import subprocess
+    import time
+
+    from . import fsmount, mountstate
+
+    cfg = load_config(fsmount.config_anchor(os.path.abspath(a.mountpoint), backing))
+
+    existing = mountstate.status(cfg)
+    if existing.running:
+        print(f"A filesystem guard is already running for {existing.mountpoint}")
+        print(f"  pid {existing.pid}.  Stop it with:  demo_cli unmount")
+        return 1
+
+    os.makedirs(cfg.workspace, exist_ok=True)
+    log = mountstate.log_path(cfg)
+
+    argv = [sys.executable, "-m", "demo_cli", "mount", a.mountpoint, "--foreground"]
+    if backing:
+        argv += ["--backing", backing]
+    if a.debug:
+        argv += ["--debug"]
+
+    # Detach properly on both platforms: no console, no process group tie, so
+    # closing the terminal or pressing Ctrl+C here does not take the guard down
+    # with it.
+    kwargs = {}
+    if os.name == "nt":
+        DETACHED_PROCESS = 0x00000008
+        CREATE_NEW_PROCESS_GROUP = 0x00000200
+        kwargs["creationflags"] = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True
+
+    with open(log, "a", encoding="utf-8") as fh:
+        proc = subprocess.Popen(argv, stdout=fh, stderr=fh,
+                                stdin=subprocess.DEVNULL, **kwargs)
+
+    # Give it long enough to fail loudly. A mount that dies immediately - a
+    # mount point that already exists, WinFsp not installed - must not be
+    # reported as started.
+    time.sleep(2.0)
+    if proc.poll() is not None:
+        print(render.c("The filesystem guard exited immediately.", "red"))
+        print(f"  see {log}")
+        try:
+            tail = open(log, encoding="utf-8", errors="replace").read().splitlines()[-8:]
+            for line in tail:
+                print("  " + line)
+        except OSError:
+            pass
+        return 1
+
+    mountstate.write(cfg, proc.pid, os.path.abspath(a.mountpoint), backing)
+    print(render.c(f"\ndemo_cli {__version__}  filesystem guard running\n", "dim"))
+    print(render.kv("mounted at", os.path.abspath(a.mountpoint)))
+    if backing:
+        print(render.kv("backing", backing))
+    print(render.kv("pid", proc.pid))
+    print(render.kv("log", log))
+    print("\n  " + render.c("It keeps running after you close this window.", "dim"))
+    print("  " + render.c("Stop it with:  demo_cli unmount", "dim") + "\n")
+    return 0
+
+
+def cmd_unmount(a) -> int:
+    """Stop a detached filesystem guard."""
+    import signal
+
+    from . import mountstate
+
+    cfg = load_config(getattr(a, "root", None))
+    st = mountstate.status(cfg)
+    if not st.recorded:
+        print("No filesystem guard is recorded for this project.")
+        print(f"  looked in {mountstate.state_path(cfg)}")
+        return 1
+    if st.stale:
+        print(f"The recorded guard (pid {st.pid}) is no longer running.")
+        print("  Clearing the stale record.")
+        mountstate.clear(cfg)
+        return 0
+    try:
+        os.kill(st.pid, signal.SIGTERM)
+    except Exception as exc:
+        print(f"Could not stop pid {st.pid}: {exc}")
+        print("  The record is left in place; the guard may still be running.")
+        return 1
+    mountstate.clear(cfg)
+    print(f"Stopped the filesystem guard at {st.mountpoint} (pid {st.pid}).")
     return 0
 
 
@@ -945,8 +1070,16 @@ def build_parser() -> argparse.ArgumentParser:
                     help="directory holding the real files (STAGE 2). Without "
                          "it the mount is in memory and its contents are LOST "
                          "on unmount - fine for a demo, not for real work")
+    mt.add_argument("--foreground", action="store_true",
+                    help="run in this terminal instead of detaching. The guard "
+                         "then stops when the window closes - which is why it is "
+                         "no longer the default")
     mt.add_argument("--debug", action="store_true", help="verbose WinFsp logging")
     mt.set_defaults(func=cmd_mount)
+
+    um = sub.add_parser("unmount", parents=[common],
+                        help="stop a detached filesystem guard [Windows]")
+    um.set_defaults(func=cmd_unmount)
 
     pr = sub.add_parser("protect", parents=[common],
                         help="relocate a project so its path becomes the guarded mount [Windows]")
