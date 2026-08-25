@@ -315,6 +315,77 @@ def _any_hook_installed(cfg) -> bool:
     return _hook_installed(project) or _hook_installed(glob)
 
 
+def _mount_checks(cfg) -> List[tuple]:
+    """Is the filesystem guard running RIGHT NOW, and can it be bypassed?
+
+    Every other doctor check is paperwork - a config exists, a hook is
+    registered, a binary is on PATH. A mount is different: it is a live
+    process, and when it stops the directory it was serving simply is not
+    there any more. Nothing else in this report would notice.
+
+    That makes a STALE record a hard fail rather than a warning. "No record"
+    means nobody started a guard, which is a choice. "Recorded but the process
+    is gone" means somebody started one, believes it is running, and is not
+    protected - the fourth appearance of installed-but-inert, and the only one
+    where the user has positive reason to think otherwise.
+    """
+    from . import fsmount, mountstate, protect as protect_mod
+
+    st = mountstate.status(cfg)
+    # Silent on platforms that cannot mount and where nobody has tried, so the
+    # report does not grow a permanently-yellow line on Linux.
+    if os.name != "nt" and not st.recorded:
+        return []
+
+    out: List[tuple] = []
+
+    if not st.recorded:
+        detail = ("not running (demo_cli protect <project>, then demo_cli mount)"
+                  if fsmount.available() else
+                  "not running; winfspy not importable "
+                  "(pipx inject demo-cli winfspy)")
+        return [("warn", "filesystem guard", detail)]
+
+    where = st.mountpoint or "?"
+    age = f", up {st.age_minutes} min" if st.age_minutes is not None else ""
+
+    if st.running is None:
+        out.append(("warn", "filesystem guard",
+                    f"recorded for {where} (pid {st.pid}) but its state cannot "
+                    f"be checked from here"))
+    elif st.stale:
+        out.append(("fail", "filesystem guard",
+                    f"RECORDED BUT NOT RUNNING - pid {st.pid} is gone, so {where} "
+                    f"is unguarded while the record says otherwise. "
+                    f"Restart it, or clear with: demo_cli unmount"))
+    else:
+        out.append(("ok", "filesystem guard", f"mounted at {where} (pid {st.pid}{age})"))
+
+    # A mount over a writable backing directory is bypassable by anything that
+    # writes to the backing path instead - demonstrated live on 2026-08-25 by
+    # an ordinary Remove-Item that the guard never saw.
+    if st.backing:
+        locked = protect_mod.is_locked(st.backing)
+        if locked is True:
+            out.append(("ok", "backing locked", st.backing))
+        elif locked is False:
+            out.append(("warn", "backing locked",
+                        f"NO - {st.backing} is writable directly, which bypasses "
+                        f"the guard entirely. Re-run `demo_cli protect` from an "
+                        f"Administrator shell"))
+        else:
+            out.append(("warn", "backing locked",
+                        f"cannot tell for {st.backing}"))
+    elif st.running:
+        out.append(("warn", "filesystem guard storage",
+                    "IN MEMORY - contents are lost on unmount. "
+                    "For real work: demo_cli protect <project>"))
+
+    if st.log and os.path.exists(st.log):
+        out.append(("ok", "guard log", st.log))
+    return out
+
+
 def cmd_doctor(a) -> int:
     import shutil
     cfg = load_config()
@@ -358,6 +429,8 @@ def cmd_doctor(a) -> int:
         checks.append(("ok" if path else "warn", f"hook: {label}",
                        path or f"not installed (demo_cli install-hook{flag})"))
     hook = _any_hook_installed(cfg)   # Claude Code specifically - gates the self-test below
+
+    checks.extend(_mount_checks(cfg))
 
     # THE check that actually predicts protection: is `demo_cli` resolvable on
     # PATH? Claude Code launches the hook as a bare `demo_cli hook` command in a
