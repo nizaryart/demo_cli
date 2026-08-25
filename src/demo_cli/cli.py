@@ -119,7 +119,7 @@ def cmd_verify(a) -> int:
 
 
 def cmd_report(a) -> int:
-    cfg = load_config()
+    cfg = load_config(getattr(a, "root", None))
     v = verify_chain(cfg.receipts_path)
     if not os.path.exists(cfg.receipts_path):
         print("No receipts yet. Run some commands through `demo_cli check` first.")
@@ -154,7 +154,7 @@ def cmd_receipt(a) -> int:
     """`demo_cli receipt --share [id]` — print a copy-pasteable proof card for a
     single receipt (the latest, or one by id). `--list` shows recent receipt ids.
     """
-    cfg = load_config()
+    cfg = load_config(getattr(a, "root", None))
 
     if getattr(a, "list", False):
         rows = load_receipts(cfg.receipts_path)
@@ -388,7 +388,7 @@ def _mount_checks(cfg) -> List[tuple]:
 
 def cmd_doctor(a) -> int:
     import shutil
-    cfg = load_config()
+    cfg = load_config(getattr(a, "root", None))
     checks = []
 
     pyok = sys.version_info >= (3, 9)
@@ -495,7 +495,7 @@ def cmd_doctor(a) -> int:
 
 
 def cmd_prune(a) -> int:
-    cfg = load_config()
+    cfg = load_config(getattr(a, "root", None))
     if a.keep is None and a.older_than is None:
         print("Specify --keep N or --older-than DAYS. Receipts are never pruned (audit trail).")
         return 1
@@ -510,7 +510,7 @@ def cmd_prune(a) -> int:
 
 
 def cmd_status(a) -> int:
-    cfg = load_config()
+    cfg = load_config(getattr(a, "root", None))
     v = verify_chain(cfg.receipts_path)
     total = v.entries if v.ok else 0
     if not v.ok and os.path.exists(cfg.receipts_path):
