@@ -43,6 +43,8 @@ step aside instead. A true crash is still caught by ``failClosed: true``.
 """
 from __future__ import annotations
 
+from . import attributed
+
 import json
 import os
 import sys
@@ -125,7 +127,7 @@ def run_before_shell(stdin, stdout) -> int:
         reason += f"  (recovery point {rid}; undo with `demo_cli undo {rid}`)"
     _emit(
         stdout, permission,
-        agent_message=reason if permission != "allow" else None,
+        agent_message=attributed(reason) if permission != "allow" else None,
         user_message=(f"demo_cli: {result.decision.decision}" if permission != "allow" else None),
     )
     return 0

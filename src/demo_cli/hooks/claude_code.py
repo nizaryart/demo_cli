@@ -29,6 +29,7 @@ import os
 import sys
 from typing import Dict
 
+from . import attributed
 from ..classify import POSIX, POWERSHELL
 from ..config import load_config
 from ..context import Intent
@@ -82,7 +83,9 @@ def _emit(stdout, permission: str, reason: str) -> None:
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "permissionDecision": permission,
-            "permissionDecisionReason": reason,
+            # Prefixed at the single exit point, so no caller can
+            # forget. See hooks.attributed.
+            "permissionDecisionReason": attributed(reason),
         }
     }))
     stdout.flush()

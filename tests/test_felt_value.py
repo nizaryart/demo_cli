@@ -89,3 +89,84 @@ def test_feedback_url_empty_on_plain_allow():
 def test_hook_selftest_exists_and_returns_bool():
     assert hasattr(cli, "_hook_selftest")
     assert isinstance(cli._hook_selftest("Bash", "rm -rf canary.txt"), bool)
+
+
+# --------------------------------------------------------------------------
+# A block has to say who blocked it
+#
+# Observed 2026-08-26 on Windows. demo_cli denied `curl.exe -X DELETE ...` and
+# the agent read only:
+#
+#     No recovery path for a mutating action on 'unknown';
+#     cannot auto-recover. Human input required.
+#
+# So it guessed - told the user "this looks like a safety gate in the
+# environment", then suggested running the command outside the session to get
+# past it. Honest reasoning from an unattributed message, and exactly the
+# wrong conclusion.
+# --------------------------------------------------------------------------
+import io as _io
+import json as _json
+
+from demo_cli.hooks import TAG, attributed
+
+
+def _deny_reason(monkeypatch, tmp_path, module, entry, payload):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".demo_cli.toml").write_text('mode = "enforce"\n')
+    out = _io.StringIO()
+    getattr(module, entry)(_io.StringIO(_json.dumps(payload)), out)
+    data = _json.loads(out.getvalue())
+    inner = data.get("hookSpecificOutput", data)
+    return (inner.get("permissionDecisionReason")
+            or data.get("agentMessage") or data.get("agent_message") or "")
+
+
+_BLOCKED = "curl.exe -X DELETE https://httpbin.org/delete"
+
+
+def test_claude_code_attributes_its_denial(monkeypatch, tmp_path):
+    from demo_cli.hooks import claude_code
+    reason = _deny_reason(monkeypatch, tmp_path, claude_code, "run_pretooluse",
+                          {"tool_name": "Bash", "tool_input": {"command": _BLOCKED}})
+    assert reason.startswith(TAG)
+
+
+def test_codex_attributes_its_denial(monkeypatch, tmp_path):
+    from demo_cli.hooks import codex
+    reason = _deny_reason(monkeypatch, tmp_path, codex, "run_pretooluse",
+                          {"tool_name": "Bash", "tool_input": {"command": _BLOCKED}})
+    assert reason.startswith(TAG)
+
+
+def test_cursor_attributes_its_denial(monkeypatch, tmp_path):
+    from demo_cli.hooks import cursor
+    reason = _deny_reason(monkeypatch, tmp_path, cursor, "run_before_shell",
+                          {"command": _BLOCKED})
+    assert reason.startswith(TAG)
+
+
+def test_the_reason_itself_survives_the_prefix():
+    assert attributed("no recovery path").endswith("no recovery path")
+
+
+def test_prefixing_is_idempotent():
+    """Belt and braces: a caller that already tagged must not double-tag."""
+    once = attributed("blocked")
+    assert attributed(once) == once
+
+
+def test_an_empty_reason_still_names_us():
+    assert attributed("") == TAG
+    assert attributed(None) == TAG
+
+
+def test_receipt_reasons_are_NOT_tagged(monkeypatch, tmp_path):
+    """The ledger records what was decided, not who printed it. Tagging there
+    would put presentation text into the hash chain forever."""
+    from demo_cli.config import Config
+    from demo_cli.guard import Guard
+    monkeypatch.chdir(tmp_path)
+    r = Guard(Config(mode="enforce", project_root=str(tmp_path))).evaluate(
+        _BLOCKED, agent_id="t", session_id="t")
+    assert TAG not in r.receipt.reason

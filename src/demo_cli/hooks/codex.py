@@ -83,6 +83,8 @@ import re
 import sys
 from typing import Dict, List, Optional, Tuple
 
+from . import attributed
+
 from ..config import load_config
 from ..context import Intent
 from ..decide import ASK, BLOCKING
@@ -189,7 +191,9 @@ def _emit(stdout, permission: str, reason: str,
     payload: Dict = {
         "hookEventName": "PreToolUse",
         "permissionDecision": permission,
-        "permissionDecisionReason": reason,
+        # Prefixed at the single exit point, so no caller can forget.
+        # See hooks.attributed.
+        "permissionDecisionReason": attributed(reason),
     }
     if additional:
         payload["additionalContext"] = additional
