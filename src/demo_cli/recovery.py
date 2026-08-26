@@ -24,7 +24,8 @@ import uuid
 from dataclasses import dataclass
 from typing import List, Optional
 
-from .classify import (POSIX, effective_command, join_continuations,
+from .classify import (POSIX, POWERSHELL, effective_command, join_continuations,
+                       strip_ps_escapes,
                        redirect_target, split_segments,
                        substitute_assignments)
 from .context import redact
@@ -543,6 +544,8 @@ def extract_path_operand(cmd: str, dialect: str = POSIX) -> Optional[str]:
     # extractor looked for a path in text that no longer describes the action.
     cmd, dialect = effective_command(cmd, dialect)
     cmd = join_continuations(cmd, dialect)
+    if dialect == POWERSHELL:
+        cmd = strip_ps_escapes(cmd)     # same normalisation as the classifier
     # `T=notes.txt; rm $T` names its target in the same string it uses it in.
     # Resolving that here rather than in the classifier keeps the change to
     # WHAT WE SNAPSHOT, and leaves WHETHER IT IS DESTRUCTIVE alone: `rm $T` is

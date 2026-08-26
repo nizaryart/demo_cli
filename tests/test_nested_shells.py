@@ -147,10 +147,72 @@ def test_a_nested_safe_command_stays_safe(files):
 # The frontier, stated as a test so nobody assumes otherwise
 # --------------------------------------------------------------------------
 
-def test_obfuscation_INSIDE_the_payload_is_still_not_caught(files):
-    """Unwrapping is string work and inherits the string layer's frontier.
-    `R''emove-Item` defeats it and always will - that is the behavioural
-    layer's job, and on Windows the WinFsp guard catches it at the filesystem.
-    Written as a test so the limit is explicit rather than assumed."""
-    assert not classify_pipeline(
-        'powershell -c "R\'\'emove-Item test.txt"').is_destructive
+@pytest.mark.parametrize("payload", [
+    "Remo`ve-Item test.txt",
+    "R`e`move-Item test.txt",
+    "`Remove-Item test.txt",
+])
+def test_backtick_obfuscation_IS_caught(files, payload):
+    """The most likely real bypass of the PowerShell rules, and a mechanical
+    one: PowerShell's grammar says a backtick before an ordinary character
+    means that character, so removing it is reading, not evaluating."""
+    cmd = f'powershell -c "{payload}"'
+    assert classify_pipeline(cmd).is_destructive
+    assert recovery.extract_path_operand(cmd) == "test.txt"
+
+
+@pytest.mark.parametrize("payload", [
+    "&('Remove-Item') test.txt",        # call operator on a string
+    "iex 'Remove-Item test.txt'",       # invoke-expression
+    "$c='Remove-Item'; & $c test.txt",  # built at runtime
+])
+def test_expression_obfuscation_is_NOT_caught_and_never_will_be(files, payload):
+    """THE FRONTIER, written down so nobody assumes otherwise.
+
+    Resolving these means EVALUATING a PowerShell expression, which a
+    pre-execution guard must never do - the moment it evaluates the thing it
+    is guarding, it has stopped being one. They belong to the behavioural
+    layer, and on Windows the WinFsp guard catches them at the filesystem
+    where the spelling no longer exists.
+
+    An earlier version of this test used `R''emove-Item`, a BASH-ism that is
+    not even valid PowerShell - so it asserted we miss something that would
+    not have run. Fourth time an assumption from the wrong dialect got into a
+    test here.
+    """
+    assert not classify_pipeline(f'powershell -c "{payload}"').is_destructive
+
+
+# --------------------------------------------------------------------------
+# The backtick normaliser on its own
+# --------------------------------------------------------------------------
+
+from demo_cli.classify import strip_ps_escapes
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("Remo`ve-Item x", "Remove-Item x"),
+    ("R`e`m`o`v`e-Item x", "Remove-Item x"),
+    ("Remove-Item x", "Remove-Item x"),
+])
+def test_literal_escapes_are_removed(raw, expected):
+    assert strip_ps_escapes(raw) == expected
+
+
+def test_escape_sequences_inside_double_quotes_are_preserved():
+    """`n is a newline, not the letter n. Turning "a`nb" into "anb" would
+    corrupt the very string being examined."""
+    assert strip_ps_escapes('Write-Host "a`nb"') == 'Write-Host "a`nb"'
+
+
+def test_single_quoted_content_is_untouched():
+    """PowerShell does no escaping at all inside single quotes."""
+    assert strip_ps_escapes("Remove-Item 'a`b'") == "Remove-Item 'a`b'"
+
+
+def test_a_backtick_in_a_bare_word_is_literal_even_for_escape_letters():
+    """`v is a vertical tab ONLY inside double quotes. In a bare command name
+    it is the letter v - which is exactly what the first implementation got
+    wrong, and exactly why Remo`ve-Item slipped through."""
+    assert strip_ps_escapes("Remo`ve-Item x") == "Remove-Item x"
+    assert strip_ps_escapes("Remo`nve x") == "Remonve x"

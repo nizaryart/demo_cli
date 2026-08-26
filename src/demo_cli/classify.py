@@ -267,6 +267,57 @@ POWERSHELL = "powershell"
 _CONTINUATION = {POSIX: "\\", POWERSHELL: "`"}
 
 
+_PS_ESCAPE_SEQUENCES = "nrt0abfv"       # only meaningful inside "double quotes"
+
+
+def strip_ps_escapes(cmd: str) -> str:
+    """Remove PowerShell backticks that mean nothing but "the next character".
+
+        Remo`ve-Item x   ->   Remove-Item x
+
+    THE MOST LIKELY REAL BYPASS OF THE POWERSHELL RULES, measured 2026-08-26.
+    A backtick before an ordinary character is PowerShell's escape for that
+    character - so the two strings above are the same command, and only the
+    second matched any rule.
+
+    Mechanical, like base64 decoding and unlike everything else in this
+    family: PowerShell's own grammar says what the backtick means, so removing
+    it is reading, not evaluating. `&('Remove-Item')` and `iex "..."` are NOT
+    in the same category - resolving those means evaluating an expression,
+    which a pre-execution guard must never do. They stay behind the frontier
+    and belong to the behavioural layer.
+
+    QUOTE STATE, not a lookahead. The first attempt excluded the escape
+    sequences (`n `r `t `0 `a `b `f `v) wherever they appeared - and missed
+    `Remo`ve-Item`, because `v is in that list. Those sequences only mean
+    anything INSIDE A DOUBLE-QUOTED STRING; in a bare command name a backtick
+    is just "the next character, literally". Inside single quotes PowerShell
+    does no escaping at all, so backticks there are left alone.
+    """
+    out: List[str] = []
+    in_single = in_double = False
+    i, n = 0, len(cmd)
+    while i < n:
+        ch = cmd[i]
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif ch == "`" and not in_single and i + 1 < n:
+            nxt = cmd[i + 1]
+            if in_double and nxt in _PS_ESCAPE_SEQUENCES:
+                out.append(ch)              # a real escape sequence: keep it
+                out.append(nxt)
+                i += 2
+                continue
+            out.append(nxt)                 # literal next character
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def join_continuations(cmd: str, dialect: str = POSIX) -> str:
     """Fold a multi-line command back into one line.
 
@@ -791,6 +842,10 @@ def classify_pipeline(cmd: str, dialect: str = POSIX) -> Classification:
     # the same, or the two would disagree about what the command even is.
     cmd, dialect = effective_command(cmd, dialect)
     cmd = join_continuations(cmd, dialect)
+    if dialect == POWERSHELL:
+        # After continuations, so an end-of-line backtick has already been
+        # consumed as one. What is left means "the literal next character".
+        cmd = strip_ps_escapes(cmd)
     segments = split_segments(cmd, dialect)
     seg_results = [_classify_segment(seg) for seg in segments]
     if not seg_results:
