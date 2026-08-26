@@ -1006,8 +1006,19 @@ def cmd_unprotect(a) -> int:
 
 
 _MITM_DIR = "~/.mitmproxy"
-_CA_PEM = _MITM_DIR + "/mitmproxy-ca-cert.pem"    # Python / Node clients
-_CA_CER = _MITM_DIR + "/mitmproxy-ca-cert.cer"    # the Windows certificate store
+_CA_PEM_NAME = "mitmproxy-ca-cert.pem"    # Python / Node clients
+_CA_CER_NAME = "mitmproxy-ca-cert.cer"    # the Windows certificate store
+
+
+def _ca_path(name: str) -> str:
+    """Expand and NORMALISE, in that order.
+
+    expanduser only replaces the '~'. Building the rest of the path with
+    forward slashes therefore printed
+    `C:\\Users\\pc/.mitmproxy/mitmproxy-ca-cert.pem` on Windows - which works,
+    and looks broken enough that a user reasonably assumes it is.
+    """
+    return os.path.normpath(os.path.join(os.path.expanduser(_MITM_DIR), name))
 
 
 def egress_setup_lines(port: int, windows: bool) -> List[str]:
@@ -1018,7 +1029,7 @@ def egress_setup_lines(port: int, windows: bool) -> List[str]:
     PowerShell is the same class of mistake as telling them to write a config
     with Out-File - it looks helpful and does not work.
     """
-    pem, cer = os.path.expanduser(_CA_PEM), os.path.expanduser(_CA_CER)
+    pem = _ca_path(_CA_PEM_NAME)
     if windows:
         return [
             "1) point the agent's traffic at the proxy:",
@@ -1056,11 +1067,11 @@ def _trust_ca(remove: bool = False) -> int:
     import subprocess
     if os.name != "nt":
         print("--trust-ca is Windows-only (the certificate store).")
-        print(f"On Linux, point clients at {os.path.expanduser(_CA_PEM)} with")
+        print(f"On Linux, point clients at {_ca_path(_CA_PEM_NAME)} with")
         print("REQUESTS_CA_BUNDLE / NODE_EXTRA_CA_CERTS, or add it to your")
         print("distribution's CA bundle.")
         return 1
-    cer = os.path.expanduser(_CA_CER)
+    cer = _ca_path(_CA_CER_NAME)
     if not remove and not os.path.exists(cer):
         print(f"{cer} does not exist yet.")
         print("mitmproxy generates its CA on first run:  demo_cli egress")
@@ -1126,6 +1137,81 @@ def cmd_egress(a) -> int:
         except KeyboardInterrupt:
             return 0
     os.execve(mitm, argv, env)
+
+
+def cmd_guarded(a) -> int:
+    """Launch an agent with every layer that can be started, started.
+
+    The value is as much the COVERAGE REPORT as the launch: it answers "am I
+    actually protected?" at the one moment somebody is guaranteed to be
+    looking, instead of leaving it to a `doctor` run nobody thinks to do.
+    """
+    import subprocess
+    import time
+
+    from . import guarded as g
+
+    argv = [t for t in (getattr(a, "argv", None) or []) if t != "--"]
+    if not argv:
+        print("usage: demo_cli guarded <command> [args...]     e.g. demo_cli guarded claude")
+        return 1
+
+    cfg = load_config(getattr(a, "root", None))
+    port = getattr(a, "port", 8080)
+    started_egress = None
+
+    # Start the proxy if it is not already up. Nothing else is auto-started:
+    # the mount needs elevation and a relocated project, and hooks are
+    # persistent host config that must not be written behind the user's back.
+    if not getattr(a, "no_egress", False) and not g.port_open(port):
+        mitm = __import__("shutil").which("mitmdump")
+        if mitm:
+            log = os.path.join(cfg.workspace, "egress.log")
+            os.makedirs(cfg.workspace, exist_ok=True)
+            here = os.path.dirname(os.path.abspath(__file__))
+            env = dict(os.environ, DEMO_CLI_EGRESS_MODE=cfg.mode,
+                       PYTHONPATH=os.path.dirname(here) + os.pathsep
+                       + os.environ.get("PYTHONPATH", ""))
+            kwargs = {"creationflags": 0x00000008 | 0x08000000} if os.name == "nt" \
+                else {"start_new_session": True}
+            with open(log, "a", encoding="utf-8") as fh:
+                started_egress = subprocess.Popen(
+                    [mitm, "-s", os.path.join(here, "egress_addon.py"),
+                     "--listen-port", str(port), "-q"],
+                    stdout=fh, stderr=fh, stdin=subprocess.DEVNULL, env=env, **kwargs)
+            for _ in range(20):                 # up to ~4s for the port to open
+                if g.port_open(port):
+                    break
+                time.sleep(0.2)
+
+    layers = g.assess(cfg, port, _host_hook_status(cfg))
+    print(render.c(f"\ndemo_cli {__version__}  guarded  ->  {' '.join(argv)}\n", "dim"))
+    for layer in layers:
+        mark = render.c("[+]", "green") if layer.ok else render.c("[!]", "yellow")
+        print(f"  {mark} {layer.name:<16} {layer.detail}")
+        if layer.fixable:
+            print(f"      {render.c('turn it on: ' + layer.fixable, 'dim')}")
+    print(f"\n  {g.summary(layers)}\n")
+    # Flush before handing the terminal over. Python buffers stdout when it is
+    # not a tty, the child does not, so without this the coverage report lands
+    # AFTER the agent's own output - and a report you read afterwards is not a
+    # report, it is a log entry.
+    sys.stdout.flush()
+
+    env = g.child_env(dict(os.environ), port, g.port_open(port))
+    try:
+        return subprocess.run(argv, env=env).returncode
+    except FileNotFoundError:
+        print(f"{argv[0]}: not found on PATH.")
+        return 127
+    except KeyboardInterrupt:
+        return 130
+    finally:
+        # Only what we started. A proxy the user already had running in another
+        # terminal is theirs, and killing it would be a surprise.
+        if started_egress and started_egress.poll() is None:
+            started_egress.terminate()
+            print("\ndemo_cli: stopped the egress guard it started.")
 
 
 def cmd_run(a) -> int:
@@ -1311,6 +1397,15 @@ def build_parser() -> argparse.ArgumentParser:
                     help="where the real files are (default: <project>.real)")
     up.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
     up.set_defaults(func=cmd_unprotect)
+
+    gd = sub.add_parser("guarded", parents=[common],
+                        help="launch an agent with every layer that can be started, started")
+    gd.add_argument("--port", type=int, default=8080, help="egress proxy port (default 8080)")
+    gd.add_argument("--no-egress", action="store_true",
+                    help="do not start or use the egress proxy")
+    gd.add_argument("argv", nargs=argparse.REMAINDER,
+                    help="the agent to run, e.g. `demo_cli guarded claude`")
+    gd.set_defaults(func=cmd_guarded)
 
     eg = sub.add_parser("egress", parents=[common],
                         help="gate destructive external/SaaS API calls via an HTTP proxy (needs mitmdump)")
