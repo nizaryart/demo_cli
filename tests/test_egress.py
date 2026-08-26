@@ -118,3 +118,68 @@ def test_tokenizer_and_verb_intent():
     assert _verb_intent("deleteUser") == "destructive"
     assert _verb_intent("getUser") == "read"
     assert _verb_intent("createUser") == "write"
+
+
+# --------------------------------------------------------------------------
+# Launching the guard: the only part of this layer that is platform-coupled
+#
+# classify_http and the five protocol extractors are pure and already pass on
+# both platforms. What did not port was the LAUNCHER:
+#
+#   * os.execve does not replace the process on Windows - it spawns a new one
+#     and terminates this one, so the prompt returns, the proxy is orphaned,
+#     and Ctrl-C never reaches it
+#   * the setup steps were printed as bash `export VAR=value`, which does
+#     nothing in PowerShell. Same class of mistake as telling somebody to
+#     write a config with Out-File: it looks helpful and silently fails
+# --------------------------------------------------------------------------
+import os as _os
+import pytest
+
+from demo_cli.cli import egress_setup_lines
+
+
+def _text(port=8080, windows=False):
+    return "\n".join(egress_setup_lines(port, windows=windows))
+
+
+def test_posix_setup_uses_export():
+    out = _text()
+    assert "export HTTPS_PROXY=http://localhost:8080" in out
+    assert "$env:" not in out
+
+
+def test_windows_setup_uses_powershell_syntax():
+    out = _text(windows=True)
+    assert '$env:HTTPS_PROXY = "http://localhost:8080"' in out
+    assert "export " not in out, "bash syntax silently does nothing in PowerShell"
+
+
+def test_the_port_is_carried_into_both_dialects():
+    assert "9999" in _text(port=9999)
+    assert "9999" in _text(port=9999, windows=True)
+
+
+def test_windows_setup_names_the_certificate_store_route():
+    """REQUESTS_CA_BUNDLE and NODE_EXTRA_CA_CERTS cover Python and Node, which
+    is most agent traffic - but Invoke-WebRequest, .NET and curl.exe ignore
+    them and read the Windows store. Saying only the first half would leave
+    somebody debugging TLS errors with no clue."""
+    out = _text(windows=True)
+    assert "REQUESTS_CA_BUNDLE" in out
+    assert "--trust-ca" in out
+    assert "--untrust-ca" in out, "an install with no documented undo is not offered"
+
+
+def test_both_dialects_point_at_the_pem_for_python_clients():
+    for windows in (False, True):
+        assert "mitmproxy-ca-cert.pem" in _text(windows=windows)
+
+
+@pytest.mark.skipif(_os.name == "nt", reason="checks the non-Windows path")
+def test_trust_ca_off_windows_explains_the_alternative(capsys):
+    from demo_cli.cli import _trust_ca
+    assert _trust_ca() == 1
+    out = capsys.readouterr().out
+    assert "Windows-only" in out
+    assert "REQUESTS_CA_BUNDLE" in out, "point them at what DOES work here"

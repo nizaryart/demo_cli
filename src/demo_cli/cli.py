@@ -1005,11 +1005,95 @@ def cmd_unprotect(a) -> int:
     return 0
 
 
+_MITM_DIR = "~/.mitmproxy"
+_CA_PEM = _MITM_DIR + "/mitmproxy-ca-cert.pem"    # Python / Node clients
+_CA_CER = _MITM_DIR + "/mitmproxy-ca-cert.cer"    # the Windows certificate store
+
+
+def egress_setup_lines(port: int, windows: bool) -> List[str]:
+    """The steps a person has to perform, in their own shell's language.
+
+    Separate from cmd_egress so the two dialects can be asserted in tests
+    without launching a proxy. Printing `export VAR=value` to somebody running
+    PowerShell is the same class of mistake as telling them to write a config
+    with Out-File - it looks helpful and does not work.
+    """
+    pem, cer = os.path.expanduser(_CA_PEM), os.path.expanduser(_CA_CER)
+    if windows:
+        return [
+            "1) point the agent's traffic at the proxy:",
+            f'     $env:HTTPS_PROXY = "http://localhost:{port}"',
+            f'     $env:HTTP_PROXY  = "http://localhost:{port}"',
+            "2) let it read TLS. Python and Node honour these:",
+            f'     $env:REQUESTS_CA_BUNDLE = "{pem}"',
+            f'     $env:NODE_EXTRA_CA_CERTS = "{pem}"',
+            "   Windows-native clients (Invoke-WebRequest, .NET, curl.exe) ignore",
+            "   those and read the certificate store instead:",
+            "     demo_cli egress --trust-ca        (undo: --untrust-ca)",
+            "3) relaunch the agent from that shell. Ctrl-C here stops the guard.",
+        ]
+    return [
+        "1) point the agent's traffic at the proxy:",
+        f"     export HTTPS_PROXY=http://localhost:{port}  HTTP_PROXY=http://localhost:{port}",
+        "2) let it read TLS by trusting mitmproxy's CA (first run generates it):",
+        f"     export REQUESTS_CA_BUNDLE={pem}   NODE_EXTRA_CA_CERTS={pem}",
+        "3) relaunch the agent from that shell. Ctrl-C here stops the guard.",
+    ]
+
+
+def _trust_ca(remove: bool = False) -> int:
+    """Add or remove mitmproxy's root CA in the CURRENT USER's trust store.
+
+    -user, never -machine: a per-user store is the smaller blast radius and
+    needs no elevation. Installing a root CA machine-wide to read one agent's
+    traffic is not a trade this tool should make for you.
+
+    A trusted root CA is a real change to what this machine believes. While it
+    is installed, anything holding mitmproxy's private key can transparently
+    read and rewrite your HTTPS - which is exactly how the guard works, and
+    exactly why --untrust-ca exists and is printed every time.
+    """
+    import subprocess
+    if os.name != "nt":
+        print("--trust-ca is Windows-only (the certificate store).")
+        print(f"On Linux, point clients at {os.path.expanduser(_CA_PEM)} with")
+        print("REQUESTS_CA_BUNDLE / NODE_EXTRA_CA_CERTS, or add it to your")
+        print("distribution's CA bundle.")
+        return 1
+    cer = os.path.expanduser(_CA_CER)
+    if not remove and not os.path.exists(cer):
+        print(f"{cer} does not exist yet.")
+        print("mitmproxy generates its CA on first run:  demo_cli egress")
+        return 1
+    verb = "delstore" if remove else "addstore"
+    args = ["certutil", "-user", "-" + verb, "Root",
+            "mitmproxy" if remove else cer]
+    r = subprocess.run(args, capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"certutil failed:\n{(r.stdout or '') + (r.stderr or '')}".rstrip())
+        return 1
+    if remove:
+        print("Removed mitmproxy's CA from your user trust store.")
+    else:
+        print(f"Trusted {cer} in your USER certificate store.")
+        print()
+        print("  While this is installed, anything holding mitmproxy's private")
+        print("  key can read and rewrite your HTTPS traffic. That is how the")
+        print("  guard inspects requests - and why you should remove it when")
+        print("  you are done:   demo_cli egress --untrust-ca")
+    return 0
+
+
 def cmd_egress(a) -> int:
     """Start the egress guard: an mitmproxy addon that gates destructive external
     / SaaS API calls on the network wire. Shells out to the installed `mitmdump`
     (demo_cli never imports mitmproxy), mirroring how recovery.py uses pg_dump."""
     import shutil
+    import subprocess
+
+    if getattr(a, "trust_ca", False) or getattr(a, "untrust_ca", False):
+        return _trust_ca(remove=getattr(a, "untrust_ca", False))
+
     mitm = shutil.which("mitmdump")
     if not mitm:
         print("mitmdump not found. Install it (external tool, not bundled):")
@@ -1020,17 +1104,28 @@ def cmd_egress(a) -> int:
     pkg_parent = os.path.dirname(here)                       # so `import demo_cli` works
     port = getattr(a, "port", 8080)
     mode = "enforce" if getattr(a, "enforce", False) else load_config().mode
-    ca = os.path.expanduser("~/.mitmproxy/mitmproxy-ca-cert.pem")
+
     print(render.c(f"\ndemo_cli egress guard  (mode={mode}, port={port})\n", "dim"))
-    print("1) point the agent's traffic at the proxy:")
-    print(f"     export HTTPS_PROXY=http://localhost:{port}  HTTP_PROXY=http://localhost:{port}")
-    print("2) let it read TLS by trusting mitmproxy's CA (first run generates it):")
-    print(f"     export REQUESTS_CA_BUNDLE={ca}   NODE_EXTRA_CA_CERTS={ca}")
-    print("3) relaunch the agent from that shell. Ctrl-C here stops the guard.\n")
+    for line in egress_setup_lines(port, windows=os.name == "nt"):
+        print(line)
+    print()
+
     # mitmdump runs its OWN Python; add demo_cli's location so the addon imports.
     env = dict(os.environ, DEMO_CLI_EGRESS_MODE=mode,
                PYTHONPATH=pkg_parent + os.pathsep + os.environ.get("PYTHONPATH", ""))
-    os.execve(mitm, [mitm, "-s", loader, "--listen-port", str(port), "-q"], env)
+    argv = [mitm, "-s", loader, "--listen-port", str(port), "-q"]
+
+    if os.name == "nt":
+        # NOT os.execve. On Windows the exec family does not replace the
+        # process the way POSIX does - it spawns a new one and terminates this
+        # one, so the prompt returns immediately, the proxy is orphaned, and
+        # Ctrl-C never reaches it. subprocess.run keeps it a child of this
+        # shell, so Ctrl-C works and the exit code is real.
+        try:
+            return subprocess.run(argv, env=env).returncode
+        except KeyboardInterrupt:
+            return 0
+    os.execve(mitm, argv, env)
 
 
 def cmd_run(a) -> int:
@@ -1221,6 +1316,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="gate destructive external/SaaS API calls via an HTTP proxy (needs mitmdump)")
     eg.add_argument("--port", type=int, default=8080, help="proxy listen port (default 8080)")
     eg.add_argument("--enforce", action="store_true", help="block/review destructive calls (else shadow)")
+    eg.add_argument("--trust-ca", action="store_true",
+                    help="[Windows] add mitmproxy's CA to your USER certificate "
+                         "store, so Invoke-WebRequest/.NET/curl.exe can be "
+                         "inspected. Prints what that means for your machine")
+    eg.add_argument("--untrust-ca", action="store_true",
+                    help="[Windows] remove it again. Do this when you are done")
     eg.set_defaults(func=cmd_egress)
 
     return p
