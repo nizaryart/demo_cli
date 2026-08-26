@@ -1199,11 +1199,17 @@ def cmd_guarded(a) -> int:
     sys.stdout.flush()
 
     env = g.child_env(dict(os.environ), port, g.port_open(port))
-    try:
-        return subprocess.run(argv, env=env).returncode
-    except FileNotFoundError:
+
+    # Resolve the executable OURSELVES. On Windows subprocess goes through
+    # CreateProcess, which does not consult PATHEXT - so `claude`, installed
+    # as claude.cmd, is invisible to it while working perfectly in the shell
+    # the user just typed it into. shutil.which does honour PATHEXT.
+    exe = __import__("shutil").which(argv[0])
+    if not exe:
         print(f"{argv[0]}: not found on PATH.")
         return 127
+    try:
+        return subprocess.run([exe] + argv[1:], env=env).returncode
     except KeyboardInterrupt:
         return 130
     finally:
