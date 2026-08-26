@@ -1,0 +1,156 @@
+"""`powershell -Command "..."` is the command inside the quotes.
+
+Observed live on Windows, 2026-08-26. Claude Code's Bash tool is GIT BASH -
+`pwd` returns /c/Users/... - so PowerShell never arrives as the tool's own
+dialect. It arrives NESTED. Asked to use Remove-Item, the agent ran:
+
+    Bash(powershell.exe -Command "Remove-Item test.txt")
+
+_PS_REMOVE_RE is anchored at the start, the command starts with
+`powershell.exe`, and seven correct PowerShell rules sat dormant while the
+delete went through. The filesystem guard caught it; the string layer never
+saw it.
+
+Third instance of one shape in this project: THE RULES WERE RIGHT AND THE
+PLUMBING NEVER ASKED THEM (see also `mv` missing from the shell-guard
+pre-filter, and dispatch running on the line instead of the segment).
+"""
+import base64
+import os
+
+import pytest
+
+from demo_cli import recovery
+from demo_cli.classify import (POSIX, POWERSHELL, classify_pipeline,
+                               effective_command, unwrap_nested)
+
+
+def encoded(text):
+    return base64.b64encode(text.encode("utf-16-le")).decode()
+
+
+# --------------------------------------------------------------------------
+# Unwrapping, one level
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("cmd,inner", [
+    ('powershell.exe -Command "Remove-Item x"', "Remove-Item x"),
+    ('powershell -Command "Remove-Item x"', "Remove-Item x"),
+    ('powershell -c "Remove-Item x"', "Remove-Item x"),
+    ('pwsh -Command "Remove-Item x"', "Remove-Item x"),
+    ('PowerShell.EXE -COMMAND "Remove-Item x"', "Remove-Item x"),
+])
+def test_a_powershell_payload_is_unwrapped_as_powershell(cmd, inner):
+    assert unwrap_nested(cmd) == (inner, POWERSHELL)
+
+
+@pytest.mark.parametrize("cmd,inner", [
+    ('bash -c "rm x"', "rm x"),
+    ('sh -c "rm x"', "rm x"),
+    ("/bin/bash -c 'rm x'", "rm x"),
+    ('cmd /c "del /f x"', "del /f x"),
+    ('cmd.exe /k "del /f x"', "del /f x"),
+])
+def test_posix_and_cmd_payloads_are_unwrapped_as_posix(cmd, inner):
+    assert unwrap_nested(cmd) == (inner, POSIX)
+
+
+def test_an_encoded_command_is_DECODED_not_executed():
+    """base64 is mechanical: nothing runs, nothing is guessed. It is the one
+    obfuscation a pre-execution guard can honestly see through, and the most
+    common one in practice."""
+    cmd = f"powershell -EncodedCommand {encoded('Remove-Item secret.txt')}"
+    assert unwrap_nested(cmd) == ("Remove-Item secret.txt", POWERSHELL)
+
+
+@pytest.mark.parametrize("flag", ["-e", "-enc", "-EncodedCommand"])
+def test_the_abbreviated_encoded_flags_are_recognised(flag):
+    assert unwrap_nested(f"powershell {flag} {encoded('Remove-Item x')}") \
+        == ("Remove-Item x", POWERSHELL)
+
+
+def test_undecodable_base64_is_not_guessed_at():
+    assert unwrap_nested("powershell -EncodedCommand not!valid!base64") is None
+
+
+# --------------------------------------------------------------------------
+# What must NOT unwrap
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("cmd", [
+    'echo powershell -c "rm x"',        # the word appears, it is not the verb
+    "rm x",
+    "ls -la",
+    "powershell -NoProfile",            # no payload at all
+    'grep "bash -c" file.txt',
+])
+def test_a_command_that_is_not_a_nested_shell_is_untouched(cmd):
+    assert unwrap_nested(cmd) is None
+    assert effective_command(cmd) == (cmd, POSIX)
+
+
+def test_nesting_is_bounded():
+    """`a -c "b -c 'c -c ...'"` must terminate rather than recurse forever."""
+    deep = 'bash -c "' * 12 + "rm x" + '"' * 12
+    inner, _ = effective_command(deep)
+    assert "rm x" in inner
+
+
+# --------------------------------------------------------------------------
+# End to end: classification AND operand extraction must agree
+# --------------------------------------------------------------------------
+
+@pytest.fixture
+def files(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "test.txt").write_text("data")
+    return tmp_path
+
+
+@pytest.mark.parametrize("cmd", [
+    'powershell.exe -Command "Remove-Item test.txt"',
+    'powershell -c "Clear-Content test.txt"',
+    'pwsh -Command "Remove-Item -Path test.txt"',
+    'bash -c "rm test.txt"',
+])
+def test_a_nested_destructive_command_is_classified_and_resolved(files, cmd):
+    """Both halves, together. If only the classifier unwrapped, it would call
+    the command destructive while the operand extractor searched text that no
+    longer describes the action - and the guard would escalate a command it
+    could have snapshotted."""
+    assert classify_pipeline(cmd).is_destructive
+    assert recovery.extract_path_operand(cmd) == "test.txt"
+
+
+def test_an_encoded_delete_is_classified_and_resolved(files):
+    cmd = f"powershell -EncodedCommand {encoded('Remove-Item test.txt')}"
+    assert classify_pipeline(cmd).is_destructive
+    assert recovery.extract_path_operand(cmd) == "test.txt"
+
+
+def test_the_guard_snapshots_a_nested_delete(files):
+    """The whole point: this is the exact command the agent ran on Windows."""
+    from demo_cli.config import Config
+    from demo_cli.guard import Guard
+    r = Guard(Config(mode="enforce", project_root=str(files))).evaluate(
+        'powershell.exe -Command "Remove-Item test.txt"',
+        agent_id="t", session_id="t")
+    assert r.receipt.decision == "REVERSIBLE"
+    assert r.receipt.recovery_point
+
+
+def test_a_nested_safe_command_stays_safe(files):
+    assert not classify_pipeline('powershell -Command "Get-Content test.txt"').is_destructive
+
+
+# --------------------------------------------------------------------------
+# The frontier, stated as a test so nobody assumes otherwise
+# --------------------------------------------------------------------------
+
+def test_obfuscation_INSIDE_the_payload_is_still_not_caught(files):
+    """Unwrapping is string work and inherits the string layer's frontier.
+    `R''emove-Item` defeats it and always will - that is the behavioural
+    layer's job, and on Windows the WinFsp guard catches it at the filesystem.
+    Written as a test so the limit is explicit rather than assumed."""
+    assert not classify_pipeline(
+        'powershell -c "R\'\'emove-Item test.txt"').is_destructive

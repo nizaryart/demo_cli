@@ -24,7 +24,8 @@ import uuid
 from dataclasses import dataclass
 from typing import List, Optional
 
-from .classify import (POSIX, join_continuations, redirect_target, split_segments,
+from .classify import (POSIX, effective_command, join_continuations,
+                       redirect_target, split_segments,
                        substitute_assignments)
 from .context import redact
 
@@ -536,6 +537,11 @@ def extract_path_operand(cmd: str, dialect: str = POSIX) -> Optional[str]:
     """
     # A command written across two lines is still one command; fold it before
     # looking for operands, or the path on the second line is simply not seen.
+    # Unwrap a nested shell FIRST, and take its dialect with it. classify_pipeline
+    # does the same on the same input; if only one of them did, the classifier
+    # would call `powershell -c "Remove-Item x"` destructive while the operand
+    # extractor looked for a path in text that no longer describes the action.
+    cmd, dialect = effective_command(cmd, dialect)
     cmd = join_continuations(cmd, dialect)
     # `T=notes.txt; rm $T` names its target in the same string it uses it in.
     # Resolving that here rather than in the classifier keeps the change to

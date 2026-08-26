@@ -13,8 +13,9 @@ destructive step, formatters rewriting whole trees, curl | bash).
 from __future__ import annotations
 
 import re
+import shlex
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 # --------------------------------------------------------------------------
 # Rule tables
@@ -454,6 +455,123 @@ def substitute_assignments(cmd: str, dialect: str = POSIX) -> str:
     return out if resolved_all else cmd
 
 
+# --------------------------------------------------------------------------
+# Nested shells
+#
+# Observed live on Windows, 2026-08-26. Claude Code's Bash tool is GIT BASH,
+# not PowerShell - `pwd` returns /c/Users/... - so the seven PowerShell rules
+# looked like the wrong investment. They were not; they were never being
+# HANDED the right string. Asked to use Remove-Item, the agent ran:
+#
+#     Bash(powershell.exe -Command "Remove-Item test.txt")
+#
+# _PS_REMOVE_RE is anchored at the start, the command starts with
+# `powershell.exe`, and seven correct rules sat dormant while the delete went
+# through. The filesystem guard caught it; the string layer never saw it.
+#
+# Third time the same shape: the rules were right and the plumbing never asked
+# them (see also `mv` missing from the shell-guard pre-filter, and dispatch
+# running on the line instead of the segment).
+#
+# WHAT THIS CANNOT DO, stated plainly: unwrapping is string work, so it
+# inherits the string layer's frontier. `powershell -c "R''emove-Item x"`
+# defeats it, and always will - obfuscation is the behavioural layer's job.
+# -EncodedCommand is the exception worth handling, because base64 is DECODED,
+# not evaluated: no execution, no guessing.
+# --------------------------------------------------------------------------
+
+_POWERSHELL_EXE = re.compile(r"^\s*(?:[\w:.\\/ ()-]*[\\/])?(?:powershell|pwsh)(?:\.exe)?\b",
+                             re.I)
+_CMD_EXE = re.compile(r"^\s*(?:[\w:.\\/ ()-]*[\\/])?cmd(?:\.exe)?\s+/[ck]\b", re.I)
+_POSIX_SH = re.compile(r"^\s*(?:[\w./-]*/)?(?:bash|sh|dash|zsh)\s+-c\b")
+
+# PowerShell accepts abbreviations: -Command, -Comm, -c. Same for
+# -EncodedCommand / -enc / -e. Matching the documented prefixes rather than the
+# full words, because the short forms are what people actually type.
+_PS_COMMAND_FLAG = re.compile(r"^-(?:c|co|com|comm|comma|comman|command)$", re.I)
+_PS_ENCODED_FLAG = re.compile(r"^-(?:e|en|enc|enco|encod|encode|encoded|"
+                              r"encodedcommand)$", re.I)
+
+_MAX_NESTING = 3        # bounded: `a -c "b -c 'c -c ...'"` must terminate
+
+
+def _strip_quotes(s: str) -> str:
+    s = s.strip()
+    while len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
+        s = s[1:-1].strip()
+    return s
+
+
+def _decode_encoded(payload: str) -> Optional[str]:
+    """PowerShell's -EncodedCommand is base64 UTF-16LE. Decoding is not
+    evaluating - nothing runs, so this is safe for a pre-execution guard."""
+    import base64
+    try:
+        raw = base64.b64decode(payload.strip(), validate=True)
+    except Exception:
+        return None
+    for encoding in ("utf-16-le", "utf-8"):
+        try:
+            text = raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        if text.isprintable() or "\n" in text:
+            return text
+    return None
+
+
+def unwrap_nested(cmd: str) -> Optional[Tuple[str, str]]:
+    """One level of `<shell> -c <payload>`, or None.
+
+    Returns (payload, dialect_of_payload). The dialect is the point: a
+    PowerShell payload has to be judged by the PowerShell rules and split with
+    PowerShell quoting, whichever shell was holding it.
+    """
+    if _POWERSHELL_EXE.match(cmd):
+        try:
+            toks = shlex.split(cmd, posix=False)
+        except ValueError:
+            return None
+        for i, tok in enumerate(toks[1:], start=1):
+            if _PS_COMMAND_FLAG.match(tok) and i + 1 < len(toks):
+                return _strip_quotes(" ".join(toks[i + 1:])), POWERSHELL
+            if _PS_ENCODED_FLAG.match(tok) and i + 1 < len(toks):
+                decoded = _decode_encoded(_strip_quotes(toks[i + 1]))
+                return (decoded, POWERSHELL) if decoded else None
+        return None
+
+    m = _CMD_EXE.match(cmd)
+    if m:
+        # cmd.exe's own verbs are closest to POSIX for splitting purposes; the
+        # dialect only decides quoting and continuation, and cmd uses neither
+        # PowerShell's backtick nor a distinct grammar we model.
+        return _strip_quotes(cmd[m.end():]), POSIX
+
+    m = _POSIX_SH.match(cmd)
+    if m:
+        return _strip_quotes(cmd[m.end():]), POSIX
+    return None
+
+
+def effective_command(cmd: str, dialect: str = POSIX) -> Tuple[str, str]:
+    """The command actually being run, and the dialect to judge it in.
+
+    Used by BOTH classify_pipeline and recovery.extract_path_operand. They
+    must agree on what the command IS, or one decides a rename is destructive
+    while the other looks for the operand in different text - the failure the
+    shared `redirect_target` already exists to prevent.
+
+    A wrapper with no recognisable payload is returned unchanged, so nothing
+    that is not a nested shell is disturbed.
+    """
+    for _ in range(_MAX_NESTING):
+        nested = unwrap_nested(cmd)
+        if not nested or not nested[0].strip():
+            break
+        cmd, dialect = nested
+    return cmd, dialect
+
+
 def split_segments(cmd: str, dialect: str = POSIX) -> List[str]:
     """Split a command line on shell separators (| || && ; newline) while
     respecting single and double quotes. Returns trimmed, non-empty segments.
@@ -668,6 +786,10 @@ def classify_pipeline(cmd: str, dialect: str = POSIX) -> Classification:
     on its own and the pipeline inherits the strongest signal. Opaque remote
     execution is detected on the full string because the pipe *is* the payload.
     """
+    # `powershell -Command "Remove-Item x"` IS a Remove-Item. Judge the payload
+    # and judge it in ITS dialect - recovery.extract_path_operand does exactly
+    # the same, or the two would disagree about what the command even is.
+    cmd, dialect = effective_command(cmd, dialect)
     cmd = join_continuations(cmd, dialect)
     segments = split_segments(cmd, dialect)
     seg_results = [_classify_segment(seg) for seg in segments]
