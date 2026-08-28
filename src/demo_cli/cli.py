@@ -1005,6 +1005,35 @@ def _step(n: int, text: str) -> None:
     print(f"\n  {render.c(f'{n}.', 'dim')} {text}")
 
 
+def _protected_children(directory: str) -> List[str]:
+    """Protected projects directly inside `directory`.
+
+    Both setup and teardown default to the current directory, and a protected
+    project is very often one level down - you stand in `lab` and the guarded
+    thing is `lab\\myproj`. Naming what we found beats reporting "not
+    protected" while the backing directory sits in plain view.
+
+    Searched by looking for BACKING directories, not for projects. When the
+    mount is not running the project path does not exist at all - it is a
+    reparse point served by a dead process, or gone entirely - so scanning for
+    projects finds nothing precisely when you most need the answer. The
+    backing directory is the durable half; it is always there.
+    """
+    from . import protect as protect_mod
+    suffix = protect_mod.BACKING_SUFFIX
+    found = []
+    try:
+        for name in sorted(os.listdir(directory)):
+            if not name.endswith(suffix):
+                continue
+            backing = os.path.join(directory, name)
+            if os.path.isdir(backing):
+                found.append(backing[: -len(suffix)])
+    except OSError:
+        pass
+    return found
+
+
 def _install_hook_for(project: str, label: str) -> None:
     """Install one host's hook into `project`, reusing that host's own
     installer rather than writing its config shape here - the Codex adapter
@@ -1214,16 +1243,33 @@ def cmd_teardown(a) -> int:
         try:
             import signal
             os.kill(st.pid, signal.SIGTERM)
+            mountstate.clear(cfg)
+            print("      " + render.c("stopped", "green"))
         except Exception:
-            print("      could not stop it - it may be elevated. Stop it from "
-                  "an Administrator shell, then re-run.")
+            # DO NOT clear the record. The guard is still running; erasing our
+            # note of it would leave a live process nobody can see - doctor
+            # would report "not recorded" while a filesystem is being served.
+            # Losing track of a running process is worse than leaving a record.
+            print("      " + render.c(
+                "could not stop it (it runs elevated). The record is KEPT so "
+                "the guard stays visible.", "yellow"))
+            print("      From an Administrator shell:  demo_cli unmount --root "
+                  + cfg.project_root)
+            print("      Then re-run this teardown.")
+            return 1
     else:
         _step(1, "filesystem guard not running")
-    mountstate.clear(cfg)
+        mountstate.clear(cfg)
 
     if os.name == "nt":
-        _step(2, "removed the logon task" if schedule.unregister(project)
-                 else "could not remove the logon task")
+        # "Absent" and "removed" are different facts, and reporting the first
+        # as the second is how a teardown looks complete while leaving things
+        # behind on some other path.
+        had_task = schedule.status(project).exists
+        ok = schedule.unregister(project)
+        _step(2, "removed the logon task" if (had_task and ok)
+                 else "could not remove the logon task" if had_task
+                 else "no logon task was registered for this project")
 
         backing = protect_mod.backing_for(project)
         if os.path.isdir(backing):
@@ -1246,7 +1292,18 @@ def cmd_teardown(a) -> int:
                          "could not restore - run `demo_cli unprotect` from an "
                          "Administrator shell")
         else:
-            _step(3, "project was not protected")
+            # A protected project is often a SUBDIRECTORY of where the user is
+            # standing - `lab` holds `myproj`, and teardown run from `lab`
+            # looked for `lab.real`, found nothing, and said "not protected"
+            # while myproj.real sat next to it. Say what we actually found.
+            nearby = _protected_children(project)
+            if nearby:
+                _step(3, "this directory is not protected, but these are:")
+                for child in nearby:
+                    print(f"      {child}")
+                print(f"      {render.c('run: demo_cli teardown ' + nearby[0], 'dim')}")
+            else:
+                _step(3, "project was not protected")
 
     removed = _remove_hooks(project)
     _step(4, f"removed hooks: {', '.join(removed)}" if removed

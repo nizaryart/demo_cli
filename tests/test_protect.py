@@ -274,3 +274,51 @@ def test_the_acl_uses_sids_not_localised_names():
     differs and icacls fails with a message nobody would connect to a locale."""
     assert "*S-1-5-18" in P._ACL_PRINCIPALS         # SYSTEM
     assert "*S-1-5-32-544" in P._ACL_PRINCIPALS     # Administrators
+
+
+# --------------------------------------------------------------------------
+# Finding a protected project you are standing next to
+#
+# Both setup and teardown default to the current directory, and the guarded
+# thing is very often one level down. Run from `lab`, teardown looked for
+# `lab.real`, found nothing, and reported "project was not protected" while
+# myproj.real sat right there. Observed 2026-08-28.
+# --------------------------------------------------------------------------
+
+def test_a_protected_child_is_found_by_its_backing(tmp_path):
+    """Searched by BACKING, not by project. When the mount is not running the
+    project path does not exist at all - it is a reparse point served by a
+    dead process - so scanning for projects finds nothing precisely when the
+    answer is most needed."""
+    from demo_cli.cli import _protected_children
+    (tmp_path / "myproj.real").mkdir()
+    (tmp_path / "unrelated").mkdir()
+    found = _protected_children(str(tmp_path))
+    assert found == [str(tmp_path / "myproj")]
+
+
+def test_a_project_that_still_exists_is_also_found(tmp_path):
+    from demo_cli.cli import _protected_children
+    (tmp_path / "myproj").mkdir()
+    (tmp_path / "myproj.real").mkdir()
+    assert _protected_children(str(tmp_path)) == [str(tmp_path / "myproj")]
+
+
+def test_an_ordinary_directory_is_not_reported_as_protected(tmp_path):
+    from demo_cli.cli import _protected_children
+    (tmp_path / "src").mkdir()
+    (tmp_path / "docs").mkdir()
+    assert _protected_children(str(tmp_path)) == []
+
+
+def test_several_protected_projects_are_all_listed(tmp_path):
+    from demo_cli.cli import _protected_children
+    for name in ("alpha.real", "beta.real"):
+        (tmp_path / name).mkdir()
+    found = _protected_children(str(tmp_path))
+    assert [os.path.basename(p) for p in found] == ["alpha", "beta"]
+
+
+def test_an_unreadable_directory_is_not_an_error(tmp_path):
+    from demo_cli.cli import _protected_children
+    assert _protected_children(str(tmp_path / "does-not-exist")) == []
