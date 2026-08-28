@@ -107,6 +107,20 @@ def register(project: str, backing: str, port_free_command: Optional[str] = None
     return r.returncode == 0
 
 
+def run_now(project: str) -> bool:
+    """Start the task immediately, without waiting for the next logon.
+
+    This is how setup brings the mount up straight away: the task already
+    carries /rl highest, so running it needs no SECOND UAC prompt. Without
+    this, setup ends with a protected project and no filesystem guard, and
+    the user has to reboot or mount by hand - which is exactly the manual
+    step the whole command exists to remove.
+    """
+    if not available() or not status(project).exists:
+        return False
+    return _run(["schtasks", "/run", "/tn", task_name(project)]).returncode == 0
+
+
 def unregister(project: str) -> bool:
     """Remove the task. Absent is success - teardown must never refuse to
     continue because a step was already done."""

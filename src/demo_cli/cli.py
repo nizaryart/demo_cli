@@ -1210,7 +1210,30 @@ def cmd_setup(a) -> int:
                 for line in out.splitlines()[:6]:
                     print("      " + line)
 
-    # 5. What is actually on right now ------------------------------------
+    # 5. Bring the guard up NOW ------------------------------------------
+    # Registering a logon task is not enough: without this, setup ends with a
+    # protected project and NO filesystem guard until the next reboot - the
+    # manual step the whole command exists to remove. Running the task uses
+    # the elevation it already stores, so there is no second UAC prompt.
+    if os.name == "nt" and not getattr(a, "no_protect", False):
+        from . import mountstate as _ms
+        if _ms.status(load_config(project)).running:
+            _step(5, "filesystem guard already running")
+        elif schedule.run_now(project):
+            import time
+            for _ in range(15):
+                time.sleep(0.4)
+                if _ms.status(load_config(project)).running:
+                    break
+            _step(5, "started the filesystem guard"
+                     if _ms.status(load_config(project)).running else
+                     "asked the task to start the guard - it has not reported "
+                     "in yet; check `demo_cli doctor` in a moment")
+        else:
+            _step(5, "could not start the guard now. It will come up at your "
+                     "next logon, or run: demo_cli mount (elevated)")
+
+    # 6. What is actually on right now ------------------------------------
     cfg = load_config(project)
     port = getattr(a, "port", 8080)
     print(render.c("\n  coverage\n", "dim"))

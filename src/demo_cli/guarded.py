@@ -161,8 +161,16 @@ def assess(cfg: Config, port: int, hooks: List[tuple],
                             f"RECORDED BUT NOT RUNNING (pid {st.pid} is gone)",
                             "demo_cli unmount, then demo_cli mount ..."))
     elif os.name == "nt":
-        layers.append(Layer("filesystem", False, "not mounted",
-                            "demo_cli protect <project>  (then mount, elevated)"))
+        # A protected project that is not mounted needs a DIFFERENT remedy
+        # from an unprotected one, and telling somebody to protect a project
+        # that is already protected reads as the tool not knowing its own
+        # state.
+        protected = os.path.isdir(protect_mod.backing_for(cfg.project_root))
+        layers.append(Layer(
+            "filesystem", False,
+            "protected but not mounted" if protected else "not mounted",
+            "demo_cli mount (elevated), or it returns at your next logon"
+            if protected else "demo_cli setup"))
     else:
         # No always-on equivalent on Linux: the syscall guard wraps one command
         # rather than standing between the agent and the disk.
