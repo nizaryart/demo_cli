@@ -1280,17 +1280,30 @@ def cmd_teardown(a) -> int:
                 except OSError:
                     pass
             plan = protect_mod.plan_unprotect(project)
-            if plan.ok:
-                for line in protect_mod.unprotect(plan):
-                    print("      " + render.c(line, "green"))
-                _step(3, "files moved back")
-            elif protect_mod.is_elevated():
+            if not plan.ok:
                 _step(3, "could not restore: " + "; ".join(plan.problems))
-            else:
+            elif not protect_mod.is_elevated():
+                # Ask for elevation BEFORE trying. The backing is locked to
+                # Administrators, so an unelevated rename fails - and the
+                # earlier version discovered that by crashing, having already
+                # unlocked nothing and moved nothing.
+                _step(3, "restoring your files (requires administrator rights)")
                 rc = protect_mod.rerun_elevated(["unprotect", project, "--yes"])
-                _step(3, "files moved back" if rc == 0 else
-                         "could not restore - run `demo_cli unprotect` from an "
-                         "Administrator shell")
+                if rc == 0:
+                    print("      " + render.c("files moved back", "green"))
+                else:
+                    print("      " + render.c(
+                        "elevation refused or failed - your files are safe at "
+                        + protect_mod.backing_for(project), "yellow"))
+                    print("      From an Administrator shell:  demo_cli unprotect "
+                          + project)
+            else:
+                try:
+                    for line in protect_mod.unprotect(plan):
+                        print("      " + render.c(line, "green"))
+                    _step(3, "files moved back")
+                except PermissionError as exc:
+                    _step(3, render.c(str(exc), "red"))
         else:
             # A protected project is often a SUBDIRECTORY of where the user is
             # standing - `lab` holds `myproj`, and teardown run from `lab`
@@ -1365,8 +1378,15 @@ def cmd_unprotect(a) -> int:
         if input("  Type 'yes' to restore: ").strip().lower() != "yes":
             print("  Nothing was changed.\n")
             return 1
-    for step in protect_mod.unprotect(plan):
-        print("  " + render.c(step, "green"))
+    try:
+        for step in protect_mod.unprotect(plan):
+            print("  " + render.c(step, "green"))
+    except PermissionError as exc:
+        # The same guard teardown has. `unprotect` is the way out, and the way
+        # out must never end in a traceback.
+        print("  " + render.c(str(exc), "red"))
+        print()
+        return 1
     print()
     return 0
 

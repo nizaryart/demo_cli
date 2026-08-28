@@ -322,3 +322,31 @@ def test_several_protected_projects_are_all_listed(tmp_path):
 def test_an_unreadable_directory_is_not_an_error(tmp_path):
     from demo_cli.cli import _protected_children
     assert _protected_children(str(tmp_path / "does-not-exist")) == []
+
+
+def test_unprotect_reports_a_blocked_rename_instead_of_raising(tmp_path):
+    """The way out must never end in a traceback.
+
+    From an unelevated shell the backing is still locked to Administrators, so
+    os.rename fails with WinError 5 - and the first version let that escape as
+    an unhandled PermissionError out of `demo_cli teardown`, the one command
+    somebody runs when things are already wrong. Observed live 2026-08-28.
+    """
+    backing = tmp_path / "proj.real"
+    backing.mkdir()
+    (backing / "notes.txt").write_text("irreplaceable")
+    plan = P.plan_unprotect(str(tmp_path / "proj"))
+    assert plan.ok
+
+    import os as _os
+    _os.chmod(tmp_path, 0o555)          # the rename cannot succeed
+    try:
+        with pytest.raises(PermissionError) as exc:
+            P.unprotect(plan)
+        message = str(exc.value)
+        assert "Administrator" in message, "say how to fix it"
+        assert "intact" in message, "say the files are safe"
+        assert str(backing) in message, "say WHERE they are"
+    finally:
+        _os.chmod(tmp_path, 0o755)
+    assert (backing / "notes.txt").read_text() == "irreplaceable"

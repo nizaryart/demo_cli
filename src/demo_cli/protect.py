@@ -289,7 +289,18 @@ def unprotect(plan: Plan) -> List[str]:
     else:
         done.append("not elevated: the ACL was left as it is. If the backing "
                     "was locked, re-run this from an Administrator shell.")
-    os.rename(plan.backing, plan.source)
+    # NEVER let this raise. The backing directory is locked to Administrators,
+    # so an unelevated rename fails with WinError 5 - and an unhandled
+    # traceback out of the command whose whole job is "get me out of this" is
+    # the worst possible place for one. Observed 2026-08-28.
+    try:
+        os.rename(plan.backing, plan.source)
+    except OSError as exc:
+        raise PermissionError(
+            f"could not move {plan.backing} back to {plan.source}: {exc.strerror or exc}. "
+            f"The backing directory is locked to Administrators; run this from "
+            f"an Administrator shell. Nothing was moved, and your files are "
+            f"intact at {plan.backing}.") from None
     done.append(f"moved {plan.backing} -> {plan.source}")
     return done
 
