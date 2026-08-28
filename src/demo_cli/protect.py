@@ -60,6 +60,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -167,13 +168,28 @@ def rerun_elevated(args: List[str]) -> Optional[int]:
     if not exe:
         return None
 
+    # RUN IT THROUGH cmd.exe WITH THE OUTPUT REDIRECTED.
+    #
+    # ShellExecute cannot redirect handles, and the elevated console closes the
+    # instant the process exits - so a failure produced nothing but "the
+    # elevated step failed", with the actual error already gone. Wrapping in
+    # `cmd /c "... > log 2>&1"` is the only way to keep it, and it is the same
+    # move the detached mount already needed for its [fs] lines.
+    log = os.path.join(tempfile.gettempdir(), "demo_cli-elevated.log")
+    try:
+        os.unlink(log)
+    except OSError:
+        pass
+    inner = subprocess.list2cmdline([exe] + list(args))
+    params = f'/c "{inner} > "{log}" 2>&1"'
+
     info = SHELLEXECUTEINFOW()
     info.cbSize = ctypes.sizeof(info)
     info.fMask = 0x00000040                      # SEE_MASK_NOCLOSEPROCESS
     info.lpVerb = "runas"                        # this is what prompts UAC
-    info.lpFile = exe
-    info.lpParameters = subprocess.list2cmdline(args)
-    info.nShow = 1                               # SW_SHOWNORMAL
+    info.lpFile = "cmd.exe"
+    info.lpParameters = params
+    info.nShow = 0                               # SW_HIDE: no console flash
     if not shell32.ShellExecuteExW(ctypes.byref(info)) or not info.hProcess:
         return None                              # cancelled at the prompt, or refused
 
@@ -181,6 +197,20 @@ def rerun_elevated(args: List[str]) -> Optional[int]:
     code = wintypes.DWORD()
     kernel32.GetExitCodeProcess(info.hProcess, ctypes.byref(code))
     return int(code.value)
+
+
+def elevated_output() -> str:
+    """What the last elevated run printed. Empty when there was none.
+
+    Without this a failure in the elevated half is completely opaque to the
+    half that asked for it.
+    """
+    log = os.path.join(tempfile.gettempdir(), "demo_cli-elevated.log")
+    try:
+        with open(log, encoding="utf-8", errors="replace") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
 
 
 def plan_protect(project: str, backing: Optional[str] = None,

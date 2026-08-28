@@ -1185,7 +1185,10 @@ def cmd_setup(a) -> int:
                         "from an Administrator shell.", "red"))
                     return 1
                 if rc != 0:
-                    print("      " + render.c("the elevated step failed.", "red"))
+                    print("      " + render.c("the elevated step failed:", "red"))
+                    for line in (protect_mod.elevated_output() or
+                                 "(it printed nothing)").splitlines():
+                        print("        " + line)
                     return 1
                 print("      " + render.c("protected", "green"))
 
@@ -1198,10 +1201,14 @@ def cmd_setup(a) -> int:
                      if ok else "could NOT register the logon task")
         else:
             rc = protect_mod.rerun_elevated(["_register-task", project])
-            _step(4, "registered a logon task so the guard returns after a reboot"
-                     if rc == 0 else
-                     "could NOT register the logon task - the guard will not "
-                     "come back automatically after a reboot")
+            if rc == 0:
+                _step(4, "registered a logon task so the guard returns after a reboot")
+            else:
+                _step(4, "could NOT register the logon task - the guard will "
+                         "not come back automatically after a reboot")
+                out = protect_mod.elevated_output()
+                for line in out.splitlines()[:6]:
+                    print("      " + line)
 
     # 5. What is actually on right now ------------------------------------
     cfg = load_config(project)
