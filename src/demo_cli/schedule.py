@@ -98,19 +98,48 @@ def register(project: str, backing: str, port_free_command: Optional[str] = None
     if not exe:
         return False
 
-    # cmd /c so both steps run in one action. rmdir (not del) because a
-    # reparse point is a directory entry; it removes the link, never a tree.
-    # >> a log, because a scheduled task's output goes NOWHERE. On 2026-08-28
-    # the task ran, `rmdir` failed on a non-empty directory, the mount refused
-    # because the path existed, and none of it was visible anywhere - the
-    # sixth instance of "anything that runs where you cannot see it must write
-    # down what it did".
-    log = os.path.join(os.path.dirname(backing), ".demo_cli", "autostart.log")
-    action = (f'cmd /c "if exist \\"{project}\\" rmdir \\"{project}\\" & '
-              f'{exe} mount \\"{project}\\" --backing \\"{backing}\\" '
-              f'>> \\"{log}\\" 2>&1"')
+    # A SCRIPT, NOT AN INLINE COMMAND.
+    #
+    # The first version built `cmd /c "if exist \"X\" rmdir \"X\" & ..."`,
+    # escaping the inner quotes Python-style. cmd.exe DOES NOT USE BACKSLASH
+    # ESCAPING - it stored them literally, saw `\"C:\path\"` as garbage, and
+    # the action silently did nothing. Observed 2026-08-28: the task reported
+    # success, the mount never started, and the log we had just added was
+    # never even created.
+    #
+    # Writing a .cmd file removes the quoting problem entirely, and has two
+    # other benefits: the user can READ what the task will do, and can edit it.
+    # NOT the project's workspace. That lives INSIDE the mount, which does not
+    # exist when this script runs - and the fallback, the backing directory,
+    # is locked to Administrators, so the user could not read their own log
+    # without an admin shell. %LOCALAPPDATA% is always there, always writable
+    # by the person who needs to read it, and survives the project being
+    # relocated, mounted, unmounted or removed.
+    home = os.path.join(os.environ.get("LOCALAPPDATA")
+                        or os.path.expanduser("~"), "demo_cli")
+    try:
+        os.makedirs(home, exist_ok=True)
+    except OSError:
+        return False
+    slug = task_name(project).replace(TASK_PREFIX + " - ", "")
+    script = os.path.join(home, f"autostart-{slug}.cmd")
+    log = os.path.join(home, f"autostart-{slug}.log")
+
+    with open(script, "w", encoding="utf-8") as f:
+        f.write("@echo off\r\n")
+        f.write(f'echo [%DATE% %TIME%] starting >> "{log}"\r\n')
+        # rmdir, never rmdir /s: a dangling reparse point is a LINK, and
+        # removing it takes nothing with it. /s would delete a real tree.
+        f.write(f'if exist "{project}" rmdir "{project}" >> "{log}" 2>&1\r\n')
+        f.write(f'if exist "{project}" (\r\n')
+        f.write(f'  echo [ERROR] "{project}" still exists and is not empty - '
+                f'refusing to mount over it >> "{log}"\r\n')
+        f.write(f'  exit /b 1\r\n')
+        f.write(f')\r\n')
+        f.write(f'"{exe}" mount "{project}" --backing "{backing}" >> "{log}" 2>&1\r\n')
+
     r = _run(["schtasks", "/create", "/tn", task_name(project),
-              "/tr", action, "/sc", "onlogon", "/rl", "highest", "/f"])
+              "/tr", f'"{script}"', "/sc", "onlogon", "/rl", "highest", "/f"])
     return r.returncode == 0
 
 
@@ -134,9 +163,25 @@ def unregister(project: str) -> bool:
     if not available():
         return False
     name = task_name(project)
-    if not status(project).exists:
-        return True
-    return _run(["schtasks", "/delete", "/tn", name, "/f"]).returncode == 0
+    ok = True
+    if status(project).exists:
+        ok = _run(["schtasks", "/delete", "/tn", name, "/f"]).returncode == 0
+    for path in autostart_paths(project):      # leave nothing behind
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    return ok
+
+
+def autostart_paths(project: str):
+    """The script and log this project's task uses. Public so teardown can
+    remove them and doctor can point at the log."""
+    home = os.path.join(os.environ.get("LOCALAPPDATA")
+                        or os.path.expanduser("~"), "demo_cli")
+    slug = task_name(project).replace(TASK_PREFIX + " - ", "")
+    return (os.path.join(home, f"autostart-{slug}.cmd"),
+            os.path.join(home, f"autostart-{slug}.log"))
 
 
 def _demo_cli_command() -> Optional[str]:
