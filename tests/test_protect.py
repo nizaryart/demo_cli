@@ -350,3 +350,52 @@ def test_unprotect_reports_a_blocked_rename_instead_of_raising(tmp_path):
     finally:
         _os.chmod(tmp_path, 0o755)
     assert (backing / "notes.txt").read_text() == "irreplaceable"
+
+
+def test_standing_inside_the_project_is_refused_before_the_uac_prompt(tmp_path, monkeypatch):
+    """A process's current directory holds an open handle on it, and Windows
+    refuses to rename a directory anything has open.
+
+    Running `demo_cli setup` from inside the project is the natural thing to
+    do, and it failed with WinError 32 AFTER the UAC prompt - so the first the
+    user knew of it was a traceback out of an elevated process they could not
+    see. Observed live 2026-08-28. Checking here costs a message instead of a
+    password.
+    """
+    project = tmp_path / "proj"
+    (project / "src").mkdir(parents=True)
+    monkeypatch.chdir(project)
+    plan = P.plan_protect(str(project))
+    assert not plan.ok
+    assert any("standing inside" in p for p in plan.problems)
+
+
+def test_a_subdirectory_of_the_project_is_also_refused(tmp_path, monkeypatch):
+    project = tmp_path / "proj"
+    (project / "src").mkdir(parents=True)
+    monkeypatch.chdir(project / "src")
+    assert not P.plan_protect(str(project)).ok
+
+
+def test_standing_beside_the_project_is_fine(tmp_path, monkeypatch):
+    project = tmp_path / "proj"
+    project.mkdir()
+    monkeypatch.chdir(tmp_path)
+    assert P.plan_protect(str(project)).ok
+
+
+def test_a_blocked_relocate_names_the_likely_cause(tmp_path):
+    """'The process cannot access the file' does not tell anyone that their
+    own shell is the process."""
+    from demo_cli.fspassthrough import Backing
+    import os as _os
+    source = tmp_path / "proj"
+    source.mkdir()
+    _os.chmod(tmp_path, 0o555)          # the rename cannot succeed
+    try:
+        with pytest.raises((PermissionError, OSError)) as exc:
+            Backing.relocate(str(source), str(tmp_path / "proj.real"))
+        assert "Nothing was moved" in str(exc.value)
+    finally:
+        _os.chmod(tmp_path, 0o755)
+    assert source.exists()

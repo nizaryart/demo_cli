@@ -244,6 +244,22 @@ def plan_protect(project: str, backing: Optional[str] = None,
     except ValueError:
         pass                                    # different drives: fine
 
+    # A PROCESS'S CURRENT DIRECTORY HOLDS AN OPEN HANDLE ON IT, and Windows
+    # refuses to rename a directory anything has open. Running `demo_cli
+    # setup` from inside the project you are protecting is the natural thing
+    # to do, and it failed with WinError 32 AFTER the UAC prompt - so the
+    # first the user knew of it was a traceback from an elevated process.
+    # Observed 2026-08-28. Checked here so it costs a message, not a password.
+    try:
+        here = os.path.abspath(os.getcwd())
+        if here == source or os.path.commonpath([here, source]) == source:
+            p.problems.append(
+                f"You are standing inside {source}. A process's current "
+                f"directory holds it open, so it cannot be moved. "
+                f"cd somewhere else and re-run.")
+    except (OSError, ValueError):
+        pass                                    # cwd gone, or another drive
+
     if os.name != "nt":
         p.warnings.append(
             "Not Windows: the directory will be relocated but nothing will "

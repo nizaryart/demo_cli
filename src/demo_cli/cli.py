@@ -1360,8 +1360,13 @@ def cmd_protect(a) -> int:
         if input("  Type 'yes' to move your project: ").strip().lower() != "yes":
             print("  Nothing was changed.\n")
             return 1
-    for step in protect_mod.protect(plan):
-        print("  " + render.c(step, "green"))
+    try:
+        for step in protect_mod.protect(plan):
+            print("  " + render.c(step, "green"))
+    except (PermissionError, OSError) as exc:
+        print("  " + render.c(str(exc), "red"))
+        print()
+        return 1
     print("\n  " + render.c(f"Now run:  {mount_cmd}", "dim") + "\n")
     return 0
 

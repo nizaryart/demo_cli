@@ -322,7 +322,18 @@ class Backing:
         if os.path.lexists(backing):
             raise FileExistsError(errno.EEXIST,
                                   "backing path already exists; refusing to merge", backing)
-        os.rename(source, backing)
+        try:
+            os.rename(source, backing)
+        except OSError as exc:
+            # Name the cause. WinError 32 here means something holds the
+            # directory open, and that something is almost always the shell
+            # the command was typed into - which is not obvious from
+            # "the process cannot access the file".
+            raise PermissionError(
+                f"could not move {source} to {backing}: {exc.strerror or exc}. "
+                f"Something has that directory open - most often a shell or "
+                f"editor sitting inside it. Close it or cd elsewhere, then "
+                f"retry. Nothing was moved.") from None
 
 
 # --------------------------------------------------------------------------
