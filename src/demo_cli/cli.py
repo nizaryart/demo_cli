@@ -340,11 +340,19 @@ def _mount_checks(cfg) -> List[tuple]:
     out: List[tuple] = []
 
     if not st.recorded:
-        detail = ("not running (demo_cli protect <project>, then demo_cli mount)"
-                  if fsmount.available() else
-                  "not running; winfspy not importable "
-                  "(pipx inject demo-cli winfspy)")
-        return [("warn", "filesystem guard", detail)]
+        if not fsmount.available():
+            return [("warn", "filesystem guard",
+                     "not running; winfspy not importable "
+                     "(pipx inject demo-cli winfspy)")]
+        # Telling somebody to protect a project that is already protected
+        # reads as the tool not knowing its own state. guarded.assess makes
+        # the same distinction; this is the second copy of that message and
+        # it had already drifted.
+        protected = os.path.isdir(protect_mod.backing_for(cfg.project_root))
+        return [("warn", "filesystem guard",
+                 "protected but NOT RUNNING - demo_cli mount (elevated), or it "
+                 "returns at your next logon" if protected else
+                 "not running (demo_cli setup <project>)")]
 
     where = st.mountpoint or "?"
     age = f", up {st.age_minutes} min" if st.age_minutes is not None else ""
