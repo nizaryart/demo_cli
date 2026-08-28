@@ -188,3 +188,29 @@ def assess(cfg: Config, port: int, hooks: List[tuple],
 def summary(layers: List[Layer]) -> str:
     on = sum(1 for x in layers if x.ok)
     return f"{on} of {len(layers)} layers active"
+
+
+def dropped(before: List[Layer], after: List[Layer]) -> List[Layer]:
+    """Layers that were up and are not any more.
+
+    WHY A HEARTBEAT AT ALL. The coverage report prints once, at launch. If the
+    mount crashes an hour into a session - or someone runs `demo_cli unmount`
+    in another window, or the egress proxy dies - nothing says so, and the
+    person keeps working while believing they are covered. That is the SIXTH
+    appearance of "is this thing actually protecting me?" in this project, and
+    the one place it had no answer.
+
+    Only TRANSITIONS are reported, never the current state. A guard that
+    prints its status every minute is noise, and noise is how a real warning
+    gets missed.
+    """
+    was_ok = {x.name for x in before if x.ok}
+    return [x for x in after if not x.ok and x.name in was_ok]
+
+
+def recovered(before: List[Layer], after: List[Layer]) -> List[Layer]:
+    """The other direction: a layer that came back. Worth saying, because it
+    tells the user the earlier warning no longer applies - otherwise they act
+    on stale information for the rest of the session."""
+    was_down = {x.name for x in before if not x.ok}
+    return [x for x in after if x.ok and x.name in was_down]

@@ -891,6 +891,50 @@ def _mount_detached(a, backing) -> int:
     return 0
 
 
+def _watch_layers(cfg, port, baseline, proc, seconds: int = 60) -> None:
+    """Re-check coverage while the agent runs, and shout if a layer drops.
+
+    A daemon thread, so it cannot keep the process alive after the agent
+    exits. It reports TRANSITIONS only - a status line every minute is noise,
+    and noise is how a real warning gets missed.
+
+    The warning goes to STDERR, so it appears even while the agent owns the
+    terminal for its own output.
+    """
+    import threading
+    import time
+
+    from . import guarded as g
+
+    if seconds <= 0:
+        return
+
+    def loop():
+        previous = baseline
+        while proc.poll() is None:
+            time.sleep(seconds)
+            if proc.poll() is not None:
+                return
+            try:
+                current = g.assess(cfg, port, _host_hook_status(cfg))
+            except Exception:
+                continue                      # never let the watchdog kill the run
+            for layer in g.dropped(previous, current):
+                sys.stderr.write(
+                    f"\ndemo_cli [!] {layer.name} STOPPED PROTECTING YOU: "
+                    f"{layer.detail}\n")
+                if layer.fixable:
+                    sys.stderr.write(f"demo_cli     fix: {layer.fixable}\n")
+                sys.stderr.flush()
+            for layer in g.recovered(previous, current):
+                sys.stderr.write(f"\ndemo_cli [+] {layer.name} is back: "
+                                 f"{layer.detail}\n")
+                sys.stderr.flush()
+            previous = current
+
+    threading.Thread(target=loop, daemon=True).start()
+
+
 def cmd_unmount(a) -> int:
     """Stop a detached filesystem guard."""
     import signal
@@ -955,6 +999,271 @@ def _show_plan(plan, title: str, next_steps: List[str]) -> int:
         print("  " + render.c(line, "dim"))
     print()
     return 0
+
+
+def _step(n: int, text: str) -> None:
+    print(f"\n  {render.c(f'{n}.', 'dim')} {text}")
+
+
+def _install_hook_for(project: str, label: str) -> None:
+    """Install one host's hook into `project`, reusing that host's own
+    installer rather than writing its config shape here - the Codex adapter
+    already learned once that a hand-built config is silently ignored."""
+    if label == "claude code":
+        from .hooks.claude_code import install_into_settings
+        install_into_settings(os.path.join(project, ".claude", "settings.json"))
+    elif label == "cursor":
+        from .hooks.cursor import install_into_hooks_json
+        install_into_hooks_json(os.path.join(project, ".cursor", "hooks.json"))
+    elif label == "codex":
+        from .hooks.codex import install_into_hooks_json
+        install_into_hooks_json(os.path.join(project, ".codex", "hooks.json"))
+
+
+def _remove_hooks(project: str) -> List[str]:
+    """Delete our entries from each host's config, leaving anything else in it.
+
+    Removing the whole file would take the user's own settings with it - and
+    somebody running teardown is often already having a bad day.
+    """
+    removed = []
+    for label, directory, filename, event, command, nested in _HOSTS:
+        path = os.path.join(project, directory, filename)
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, encoding="utf-8-sig") as f:
+                data = json.load(f)
+            if _strip_hook_entries(data, event, command):
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+                removed.append(label)
+        except Exception:
+            continue        # a config we cannot parse is one we must not rewrite
+    return removed
+
+
+def _strip_hook_entries(data, event: str, command: str) -> bool:
+    """Remove our handlers from a host config in place. True if anything went.
+
+    Handles both shapes: Claude Code / Codex nest handlers in a group
+    ({matcher, hooks:[{type, command}]}); Cursor lists them flat.
+    """
+    hooks = data.get("hooks")
+    if not isinstance(hooks, dict) or event not in hooks:
+        return False
+    groups, kept, changed = hooks[event], [], False
+    if not isinstance(groups, list):
+        return False
+    for group in groups:
+        if isinstance(group, dict) and "hooks" in group:
+            inner = [h for h in group.get("hooks", [])
+                     if command not in str(h.get("command", ""))]
+            if len(inner) != len(group.get("hooks", [])):
+                changed = True
+            if inner:
+                group["hooks"] = inner
+                kept.append(group)
+        elif isinstance(group, dict) and command in str(group.get("command", "")):
+            changed = True
+        else:
+            kept.append(group)
+    if changed:
+        if kept:
+            hooks[event] = kept
+        else:
+            hooks.pop(event)
+    return changed
+
+
+def cmd_setup(a) -> int:
+    """One command to make a project guarded, and to say what that means.
+
+    Setup used to be six commands across two shells with an implicit order and
+    elevation at unpredictable points. Nothing told anyone how far they had
+    got, and "installed but inert" has been the dangerous state six times in
+    this project - four independent manual steps is how a seventh happens.
+
+    What it will NOT do without asking: move your files. That is printed in
+    full and confirmed, every time.
+    """
+    from . import guarded as g, protect as protect_mod, schedule
+
+    project = os.path.abspath(getattr(a, "project", None) or os.getcwd())
+    yes = getattr(a, "yes", False)
+    print(render.c(f"\ndemo_cli {__version__}  setup  ->  {project}\n", "dim"))
+
+    # 1. Config -----------------------------------------------------------
+    cfg_path = os.path.join(project, CONFIG_NAME)
+    mode = getattr(a, "mode", None) or "enforce"
+    if os.path.exists(cfg_path):
+        _step(1, f"config already present ({cfg_path})")
+    else:
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            f.write(_CONFIG_TEMPLATE.replace('mode = "shadow"', f'mode = "{mode}"'))
+        _step(1, f"wrote {cfg_path}  (mode = {mode})")
+
+    # 2. Hooks, for hosts that are actually present ------------------------
+    installed = []
+    for label, directory, filename, event, command, nested in _HOSTS:
+        home_dir = os.path.join(os.path.expanduser("~"), directory)
+        if not os.path.isdir(home_dir) and label != "claude code":
+            continue                    # host not installed on this machine
+        try:
+            _install_hook_for(project, label)
+            installed.append(label)
+        except Exception as exc:
+            print(f"      could not install the {label} hook: {exc}")
+    _step(2, f"hooks: {', '.join(installed) if installed else 'none installed'}")
+
+    # 3. Protection, which MOVES FILES and therefore always asks -----------
+    if os.name != "nt":
+        _step(3, "no filesystem guard on Linux - the behavioural layer is "
+                 "`demo_cli run <cmd>`, wrapped per command")
+    elif getattr(a, "no_protect", False):
+        _step(3, "skipped (--no-protect)")
+    else:
+        backing = protect_mod.backing_for(project)
+        already = os.path.isdir(backing)
+        if already:
+            _step(3, f"already protected  (files live in {backing})")
+        else:
+            plan = protect_mod.plan_protect(project)
+            _step(3, "protect this project")
+            print(f"      your files move to   {plan.backing}")
+            print(f"      {project} becomes the guarded mount")
+            for w in plan.warnings:
+                print("      " + render.c("! " + w, "yellow"))
+            for p in plan.problems:
+                print("      " + render.c("x " + p, "red"))
+            if not plan.ok:
+                return 1
+            if not yes and input("\n      Type 'yes' to move your project: "
+                                 ).strip().lower() != "yes":
+                print("\n  Nothing was moved. Setup stopped.\n")
+                return 1
+            # Elevation happens HERE, after the user has agreed - not at the
+            # start, and not by sending them to another shell to start over.
+            if protect_mod.is_elevated():
+                for line in protect_mod.protect(plan):
+                    print("      " + render.c(line, "green"))
+            else:
+                print("      requesting administrator rights...")
+                rc = protect_mod.rerun_elevated(["protect", project, "--yes"])
+                if rc is None:
+                    print("      " + render.c(
+                        "elevation was refused; nothing was moved. Re-run "
+                        "from an Administrator shell.", "red"))
+                    return 1
+                if rc != 0:
+                    print("      " + render.c("the elevated step failed.", "red"))
+                    return 1
+                print("      " + render.c("protected", "green"))
+
+        # 4. Come back after a reboot --------------------------------------
+        if schedule.status(project).exists:
+            _step(4, "logon task already registered")
+        elif protect_mod.is_elevated():
+            ok = schedule.register(project, protect_mod.backing_for(project))
+            _step(4, "registered a logon task so the guard returns after a reboot"
+                     if ok else "could NOT register the logon task")
+        else:
+            rc = protect_mod.rerun_elevated(["_register-task", project])
+            _step(4, "registered a logon task so the guard returns after a reboot"
+                     if rc == 0 else
+                     "could NOT register the logon task - the guard will not "
+                     "come back automatically after a reboot")
+
+    # 5. What is actually on right now ------------------------------------
+    cfg = load_config(project)
+    port = getattr(a, "port", 8080)
+    print(render.c("\n  coverage\n", "dim"))
+    for layer in g.assess(cfg, port, _host_hook_status(cfg)):
+        mark = render.c("[+]", "green") if layer.ok else render.c("[!]", "yellow")
+        print(f"  {mark} {layer.name:<16} {layer.detail}")
+        if layer.fixable:
+            print(f"      {render.c('turn it on: ' + layer.fixable, 'dim')}")
+
+    print(f"\n  {render.c('Start your agent with:  demo_cli guarded claude', 'dim')}")
+    print(f"  {render.c('Undo everything:        demo_cli teardown', 'dim')}\n")
+    return 0
+
+
+def cmd_teardown(a) -> int:
+    """Remove everything setup added, in reverse, on a machine in any state.
+
+    It never refuses to continue because a step was already done. A teardown
+    that only works when everything is healthy is not a way out - and the
+    moment somebody reaches for it is usually the moment something is broken.
+    """
+    from . import mountstate, protect as protect_mod, schedule
+
+    project = os.path.abspath(getattr(a, "project", None) or os.getcwd())
+    print(render.c(f"\ndemo_cli {__version__}  teardown  ->  {project}\n", "dim"))
+    if not getattr(a, "yes", False):
+        print("  This removes the hooks, the logon task, and moves your files back.")
+        if input("  Type 'yes' to continue: ").strip().lower() != "yes":
+            print("  Nothing was changed.\n")
+            return 1
+
+    cfg = load_config(project)
+
+    st = mountstate.status(cfg)
+    if st.running:
+        _step(1, f"stopping the filesystem guard (pid {st.pid})")
+        try:
+            import signal
+            os.kill(st.pid, signal.SIGTERM)
+        except Exception:
+            print("      could not stop it - it may be elevated. Stop it from "
+                  "an Administrator shell, then re-run.")
+    else:
+        _step(1, "filesystem guard not running")
+    mountstate.clear(cfg)
+
+    if os.name == "nt":
+        _step(2, "removed the logon task" if schedule.unregister(project)
+                 else "could not remove the logon task")
+
+        backing = protect_mod.backing_for(project)
+        if os.path.isdir(backing):
+            # The junction must go first or the rename has nowhere to land.
+            if os.path.lexists(project):
+                try:
+                    os.rmdir(project)
+                except OSError:
+                    pass
+            plan = protect_mod.plan_unprotect(project)
+            if plan.ok:
+                for line in protect_mod.unprotect(plan):
+                    print("      " + render.c(line, "green"))
+                _step(3, "files moved back")
+            elif protect_mod.is_elevated():
+                _step(3, "could not restore: " + "; ".join(plan.problems))
+            else:
+                rc = protect_mod.rerun_elevated(["unprotect", project, "--yes"])
+                _step(3, "files moved back" if rc == 0 else
+                         "could not restore - run `demo_cli unprotect` from an "
+                         "Administrator shell")
+        else:
+            _step(3, "project was not protected")
+
+    removed = _remove_hooks(project)
+    _step(4, f"removed hooks: {', '.join(removed)}" if removed
+             else "no hooks to remove")
+
+    print(f"\n  {render.c('The config and receipts are left in place - they are ', 'dim')}"
+          f"{render.c('your audit trail.', 'dim')}")
+    print(f"  {render.c('Remove them yourself if you want: ' + cfg.workspace, 'dim')}\n")
+    return 0
+
+
+def cmd_register_task(a) -> int:
+    """(internal) Register the logon task. Its own subcommand only so setup can
+    re-run itself elevated for this one step."""
+    from . import protect as protect_mod, schedule
+    project = os.path.abspath(a.project)
+    return 0 if schedule.register(project, protect_mod.backing_for(project)) else 1
 
 
 def cmd_protect(a) -> int:
@@ -1209,7 +1518,10 @@ def cmd_guarded(a) -> int:
         print(f"{argv[0]}: not found on PATH.")
         return 127
     try:
-        return subprocess.run([exe] + argv[1:], env=env).returncode
+        proc = subprocess.Popen([exe] + argv[1:], env=env)
+        _watch_layers(cfg, port, layers, proc,
+                      seconds=getattr(a, "heartbeat", 60))
+        return proc.wait()
     except KeyboardInterrupt:
         return 130
     finally:
@@ -1383,6 +1695,27 @@ def build_parser() -> argparse.ArgumentParser:
                         help="stop a detached filesystem guard [Windows]")
     um.set_defaults(func=cmd_unmount)
 
+    st = sub.add_parser("setup", parents=[common],
+                        help="make a project guarded: config, hooks, protection, autostart")
+    st.add_argument("project", nargs="?", help="the project (default: current directory)")
+    st.add_argument("--mode", choices=["shadow", "enforce"], default="enforce")
+    st.add_argument("--no-protect", action="store_true",
+                    help="skip relocating the project (no filesystem guard)")
+    st.add_argument("--port", type=int, default=8080)
+    st.add_argument("--yes", action="store_true", help="skip confirmations")
+    st.set_defaults(func=cmd_setup)
+
+    td = sub.add_parser("teardown", parents=[common],
+                        help="undo everything setup did, in any machine state")
+    td.add_argument("project", nargs="?", help="the project (default: current directory)")
+    td.add_argument("--yes", action="store_true", help="skip confirmations")
+    td.set_defaults(func=cmd_teardown)
+
+    rt = sub.add_parser("_register-task", parents=[common],
+                        help=argparse.SUPPRESS)
+    rt.add_argument("project")
+    rt.set_defaults(func=cmd_register_task)
+
     pr = sub.add_parser("protect", parents=[common],
                         help="relocate a project so its path becomes the guarded mount [Windows]")
     pr.add_argument("project", help="the project directory to protect")
@@ -1409,6 +1742,9 @@ def build_parser() -> argparse.ArgumentParser:
     gd.add_argument("--port", type=int, default=8080, help="egress proxy port (default 8080)")
     gd.add_argument("--no-egress", action="store_true",
                     help="do not start or use the egress proxy")
+    gd.add_argument("--heartbeat", type=int, default=60, metavar="SECONDS",
+                    help="re-check coverage this often and warn if a layer "
+                         "drops mid-session (0 disables)")
     gd.add_argument("argv", nargs=argparse.REMAINDER,
                     help="the agent to run, e.g. `demo_cli guarded claude`")
     gd.set_defaults(func=cmd_guarded)

@@ -119,6 +119,70 @@ def is_elevated() -> bool:
         return False
 
 
+def rerun_elevated(args: List[str]) -> Optional[int]:
+    """Re-run demo_cli with these arguments, elevated. Returns its exit code.
+
+    ShellExecuteW with the "runas" verb is the only way to raise a UAC prompt;
+    a process cannot elevate itself in place. So this launches a SECOND
+    demo_cli, waits for it, and reports what it did.
+
+    WHY BOTHER, instead of printing "open an admin shell and re-run": the step
+    that needs elevation happens in the middle of setup, after the user has
+    already read the plan and typed yes. Sending them away to another shell at
+    that point means they come back and start over - and every extra manual
+    step is a step someone skips, leaving a half-configured machine.
+
+    Returns None when elevation is unavailable or refused, so the caller can
+    say so rather than pretending the work was done.
+    """
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    class SHELLEXECUTEINFOW(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD), ("fMask", ctypes.c_ulong),
+                    ("hwnd", wintypes.HWND), ("lpVerb", wintypes.LPCWSTR),
+                    ("lpFile", wintypes.LPCWSTR), ("lpParameters", wintypes.LPCWSTR),
+                    ("lpDirectory", wintypes.LPCWSTR), ("nShow", ctypes.c_int),
+                    ("hInstApp", wintypes.HINSTANCE), ("lpIDList", ctypes.c_void_p),
+                    ("lpClass", wintypes.LPCWSTR), ("hkeyClass", wintypes.HKEY),
+                    ("dwHotKey", wintypes.DWORD), ("hIcon", wintypes.HANDLE),
+                    ("hProcess", wintypes.HANDLE)]
+
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    # Declare every signature. ctypes defaults an undeclared return to a
+    # 32-bit int, which truncates pointer-sized handles on x64 - the bug that
+    # cost three debugging rounds during the privilege investigation.
+    shell32.ShellExecuteExW.restype = wintypes.BOOL
+    shell32.ShellExecuteExW.argtypes = [ctypes.POINTER(SHELLEXECUTEINFOW)]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE,
+                                            ctypes.POINTER(wintypes.DWORD)]
+
+    exe = shutil.which("demo_cli")
+    if not exe:
+        return None
+
+    info = SHELLEXECUTEINFOW()
+    info.cbSize = ctypes.sizeof(info)
+    info.fMask = 0x00000040                      # SEE_MASK_NOCLOSEPROCESS
+    info.lpVerb = "runas"                        # this is what prompts UAC
+    info.lpFile = exe
+    info.lpParameters = subprocess.list2cmdline(args)
+    info.nShow = 1                               # SW_SHOWNORMAL
+    if not shell32.ShellExecuteExW(ctypes.byref(info)) or not info.hProcess:
+        return None                              # cancelled at the prompt, or refused
+
+    kernel32.WaitForSingleObject(info.hProcess, 0xFFFFFFFF)
+    code = wintypes.DWORD()
+    kernel32.GetExitCodeProcess(info.hProcess, ctypes.byref(code))
+    return int(code.value)
+
+
 def plan_protect(project: str, backing: Optional[str] = None,
                  lock: bool = True) -> Plan:
     """Decide whether this project can be protected, without touching anything.

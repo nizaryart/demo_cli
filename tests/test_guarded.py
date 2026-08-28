@@ -188,3 +188,47 @@ def test_every_layer_that_is_off_offers_a_way_to_turn_it_on(cfg):
         if layer.ok or "no always-on layer" in layer.detail:
             continue
         assert layer.fixable, f"{layer.name} is off with no stated remedy"
+
+
+# --------------------------------------------------------------------------
+# The heartbeat
+#
+# The coverage report prints once, at launch. If the mount crashes an hour in,
+# or someone runs `demo_cli unmount` in another window, nothing says so and the
+# person keeps working while believing they are covered. Sixth appearance of
+# "is this thing actually protecting me?", and the one place it had no answer.
+# --------------------------------------------------------------------------
+
+def test_a_layer_going_down_is_reported():
+    before = [g.Layer("filesystem", True, "mounted"), g.Layer("egress", True, ":8080")]
+    after = [g.Layer("filesystem", False, "gone"), g.Layer("egress", True, ":8080")]
+    assert [x.name for x in g.dropped(before, after)] == ["filesystem"]
+
+
+def test_a_layer_that_was_already_down_is_not_reported_again():
+    """Only TRANSITIONS. A guard that prints its status every minute is noise,
+    and noise is how a real warning gets missed."""
+    before = [g.Layer("egress", False, "down")]
+    after = [g.Layer("egress", False, "down")]
+    assert g.dropped(before, after) == []
+
+
+def test_nothing_is_reported_when_nothing_changed():
+    layers = [g.Layer("filesystem", True, "mounted")]
+    assert g.dropped(layers, layers) == []
+    assert g.recovered(layers, layers) == []
+
+
+def test_a_layer_coming_back_is_reported():
+    """Otherwise the user acts on a stale warning for the rest of the session."""
+    before = [g.Layer("egress", False, "down")]
+    after = [g.Layer("egress", True, ":8080")]
+    assert [x.name for x in g.recovered(before, after)] == ["egress"]
+
+
+def test_a_layer_that_disappears_from_the_report_is_not_a_drop():
+    """Platform differences change which layers are assessed at all; a missing
+    row is not the same as a row that failed."""
+    before = [g.Layer("shell guard", True, "installed"), g.Layer("egress", True, "up")]
+    after = [g.Layer("egress", True, "up")]
+    assert g.dropped(before, after) == []
