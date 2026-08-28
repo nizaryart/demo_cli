@@ -1122,8 +1122,18 @@ def cmd_setup(a) -> int:
     yes = getattr(a, "yes", False)
     print(render.c(f"\ndemo_cli {__version__}  setup  ->  {project}\n", "dim"))
 
+    # PROTECTION STATUS FIRST, because it decides WHERE the config may be
+    # written. Once a project is protected, its own path IS the mount point -
+    # so writing a file there creates a real directory that BLOCKS mounting,
+    # and a second config competing with the real one. That is exactly what
+    # happened on 2026-08-28: setup wrote myproj\.demo_cli.toml, the logon
+    # task's `rmdir` could not remove a non-empty directory, and the mount
+    # refused because the path existed.
+    already_protected = os.path.isdir(protect_mod.backing_for(project))
+    config_home = protect_mod.backing_for(project) if already_protected else project
+
     # 1. Config -----------------------------------------------------------
-    cfg_path = os.path.join(project, CONFIG_NAME)
+    cfg_path = os.path.join(config_home, CONFIG_NAME)
     mode = getattr(a, "mode", None) or "enforce"
     if os.path.exists(cfg_path):
         _step(1, f"config already present ({cfg_path})")
@@ -1139,7 +1149,7 @@ def cmd_setup(a) -> int:
         if not os.path.isdir(home_dir) and label != "claude code":
             continue                    # host not installed on this machine
         try:
-            _install_hook_for(project, label)
+            _install_hook_for(config_home, label)
             installed.append(label)
         except Exception as exc:
             print(f"      could not install the {label} hook: {exc}")
@@ -1153,8 +1163,7 @@ def cmd_setup(a) -> int:
         _step(3, "skipped (--no-protect)")
     else:
         backing = protect_mod.backing_for(project)
-        already = os.path.isdir(backing)
-        if already:
+        if already_protected:
             _step(3, f"already protected  (files live in {backing})")
         else:
             plan = protect_mod.plan_protect(project)

@@ -100,8 +100,15 @@ def register(project: str, backing: str, port_free_command: Optional[str] = None
 
     # cmd /c so both steps run in one action. rmdir (not del) because a
     # reparse point is a directory entry; it removes the link, never a tree.
+    # >> a log, because a scheduled task's output goes NOWHERE. On 2026-08-28
+    # the task ran, `rmdir` failed on a non-empty directory, the mount refused
+    # because the path existed, and none of it was visible anywhere - the
+    # sixth instance of "anything that runs where you cannot see it must write
+    # down what it did".
+    log = os.path.join(os.path.dirname(backing), ".demo_cli", "autostart.log")
     action = (f'cmd /c "if exist \\"{project}\\" rmdir \\"{project}\\" & '
-              f'{exe} mount \\"{project}\\" --backing \\"{backing}\\""')
+              f'{exe} mount \\"{project}\\" --backing \\"{backing}\\" '
+              f'>> \\"{log}\\" 2>&1"')
     r = _run(["schtasks", "/create", "/tn", task_name(project),
               "/tr", action, "/sc", "onlogon", "/rl", "highest", "/f"])
     return r.returncode == 0
