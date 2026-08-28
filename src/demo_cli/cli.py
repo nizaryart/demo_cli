@@ -1138,12 +1138,35 @@ def cmd_setup(a) -> int:
     # task's `rmdir` could not remove a non-empty directory, and the mount
     # refused because the path existed.
     already_protected = os.path.isdir(protect_mod.backing_for(project))
-    config_home = protect_mod.backing_for(project) if already_protected else project
+
+    # WHERE CONFIG AND HOOKS GO, and why the order changes.
+    #
+    # They belong INSIDE the project. For an unprotected one that is just the
+    # project path. For a protected one the only legitimate route to those
+    # files is THROUGH THE MOUNT - writing into the backing directly is
+    # reaching around our own guard, which is exactly what the ACL exists to
+    # prevent, and it fails anyway because the backing is Administrators-only.
+    #
+    # So when a project is already protected we DEFER these steps until the
+    # mount is up, and do them through it. Trying to write into the locked
+    # backing was a crash on 2026-08-28, from a fix made an hour earlier.
+    from . import mountstate as _ms
+    mounted_now = _ms.status(load_config(project)).running
+    defer = already_protected and not mounted_now
+    config_home = project
+
+    if defer:
+        print(render.c("  This project is protected but not mounted, so its "
+                       "config and hooks", "dim"))
+        print(render.c("  are set up after the guard starts, through the "
+                       "mount.", "dim"))
 
     # 1. Config -----------------------------------------------------------
     cfg_path = os.path.join(config_home, CONFIG_NAME)
     mode = getattr(a, "mode", None) or "enforce"
-    if os.path.exists(cfg_path):
+    if defer:
+        _step(1, "config: deferred until the guard is mounted")
+    elif os.path.exists(cfg_path):
         _step(1, f"config already present ({cfg_path})")
     else:
         with open(cfg_path, "w", encoding="utf-8") as f:
@@ -1152,7 +1175,7 @@ def cmd_setup(a) -> int:
 
     # 2. Hooks, for hosts that are actually present ------------------------
     installed = []
-    for label, directory, filename, event, command, nested in _HOSTS:
+    for label, directory, filename, event, command, nested in ([] if defer else _HOSTS):
         home_dir = os.path.join(os.path.expanduser("~"), directory)
         if not os.path.isdir(home_dir) and label != "claude code":
             continue                    # host not installed on this machine
@@ -1161,7 +1184,8 @@ def cmd_setup(a) -> int:
             installed.append(label)
         except Exception as exc:
             print(f"      could not install the {label} hook: {exc}")
-    _step(2, f"hooks: {', '.join(installed) if installed else 'none installed'}")
+    _step(2, "hooks: deferred until the guard is mounted" if defer else
+             f"hooks: {', '.join(installed) if installed else 'none installed'}")
 
     # 3. Protection, which MOVES FILES and therefore always asks -----------
     if os.name != "nt":
@@ -1250,7 +1274,29 @@ def cmd_setup(a) -> int:
             _step(5, "could not start the guard now. It will come up at your "
                      "next logon, or run: demo_cli mount (elevated)")
 
-    # 6. What is actually on right now ------------------------------------
+    if defer and _ms.status(load_config(project)).running:
+        # Through the mount now, which is the only honest route to a
+        # protected project's files.
+        try:
+            if not os.path.exists(cfg_path):
+                with open(cfg_path, "w", encoding="utf-8") as f:
+                    f.write(_CONFIG_TEMPLATE.replace('mode = "shadow"',
+                                                     f'mode = {mode!r}'))
+            done = []
+            for label, *_ in _HOSTS:
+                try:
+                    _install_hook_for(project, label)
+                    done.append(label)
+                except Exception:
+                    pass
+            _step(6, f"config and hooks written through the mount"
+                     + (f" ({', '.join(done)})" if done else ""))
+        except OSError as exc:
+            _step(6, f"could not write through the mount: {exc}")
+    elif defer:
+        _step(6, "config and hooks still deferred - the guard is not mounted")
+
+    # 7. What is actually on right now ------------------------------------
     cfg = load_config(project)
     port = getattr(a, "port", 8080)
     print(render.c("\n  coverage\n", "dim"))
