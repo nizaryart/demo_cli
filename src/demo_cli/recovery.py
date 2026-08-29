@@ -834,6 +834,52 @@ def snapshot_bytes(name: str, data: bytes, recovery_dir: str,
     return entry
 
 
+def snapshot_before_restore(entry: Optional[dict],
+                            recovery_dir: str) -> Optional[dict]:
+    """Preserve what `undo` is about to overwrite.
+
+    UNDO WAS THE ONE MUTATION THE TOOL DID NOT GATE. Everything an agent does
+    is snapshotted before it destroys anything; `undo` overwrote a file with
+    no recovery point of its own. The failure that exposed it: restore a file,
+    do new work on it, then restore again out of habit - and the new work is
+    gone, with nothing to go back to.
+
+    Blocking a repeated id would not have fixed that. A DIFFERENT recovery
+    point for the same file does identical damage and has never been used, so
+    a once-only rule lets it straight through. The hazard is overwriting live
+    content, not reusing an id, so the guard belongs on the overwrite.
+
+    Returns the new entry, or None when there is nothing worth keeping: no
+    target on disk, or bytes already identical to what is being restored -
+    a recovery point recording no change is noise in the log, and noise is
+    how a real one gets missed.
+
+    FILES ONLY. A 'dir' entry restores by copytree overlay, which can clobber
+    modified files the same way; capturing a whole tree here needs snapshot()
+    and a Target, and is left as known work rather than half-done. Every
+    recovery point the filesystem guard writes is a file.
+    """
+    if not entry or entry.get("kind") not in ("file", "sqlite"):
+        return None
+    target, rp = entry.get("target"), entry.get("recovery_point")
+    if not target or not os.path.isfile(target):
+        return None                     # nothing there to lose
+    try:
+        with open(target, "rb") as f:
+            current = f.read()
+    except OSError:
+        return None
+    try:
+        with open(rp, "rb") as f:
+            if f.read() == current:
+                return None             # restoring identical bytes changes nothing
+    except OSError:
+        pass                            # cannot compare - keep the copy, it is cheap
+    return snapshot_bytes(os.path.basename(target), current, recovery_dir,
+                          action=f"undo {entry.get('id', '?')} overwrote {target}",
+                          target=target)
+
+
 def load_entries(recovery_dir: str) -> List[dict]:
     idx = _index_path(recovery_dir)
     entries: List[dict] = []

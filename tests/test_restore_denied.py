@@ -128,3 +128,70 @@ def test_a_genuine_failure_still_says_so(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "No recovery point could be restored" in out
     assert "Administrator" not in out, "do not send people to UAC for nothing"
+
+
+# --------------------------------------------------------------------------
+# undo must not destroy what it overwrites
+#
+# The last unguarded mutation in the system. Everything an agent does is
+# snapshotted first; `undo` overwrote a file with no recovery point of its
+# own, so restore -> new work -> restore again lost the new work with nothing
+# to go back to. A once-only rule would not have caught it: a DIFFERENT id for
+# the same file does the same damage and has never been used.
+# --------------------------------------------------------------------------
+
+def test_undo_snapshots_what_it_is_about_to_overwrite(tmp_path):
+    entry = _entry(tmp_path, b"OLD")
+    target = tmp_path / "proj" / "notes.txt"
+    target.parent.mkdir()
+    target.write_bytes(b"NEW WORK")
+
+    kept = recovery.snapshot_before_restore(entry, str(tmp_path / "rec"))
+    assert kept, "live content must not be overwritten without a recovery point"
+    assert open(kept["recovery_point"], "rb").read() == b"NEW WORK"
+    assert kept["target"] == str(target)
+    assert "undo" in (kept["action"] or "")
+
+
+def test_the_kept_copy_restores_the_new_work(tmp_path):
+    """The whole point: undo the undo."""
+    entry = _entry(tmp_path, b"OLD")
+    target = tmp_path / "proj" / "notes.txt"
+    target.parent.mkdir()
+    target.write_bytes(b"NEW WORK")
+
+    kept = recovery.snapshot_before_restore(entry, str(tmp_path / "rec"))
+    assert recovery.restore(entry).ok
+    assert target.read_bytes() == b"OLD"          # the undo happened
+    assert recovery.restore(kept).ok
+    assert target.read_bytes() == b"NEW WORK"     # and is itself reversible
+
+
+def test_identical_bytes_are_not_snapshotted(tmp_path):
+    """A recovery point recording no change is noise, and noise is how a real
+    one gets missed."""
+    entry = _entry(tmp_path, b"SAME")
+    target = tmp_path / "proj" / "notes.txt"
+    target.parent.mkdir()
+    target.write_bytes(b"SAME")
+    assert recovery.snapshot_before_restore(entry, str(tmp_path / "rec")) is None
+
+
+def test_a_missing_target_is_not_snapshotted(tmp_path):
+    """Restoring a DELETED file - the common case - has nothing to preserve."""
+    entry = _entry(tmp_path)
+    assert recovery.snapshot_before_restore(entry, str(tmp_path / "rec")) is None
+
+
+def test_no_entry_is_handled(tmp_path):
+    assert recovery.snapshot_before_restore(None, str(tmp_path / "rec")) is None
+
+
+def test_a_directory_entry_is_left_alone(tmp_path):
+    """Known gap, stated rather than half-done: a 'dir' entry restores by
+    copytree overlay and would need snapshot() plus a Target. Every recovery
+    point the filesystem guard writes is a file."""
+    d = tmp_path / "tree"
+    d.mkdir()
+    entry = {"kind": "dir", "recovery_point": str(d), "target": str(tmp_path / "t")}
+    assert recovery.snapshot_before_restore(entry, str(tmp_path / "rec")) is None

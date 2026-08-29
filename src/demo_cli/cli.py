@@ -92,6 +92,11 @@ def _undo_argv(a) -> List[str]:
         argv += ["--target", os.path.abspath(a.target)]
     if getattr(a, "root", None):
         argv += ["--root", os.path.abspath(a.root)]
+    # This process already took the pre-restore snapshot - the target lives in
+    # the mount and is readable unelevated, even when the recovery point is
+    # not. Without this the elevated child would take a second one of bytes
+    # nobody changed in between.
+    argv.append("--no-presnapshot")
     return argv
 
 
@@ -124,6 +129,19 @@ def _undo_elevated(a) -> Optional[int]:
 def cmd_undo(a) -> int:
     cfg = load_config(getattr(a, "root", None))
     entry = _resolve_entry(cfg, a)
+
+    # Snapshot BEFORE restoring, and before any elevation attempt. The target
+    # sits in the mount and is readable unelevated even when the recovery
+    # point is not, so this succeeds here and the resulting id reaches the
+    # shell the person is actually looking at - an elevated child's output
+    # goes to a console that closes with it.
+    preserved = None
+    if not getattr(a, "no_presnapshot", False):
+        try:
+            preserved = recovery.snapshot_before_restore(entry, cfg.recovery_dir)
+        except OSError:
+            preserved = None            # never let bookkeeping block a recovery
+
     result = recovery.restore(entry)
 
     if not result.ok and result.denied:
@@ -135,6 +153,7 @@ def cmd_undo(a) -> int:
             render.render_restore(entry, True, __version__,
                                   recovery_dir=cfg.recovery_dir,
                                   requested_id=getattr(a, "id", None))
+            _say_preserved(preserved)
             return 0
         if rc is not None:
             print(render.c("The elevated attempt did not restore it either "
@@ -147,7 +166,20 @@ def cmd_undo(a) -> int:
                           recovery_dir=cfg.recovery_dir,
                           requested_id=getattr(a, "id", None),
                           denied=result.denied, problem=result.problem)
+    if result.ok:
+        _say_preserved(preserved)
     return 0 if result.ok else 1
+
+
+def _say_preserved(entry) -> None:
+    """Name the recovery point undo just took, so the undo is itself undoable.
+
+    Silent when there was nothing to keep - an identical file, or no file.
+    """
+    if entry:
+        print(render.c(f"  the previous content was kept as {entry['id']}"
+                       f" - put it back with:  demo_cli undo {entry['id']}", "dim"))
+        print()
 
 
 def cmd_diff(a) -> int:
@@ -1844,6 +1876,7 @@ def build_parser() -> argparse.ArgumentParser:
     un = sub.add_parser("undo", parents=[common], help="restore a recovery point (latest, or by id)")
     un.add_argument("id", nargs="?", default=None, help="recovery point id (see `demo_cli log`)")
     un.add_argument("--target", default=None)
+    un.add_argument("--no-presnapshot", action="store_true", help=argparse.SUPPRESS)
     un.set_defaults(func=cmd_undo)
 
     df = sub.add_parser("diff", parents=[common], help="show what changed since a recovery point")
