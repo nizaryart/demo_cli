@@ -324,6 +324,67 @@ def test_an_unreadable_directory_is_not_an_error(tmp_path):
     assert _protected_children(str(tmp_path / "does-not-exist")) == []
 
 
+import contextlib as _contextlib
+
+
+@_contextlib.contextmanager
+def _rename_blocked(directory):
+    """Make renaming `directory` fail - on either platform.
+
+    os.chmod DOES NOT RESTRICT DIRECTORIES ON WINDOWS. It only toggles the
+    read-only bit, the rename went through, and both tests using it failed
+    with "DID NOT RAISE" on the first real Windows run (2026-08-29). That is
+    the sixth platform-shaped test assumption in this project, and once again
+    the production code was correct - only the test's idea of the platform
+    was wrong.
+
+    The Windows mechanism here is the real one from the field: a process
+    holding an open handle on a directory makes Windows refuse to rename it.
+    That is precisely the WinError 32 `demo_cli setup` hit live on 2026-08-28,
+    so the test now REPRODUCES the observed failure instead of simulating it.
+
+    Share mode 0 - no sharing at all - so the rename's own open fails. The
+    restype declaration is not decoration: an undeclared restype truncates a
+    64-bit HANDLE to 32 bits, which cost three separate bugs earlier in this
+    project.
+    """
+    directory = str(directory)
+    if os.name != "nt":
+        parent = os.path.dirname(directory)
+        mode = os.stat(parent).st_mode
+        os.chmod(parent, 0o555)
+        try:
+            yield
+        finally:
+            os.chmod(parent, mode)
+        return
+
+    import ctypes
+    from ctypes import wintypes
+    kernel32 = ctypes.windll.kernel32
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD,
+                                     wintypes.DWORD, ctypes.c_void_p,
+                                     wintypes.DWORD, wintypes.DWORD,
+                                     wintypes.HANDLE]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    GENERIC_READ = 0x80000000
+    OPEN_EXISTING = 3
+    FILE_FLAG_BACKUP_SEMANTICS = 0x02000000     # required to open a DIRECTORY
+    INVALID = wintypes.HANDLE(-1).value
+
+    handle = kernel32.CreateFileW(directory, GENERIC_READ, 0, None,
+                                  OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS,
+                                  None)
+    if handle == INVALID:
+        pytest.skip(f"could not hold {directory} open "
+                    f"(WinError {ctypes.get_last_error()})")
+    try:
+        yield
+    finally:
+        kernel32.CloseHandle(wintypes.HANDLE(handle))
+
+
 def test_unprotect_reports_a_blocked_rename_instead_of_raising(tmp_path):
     """The way out must never end in a traceback.
 
@@ -338,17 +399,13 @@ def test_unprotect_reports_a_blocked_rename_instead_of_raising(tmp_path):
     plan = P.plan_unprotect(str(tmp_path / "proj"))
     assert plan.ok
 
-    import os as _os
-    _os.chmod(tmp_path, 0o555)          # the rename cannot succeed
-    try:
+    with _rename_blocked(backing):
         with pytest.raises(PermissionError) as exc:
             P.unprotect(plan)
         message = str(exc.value)
         assert "Administrator" in message, "say how to fix it"
         assert "intact" in message, "say the files are safe"
         assert str(backing) in message, "say WHERE they are"
-    finally:
-        _os.chmod(tmp_path, 0o755)
     assert (backing / "notes.txt").read_text() == "irreplaceable"
 
 
@@ -388,14 +445,10 @@ def test_a_blocked_relocate_names_the_likely_cause(tmp_path):
     """'The process cannot access the file' does not tell anyone that their
     own shell is the process."""
     from demo_cli.fspassthrough import Backing
-    import os as _os
     source = tmp_path / "proj"
     source.mkdir()
-    _os.chmod(tmp_path, 0o555)          # the rename cannot succeed
-    try:
+    with _rename_blocked(source):
         with pytest.raises((PermissionError, OSError)) as exc:
             Backing.relocate(str(source), str(tmp_path / "proj.real"))
         assert "Nothing was moved" in str(exc.value)
-    finally:
-        _os.chmod(tmp_path, 0o755)
     assert source.exists()

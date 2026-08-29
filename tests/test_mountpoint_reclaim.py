@@ -15,12 +15,36 @@ platform-shaped test assumption in this project would have been to gate them
 behind skipif(os.name != "nt").
 """
 import os
+import subprocess
 
 import pytest
 
 from demo_cli import config as config_mod
 from demo_cli.config import Config
 from demo_cli.fsmount import clear_mountpoint, mountpoint_obstruction
+
+
+def _dir_link(link, target):
+    """A directory link that needs no special privilege.
+
+    os.symlink on Windows requires SeCreateSymbolicLinkPrivilege - an admin
+    shell or Developer Mode - so the first Windows run failed with
+    "WinError 1314: A required privilege is not held by the client". A
+    JUNCTION needs no privilege at all.
+
+    That turned out to be the right object anyway, not just the runnable one:
+    what an unclean shutdown leaves behind where a WinFsp mount used to be is
+    a JUNCTION, not a symlink. The test is now testing the thing that actually
+    occurs. Being forced to make it run made it more faithful.
+    """
+    link, target = str(link), str(target)
+    if os.name != "nt":
+        os.symlink(target, link, target_is_directory=True)
+        return
+    r = subprocess.run(["cmd", "/c", "mklink", "/J", link, target],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        pytest.skip(f"mklink /J failed: {r.stdout.strip()} {r.stderr.strip()}")
 
 
 # --------------------------------------------------------------------------
@@ -45,20 +69,24 @@ def test_empty_workspace_leftover_is_no_obstruction(tmp_path):
     assert mountpoint_obstruction(str(d)) is None
 
 
-def test_symlink_is_no_obstruction(tmp_path):
-    """A dangling reparse point on Windows; a symlink is the closest thing
-    testable here. Removing a link removes nothing - the bytes are in the
-    backing directory."""
+def test_a_live_link_is_no_obstruction(tmp_path):
+    """A junction on Windows, a symlink on Linux. Removing a link removes
+    nothing - the bytes are in the backing directory."""
     target = tmp_path / "backing"
     target.mkdir()
     link = tmp_path / "mnt"
-    link.symlink_to(target, target_is_directory=True)
+    _dir_link(link, target)
     assert mountpoint_obstruction(str(link)) is None
 
 
-def test_dangling_symlink_is_no_obstruction(tmp_path):
+def test_a_dangling_link_is_no_obstruction(tmp_path):
+    """THE REBOOT CASE. A junction whose filesystem is no longer running is a
+    pointer to nothing; it used to block the logon task forever."""
+    target = tmp_path / "backing"
+    target.mkdir()
     link = tmp_path / "mnt"
-    link.symlink_to(tmp_path / "gone", target_is_directory=True)
+    _dir_link(link, target)
+    target.rmdir()                       # the filesystem behind it is gone
     assert mountpoint_obstruction(str(link)) is None
 
 
@@ -127,13 +155,14 @@ def test_clear_removes_empty_workspace_leftover(tmp_path):
     assert not d.exists()
 
 
-def test_clear_symlink_leaves_the_target_alone(tmp_path):
-    """The junction case. Removing the pointer must not touch the bytes."""
+def test_clearing_a_link_leaves_the_target_alone(tmp_path):
+    """The whole safety claim in one test: removing the pointer must not
+    touch a single byte behind it."""
     target = tmp_path / "backing"
     target.mkdir()
     (target / "notes.txt").write_text("irreplaceable")
     link = tmp_path / "mnt"
-    link.symlink_to(target, target_is_directory=True)
+    _dir_link(link, target)
 
     assert clear_mountpoint(str(link)) is True
     assert not link.exists()

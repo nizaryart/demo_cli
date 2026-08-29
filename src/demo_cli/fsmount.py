@@ -97,6 +97,29 @@ def absolute_target(mountpoint: Optional[str], virtual: str) -> str:
     return os.path.join(mountpoint, virtual.replace("/", os.sep))
 
 
+def _is_link(path: str) -> bool:
+    """Is this path a link of any kind - symlink, or a Windows junction?
+
+    os.path.islink() is documented for symlinks. A junction is a DIFFERENT
+    reparse-point tag, and whether islink() reports it has varied across
+    CPython versions on Windows. Guessing is not acceptable here: a dangling
+    junction that reads as "not a link" falls through to the isdir() branch,
+    is reported as a file, and the mount refuses - which is exactly the bug
+    this function was added to fix.
+
+    st_reparse_tag is set by os.lstat() on Windows for any reparse point, so
+    it answers the question directly rather than by inference.
+    """
+    if os.path.islink(path):
+        return True
+    if os.name != "nt":
+        return False
+    try:
+        return bool(getattr(os.lstat(path), "st_reparse_tag", 0))
+    except OSError:
+        return False
+
+
 def mountpoint_obstruction(mountpoint: str,
                            workspace_dir: str = ".demo_cli") -> Optional[str]:
     """Why this path cannot be mounted over, or None if it is safe to clear.
@@ -127,7 +150,7 @@ def mountpoint_obstruction(mountpoint: str,
     """
     if not os.path.lexists(mountpoint):
         return None
-    if os.path.islink(mountpoint):
+    if _is_link(mountpoint):
         return None                      # a link holds no bytes of its own
     if not os.path.isdir(mountpoint):
         return f"{mountpoint} exists and is a file, not a directory"
@@ -164,7 +187,7 @@ def clear_mountpoint(mountpoint: str, workspace_dir: str = ".demo_cli") -> bool:
     """
     if not os.path.lexists(mountpoint):
         return False
-    if os.path.islink(mountpoint):
+    if _is_link(mountpoint):
         # A LINK IS REMOVED DIFFERENTLY ON EACH PLATFORM, and neither call
         # follows it, so the backing directory is untouched either way.
         # POSIX: unlink, even when it points at a directory - rmdir raises
