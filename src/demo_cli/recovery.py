@@ -933,6 +933,90 @@ def prune(recovery_dir: str, keep: Optional[int] = None,
     return doomed
 
 
+@dataclass
+class RestoreResult:
+    """Whether the restore happened, and if not, WHY NOT.
+
+    restore_entry() used to collapse every OSError into False, and the caller
+    then printed a fixed guess: "check the target path is reachable". On
+    2026-08-29 that guess was wrong in the one case that matters most.
+
+    A filesystem-layer recovery point lives in the ACL-locked backing, so an
+    unelevated shell cannot READ it. Undo failed, and the user was told
+    "No recovery point could be restored" about a file sitting intact on
+    disk - a FALSE NEGATIVE from the command someone runs precisely when they
+    have already lost something. An unearned "REVERSIBLE" and an unearned
+    "unrecoverable" break the same invariant; only the direction differs.
+
+    `denied` is the distinction worth carrying: it means an elevated retry
+    would work, which is actionable, where "gone" is not.
+    """
+    ok: bool
+    denied: bool = False
+    problem: Optional[str] = None
+
+
+def restore(entry: Optional[dict]) -> RestoreResult:
+    """restore_entry(), but it says why it failed."""
+    if not entry:
+        return RestoreResult(False, problem="no recovery entry")
+    kind = entry.get("kind", "sqlite")
+    rp = entry.get("recovery_point")
+    try:
+        present = bool(rp) and (os.path.isdir(rp) if kind == "dir"
+                                else os.path.exists(rp))
+    except OSError:
+        present = False
+    if not present:
+        # Cannot even stat it. On Windows a directory locked to Administrators
+        # denies traverse, so "not there" and "not allowed to look" are the
+        # same answer here - and an elevated retry settles which.
+        if rp and not _readable_parent(rp):
+            return RestoreResult(False, denied=True,
+                                 problem=f"{rp} is not readable from this shell")
+        return RestoreResult(False, problem="the recovery point is missing")
+    try:
+        ok = restore_entry(entry)
+    except PermissionError as e:
+        return RestoreResult(False, denied=True, problem=str(e))
+    if ok:
+        return RestoreResult(True)
+    denied, why = _why_restore_failed(entry)
+    return RestoreResult(False, denied=denied, problem=why)
+
+
+def _readable_parent(path: str) -> bool:
+    parent = os.path.dirname(path) or "."
+    try:
+        os.listdir(parent)
+        return True
+    except OSError:
+        return False
+
+
+def _why_restore_failed(entry: dict):
+    """Re-attempt the two file operations to learn which one was refused.
+
+    Deliberately a SECOND look rather than plumbing the exception out of
+    restore_entry: that function is called from thirteen places and from the
+    syscall guard, and widening its contract to carry an error would touch all
+    of them. The cost is one extra open on a path that already failed - only
+    ever on the failure path, never in the normal one.
+    """
+    rp, target = entry.get("recovery_point"), entry.get("target")
+    try:
+        with open(rp, "rb"):
+            pass
+    except PermissionError:
+        return True, f"{rp} cannot be read from this shell"
+    except OSError as e:
+        return False, f"{rp} cannot be read ({e.strerror})"
+    parent = os.path.dirname(os.path.abspath(target or "")) or "."
+    if not os.access(parent, os.W_OK):
+        return True, f"{parent} cannot be written from this shell"
+    return False, "the copy did not complete"
+
+
 def restore_entry(entry: dict) -> bool:
     kind = entry.get("kind", "sqlite")
     rp, target = entry.get("recovery_point"), entry.get("target")

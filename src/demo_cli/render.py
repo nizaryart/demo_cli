@@ -221,7 +221,9 @@ def render_diff(entry: dict, lines: List[DiffLine], version: str) -> None:
 
 def render_restore(entry, ok: bool, version: str,
                    recovery_dir: Optional[str] = None,
-                   requested_id: Optional[str] = None) -> None:
+                   requested_id: Optional[str] = None,
+                   denied: bool = False,
+                   problem: Optional[str] = None) -> None:
     """`recovery_dir` and `requested_id` exist so a failure can say WHERE it
     looked.
 
@@ -242,12 +244,25 @@ def render_restore(entry, ok: bool, version: str,
         return
 
     lines = ["", c(f"demo_cli {version}", "dim") + "  " + _label("ESCALATE"), ""]
-    if entry:
+    if entry and denied:
+        # NOT "unrecoverable". The bytes are there and an elevated shell can
+        # reach them - saying otherwise is a false negative from the one
+        # command a person runs after already losing something (2026-08-29).
+        lines += ["  " + c("This recovery point needs Administrator.", "yellow"),
+                  kv("target", redact(entry.get("target", "?"))),
+                  kv("recovery point", redact(entry.get("recovery_point", "?")))]
+        if problem:
+            lines += [kv("refused", problem)]
+        lines += ["  " + c("The filesystem guard writes its recovery points into "
+                           "the protected backing, which is locked to "
+                           "Administrators so the agent cannot tamper with them. "
+                           "Your file is intact.", "dim")]
+    elif entry:
         # The entry was found; the copy is what failed.
         lines += ["  " + c("No recovery point could be restored.", "red"),
-                  kv("target", redact(entry.get("target", "?"))),
-                  "  " + c("The recovery point is present but could not be "
-                           "written back - check the target path is reachable.", "dim")]
+                  kv("target", redact(entry.get("target", "?")))]
+        lines += ["  " + c(problem or "The recovery point is present but could "
+                           "not be written back.", "dim")]
     else:
         what = f"No recovery point matched {requested_id!r}." if requested_id \
             else "No recovery points found."

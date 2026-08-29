@@ -83,17 +83,71 @@ def _resolve_entry(cfg, a):
     return recovery.latest(cfg.recovery_dir, ref)
 
 
+def _undo_argv(a) -> List[str]:
+    """This same undo, as a command line, for the elevated re-run."""
+    argv = ["undo"]
+    if getattr(a, "id", None):
+        argv.append(a.id)
+    if getattr(a, "target", None):
+        argv += ["--target", os.path.abspath(a.target)]
+    if getattr(a, "root", None):
+        argv += ["--root", os.path.abspath(a.root)]
+    return argv
+
+
+def _undo_elevated(a) -> Optional[int]:
+    """Retry an undo that was refused for lack of privilege, via UAC.
+
+    WHY ASK RATHER THAN INSTRUCT. The filesystem guard writes its recovery
+    points into the ACL-locked backing on purpose: it is what stops the agent
+    from deleting the evidence of what it did. The consequence is that undo of
+    anything that layer caught needs Administrator - and on 2026-08-29 the
+    user met that as "No recovery point could be restored", went away
+    believing the file was gone, and only got it back by guessing to open an
+    admin shell.
+
+    Sending somebody to another shell mid-recovery is the manual step people
+    skip. UAC is itself the consent prompt, so asking directly is both fewer
+    steps and no less explicit about what is happening.
+
+    Returns None when elevation is unavailable, refused, or pointless (already
+    elevated) - the caller then prints the honest failure instead.
+    """
+    from . import protect as protect_mod
+    if os.name != "nt" or protect_mod.is_elevated():
+        return None                     # already admin: elevating again changes nothing
+    print(render.c("[demo_cli] this recovery point lives in the protected backing; "
+                   "asking for Administrator.", "yellow"))
+    return protect_mod.rerun_elevated(_undo_argv(a))
+
+
 def cmd_undo(a) -> int:
     cfg = load_config(getattr(a, "root", None))
     entry = _resolve_entry(cfg, a)
-    ok = recovery.restore_entry(entry) if entry else False
+    result = recovery.restore(entry)
+
+    if not result.ok and result.denied:
+        rc = _undo_elevated(a)
+        if rc == 0:
+            # The elevated process owns its own console, which closes with it,
+            # so its RESTORED banner is never seen. Say it here, in the shell
+            # the person is actually looking at.
+            render.render_restore(entry, True, __version__,
+                                  recovery_dir=cfg.recovery_dir,
+                                  requested_id=getattr(a, "id", None))
+            return 0
+        if rc is not None:
+            print(render.c("The elevated attempt did not restore it either "
+                           f"(exit {rc}).", "red"))
+
     # Pass the ledger we searched: "not found" is unactionable without it, and
     # the recovery dir follows the project root, which follows the directory a
     # guard was started from.
-    render.render_restore(entry, ok, __version__,
+    render.render_restore(entry, result.ok, __version__,
                           recovery_dir=cfg.recovery_dir,
-                          requested_id=getattr(a, "id", None))
-    return 0 if ok else 1
+                          requested_id=getattr(a, "id", None),
+                          denied=result.denied, problem=result.problem)
+    return 0 if result.ok else 1
 
 
 def cmd_diff(a) -> int:
