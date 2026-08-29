@@ -95,10 +95,66 @@ import pytest as _pytest
 from demo_cli.cli import _SHELL_GUARD_SNIPPET
 
 
-def _fake_demo_cli(directory, body):
-    path = os.path.join(directory, "demo_cli")
-    with open(path, "w") as f:
+def _bash_for_this_platform():
+    """A bash that is running on THE PLATFORM UNDER TEST - or None.
+
+    shutil.which("bash") on Windows finds C:\\Windows\\System32\\bash.exe,
+    which is WSL. That is a LINUX kernel, a Linux filesystem and a Linux PATH.
+    These tests were therefore not testing Windows at all: they crossed into a
+    different operating system and reported the result as a Windows failure
+    (found 2026-08-29).
+
+    Worse, the crossing hid itself. Inside WSL the fixture's stub sits at a
+    Windows path that means nothing, so `command -v demo_cli` finds nothing,
+    the snippet's own gate never opens, and NO TRAP IS INSTALLED. A guard that
+    never loaded is indistinguishable from a guard correctly switched off - so
+    test_the_kill_switch_turns_the_guard_off PASSED, on a shell where the
+    guard could not possibly have run. A false pass is worse than a failure.
+
+    Measured on the machine, same command through each shell:
+
+        C:\\Windows\\System32\\bash.exe   Linux ... WSL2      demo_cli: not found
+        C:\\Program Files\\Git\\bin\\bash  MINGW64_NT ... Msys  /c/users/pc/.local/bin/demo_cli
+
+    Git Bash is also the one that matters: Claude Code's Bash tool on Windows
+    is Git Bash, so it is where !-mode actually runs.
+    """
+    if os.name != "nt":
+        return _shutil.which("bash")
+
+    for candidate in (r"C:\Program Files\Git\bin\bash.exe",
+                      r"C:\Program Files (x86)\Git\bin\bash.exe"):
+        if os.path.exists(candidate):
+            return candidate
+    git = _shutil.which("git")          # ...\Git\cmd\git.exe -> ...\Git\bin\bash.exe
+    if git:
+        cand = os.path.join(os.path.dirname(os.path.dirname(git)), "bin", "bash.exe")
+        if os.path.exists(cand):
+            return cand
+    found = _shutil.which("bash")
+    if found and "system32" not in found.lower():
+        return found
+    return None                          # WSL only: not a Windows bash
+
+
+BASH = _bash_for_this_platform()
+
+
+def _write_sh(path, body):
+    """newline="\n", always.
+
+    Python on Windows writes \r\n by default, and a CRLF shebang makes the
+    interpreter name "/bin/sh\r" - a file that does not exist. The script is
+    read by a POSIX shell, so it gets POSIX line endings whatever host wrote
+    it.
+    """
+    with open(path, "w", newline="\n") as f:
         f.write(body)
+    return path
+
+
+def _fake_demo_cli(directory, body):
+    path = _write_sh(os.path.join(directory, "demo_cli"), body)
     os.chmod(path, 0o755)
     return path
 
@@ -108,8 +164,7 @@ def guarded_shell(tmp_path):
     """A real bash with the real snippet installed, and a stub demo_cli."""
     binn = tmp_path / "bin"
     binn.mkdir()
-    script = tmp_path / "guard.sh"
-    script.write_text(_SHELL_GUARD_SNIPPET)
+    script = _write_sh(str(tmp_path / "guard.sh"), _SHELL_GUARD_SNIPPET)
 
     def run(stub_body, env_extra=None):
         _fake_demo_cli(str(binn), stub_body)
@@ -117,7 +172,7 @@ def guarded_shell(tmp_path):
         env["PATH"] = f"{binn}{os.pathsep}" + env["PATH"]
         env["BASH_ENV"] = str(script)
         env.update(env_extra or {})
-        return _subprocess.run(["bash", "-c", "rm -f /tmp/nonexistent-xyz; echo RAN"],
+        return _subprocess.run([BASH, "-c", "rm -f /tmp/nonexistent-xyz; echo RAN"],
                                capture_output=True, text=True, env=env, timeout=30)
     return run
 
@@ -127,7 +182,8 @@ BLOCKS = '#!/bin/sh\nif [ "$1" = "--version" ]; then echo 0.0; exit 0; fi\nexit 
 ALLOWS = '#!/bin/sh\nexit 0\n'
 
 
-@_pytest.mark.skipif(not _shutil.which("bash"), reason="needs bash")
+@_pytest.mark.skipif(BASH is None, reason="no bash for this platform "
+                                          "(WSL's bash is not Windows)")
 def test_a_broken_demo_cli_does_not_lock_the_shell(guarded_shell):
     """THE regression test. Every invocation fails, as it did when the package
     would not import - and the command must still run."""
@@ -136,7 +192,8 @@ def test_a_broken_demo_cli_does_not_lock_the_shell(guarded_shell):
     assert "not working" in r.stderr, "and it must say why"
 
 
-@_pytest.mark.skipif(not _shutil.which("bash"), reason="needs bash")
+@_pytest.mark.skipif(BASH is None, reason="no bash for this platform "
+                                          "(WSL's bash is not Windows)")
 def test_a_working_guard_still_blocks(guarded_shell):
     """The escape hatch must not become a hole: a guard that runs and refuses
     is still a refusal."""
@@ -145,7 +202,8 @@ def test_a_working_guard_still_blocks(guarded_shell):
     assert "blocked" in r.stderr
 
 
-@_pytest.mark.skipif(not _shutil.which("bash"), reason="needs bash")
+@_pytest.mark.skipif(BASH is None, reason="no bash for this platform "
+                                          "(WSL's bash is not Windows)")
 def test_the_kill_switch_turns_the_guard_off(guarded_shell):
     """`export` is a builtin matching no pattern in the pre-filter, so this
     still works from a shell that is otherwise stuck."""
@@ -154,7 +212,8 @@ def test_the_kill_switch_turns_the_guard_off(guarded_shell):
     assert "blocked" not in r.stderr
 
 
-@_pytest.mark.skipif(not _shutil.which("bash"), reason="needs bash")
+@_pytest.mark.skipif(BASH is None, reason="no bash for this platform "
+                                          "(WSL's bash is not Windows)")
 def test_an_allowing_guard_lets_the_command_through(guarded_shell):
     r = guarded_shell(ALLOWS)
     assert "RAN" in r.stdout
