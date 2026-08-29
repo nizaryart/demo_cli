@@ -12,6 +12,7 @@ import sys
 from typing import List, Optional
 
 from . import recovery, render
+from . import config as config_mod
 from .config import CONFIG_NAME, load_config
 from .context import Intent, normalize_env
 from .decide import CONTEXT_MISMATCH, ESCALATE
@@ -414,16 +415,23 @@ def cmd_doctor(a) -> int:
         checks.append(("warn", "config", "using defaults (run: demo_cli init)"))
 
     ws = cfg.workspace
-    writable = True
-    try:
-        os.makedirs(ws, exist_ok=True)
-        probe = os.path.join(ws, ".write_probe")
-        with open(probe, "w") as f:
-            f.write("ok")
-        os.remove(probe)
-    except Exception:
-        writable = False
-    checks.append(("ok" if writable else "fail", "workspace writable", ws))
+    # This check used to CREATE the workspace, parents and all. On a protected
+    # Windows project the parent is the mount point, so running doctor while
+    # the guard was down left a real directory there and the guard could never
+    # remount - the diagnostic bricking the thing it diagnosed (2026-08-29).
+    refused = config_mod.ensure_workspace(cfg)
+    if refused:
+        checks.append(("warn", "workspace", refused))
+    else:
+        writable = True
+        try:
+            probe = os.path.join(ws, ".write_probe")
+            with open(probe, "w") as f:
+                f.write("ok")
+            os.remove(probe)
+        except Exception:
+            writable = False
+        checks.append(("ok" if writable else "fail", "workspace writable", ws))
 
     pg = bool(shutil.which("pg_dump") and shutil.which("pg_restore"))
     checks.append(("ok" if pg else "warn", "postgres tools",
@@ -765,7 +773,8 @@ def cmd_mount(a) -> int:
     where ptrace does not exist. Everything written through the mount is
     intercepted below the syscall boundary, so obfuscation in the command text
     cannot route around it."""
-    from .fsmount import available, mount
+    from .fsmount import (available, clear_mountpoint, mount,
+                          mountpoint_obstruction)
     if not available():
         if os.name != "nt":
             print("The filesystem guard is Windows-only (WinFsp).")
@@ -776,10 +785,26 @@ def cmd_mount(a) -> int:
             print("  pipx inject demo-cli winfspy      (if demo_cli came from pipx)")
             print("  pip install winfspy               (otherwise)")
         return 1
-    if os.path.exists(a.mountpoint):
-        print(f"{a.mountpoint} already exists.")
+    # A leftover mount point must not be permanent. After a reboot the path
+    # can be a dangling reparse point, or an empty directory another demo_cli
+    # command conjured while the guard was down - neither holds any of the
+    # user's bytes, and refusing on both meant the logon task failed every
+    # boot with no route back but rmdir by hand. fsmount decides; this only
+    # reports and acts.
+    obstruction = mountpoint_obstruction(a.mountpoint)
+    if obstruction:
+        print(obstruction)
         print("WinFsp CREATES the mount point itself, so it must not exist yet.")
-        print("Pick a new path, e.g. a 'myproject-guarded' beside your project.")
+        print("Move or empty that path, or pick a new one.")
+        return 1
+    try:
+        if clear_mountpoint(a.mountpoint):
+            # Said out loud. Deleting a directory silently is precisely what
+            # this tool exists not to do, even when it is provably empty.
+            print(f"[fs] cleared a leftover mount point at {a.mountpoint}")
+    except OSError as e:
+        print(f"{a.mountpoint} could not be cleared: {e.strerror}")
+        print("Something is holding it open, or it is not empty after all.")
         return 1
     backing = getattr(a, "backing", None)
     if backing and not os.path.isdir(backing):
@@ -842,7 +867,10 @@ def _mount_detached(a, backing) -> int:
         print(f"  pid {existing.pid}.  Stop it with:  demo_cli unmount")
         return 1
 
-    os.makedirs(cfg.workspace, exist_ok=True)
+    refused = config_mod.ensure_workspace(cfg)
+    if refused:
+        print(f"Cannot prepare the guard's workspace: {refused}")
+        return 1
     log = mountstate.log_path(cfg)
 
     argv = [sys.executable, "-m", "demo_cli", "mount", a.mountpoint, "--foreground"]
@@ -1651,7 +1679,7 @@ def cmd_guarded(a) -> int:
         mitm = __import__("shutil").which("mitmdump")
         if mitm:
             log = os.path.join(cfg.workspace, "egress.log")
-            os.makedirs(cfg.workspace, exist_ok=True)
+            config_mod.ensure_workspace(cfg)
             here = os.path.dirname(os.path.abspath(__file__))
             env = dict(os.environ, DEMO_CLI_EGRESS_MODE=cfg.mode,
                        PYTHONPATH=os.path.dirname(here) + os.pathsep

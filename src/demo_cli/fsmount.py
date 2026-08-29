@@ -97,6 +97,93 @@ def absolute_target(mountpoint: Optional[str], virtual: str) -> str:
     return os.path.join(mountpoint, virtual.replace("/", os.sep))
 
 
+def mountpoint_obstruction(mountpoint: str,
+                           workspace_dir: str = ".demo_cli") -> Optional[str]:
+    """Why this path cannot be mounted over, or None if it is safe to clear.
+
+    WinFsp creates the mount point itself, so the path must NOT exist first.
+    The old check was `if os.path.exists(...): refuse`, which is right for a
+    directory holding somebody's work and wrong for the two cases that
+    actually occur after a reboot:
+
+      a dangling reparse point   a POINTER to a filesystem that is no longer
+                                 running. Removing it removes nothing; the
+                                 bytes are in the backing directory.
+      an empty leftover          a directory some other demo_cli command
+                                 conjured while the guard was down (see
+                                 config.ensure_workspace). Nothing of the
+                                 user's is inside it.
+
+    Both used to be permanent: the logon task refused, every boot, and the
+    only route back was rmdir by hand - which the person would have to know
+    was safe. Judgement belongs here, in the module that can be tested off
+    Windows, not in the .cmd file the scheduled task runs.
+
+    STRICTLY EMPTY, deliberately. A .demo_cli with anything in it holds
+    receipts and recovery points - the evidence the whole tool exists to
+    produce - so it is an obstruction like any other. This function's job is
+    to separate "nothing would be lost" from "something might be", and when it
+    cannot tell, it says so and the mount refuses.
+    """
+    if not os.path.lexists(mountpoint):
+        return None
+    if os.path.islink(mountpoint):
+        return None                      # a link holds no bytes of its own
+    if not os.path.isdir(mountpoint):
+        return f"{mountpoint} exists and is a file, not a directory"
+    try:
+        entries = os.listdir(mountpoint)
+    except OSError as e:
+        return f"{mountpoint} exists and cannot be read ({e.strerror})"
+
+    others = sorted(e for e in entries if e != workspace_dir)
+    if others:
+        shown = ", ".join(others[:4]) + (", ..." if len(others) > 4 else "")
+        return f"{mountpoint} already exists and contains: {shown}"
+    if workspace_dir in entries:
+        ws = os.path.join(mountpoint, workspace_dir)
+        try:
+            if os.listdir(ws):
+                return (f"{mountpoint} holds a non-empty {workspace_dir} - "
+                        f"receipts or recovery points live there")
+        except OSError as e:
+            return f"{ws} cannot be read ({e.strerror})"
+    return None
+
+
+def clear_mountpoint(mountpoint: str, workspace_dir: str = ".demo_cli") -> bool:
+    """Remove a mount point that mountpoint_obstruction() has cleared.
+
+    Returns True if something was removed. Callers MUST consult
+    mountpoint_obstruction first; this deletes without re-judging.
+
+    os.rmdir, never shutil.rmtree. rmdir refuses a directory that is not
+    empty, so if the judgement above were ever wrong this fails loudly instead
+    of taking a tree with it - the same reason schedule.py's script uses
+    `rmdir` and not `rmdir /s`.
+    """
+    if not os.path.lexists(mountpoint):
+        return False
+    if os.path.islink(mountpoint):
+        # A LINK IS REMOVED DIFFERENTLY ON EACH PLATFORM, and neither call
+        # follows it, so the backing directory is untouched either way.
+        # POSIX: unlink, even when it points at a directory - rmdir raises
+        # NotADirectoryError. Windows: a junction or directory symlink needs
+        # rmdir, and unlink raises. Caught by the test on Linux rather than
+        # assumed, which is how the four earlier platform-shaped assumptions
+        # in this project should have been found.
+        try:
+            os.unlink(mountpoint)
+        except OSError:
+            os.rmdir(mountpoint)
+        return True
+    ws = os.path.join(mountpoint, workspace_dir)
+    if os.path.isdir(ws):
+        os.rmdir(ws)
+    os.rmdir(mountpoint)
+    return True
+
+
 def config_anchor(mountpoint: str, backing: Optional[str] = None) -> str:
     """Which directory the mount's config and ledger are resolved from.
 

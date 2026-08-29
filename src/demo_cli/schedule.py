@@ -83,13 +83,18 @@ def status(project: str) -> TaskStatus:
 def register(project: str, backing: str, port_free_command: Optional[str] = None) -> bool:
     """Create (or replace) the logon task for one project.
 
-    The command it runs deletes a STALE REPARSE POINT first. If a shutdown
-    leaves the junction behind - untested as of writing, and the reason this
-    is here - the mount would refuse with "already exists" on every boot, and
-    the user would find a broken directory where their project used to be.
-    Deleting a dangling reparse point removes nothing: the bytes live in the
-    backing directory, and the junction is only a pointer to a filesystem that
-    is no longer running.
+    The script does nothing but call `demo_cli mount`, and that is the point.
+    Its first version tried to clear a stale mount point itself, in cmd.exe:
+    `if exist X rmdir X`, then refuse if anything remained. That refusal fired
+    on the first real reboot (2026-08-29) because an empty `.demo_cli` had been
+    left inside the mount point, so `rmdir` failed and the guard never came
+    back - every boot, with no route out but rmdir by hand.
+
+    Deciding what is safe to delete is judgement, and judgement written in a
+    batch file cannot be tested, cannot tell an empty leftover from somebody's
+    work, and cannot say why it refused. It now lives in
+    `fsmount.mountpoint_obstruction`, which is tested off Windows, and this
+    script is left with plumbing only - the same split as fsguard/fsmount.
     """
     if not available():
         return False
@@ -128,14 +133,6 @@ def register(project: str, backing: str, port_free_command: Optional[str] = None
     with open(script, "w", encoding="utf-8") as f:
         f.write("@echo off\r\n")
         f.write(f'echo [%DATE% %TIME%] starting >> "{log}"\r\n')
-        # rmdir, never rmdir /s: a dangling reparse point is a LINK, and
-        # removing it takes nothing with it. /s would delete a real tree.
-        f.write(f'if exist "{project}" rmdir "{project}" >> "{log}" 2>&1\r\n')
-        f.write(f'if exist "{project}" (\r\n')
-        f.write(f'  echo [ERROR] "{project}" still exists and is not empty - '
-                f'refusing to mount over it >> "{log}"\r\n')
-        f.write(f'  exit /b 1\r\n')
-        f.write(f')\r\n')
         f.write(f'"{exe}" mount "{project}" --backing "{backing}" >> "{log}" 2>&1\r\n')
 
     r = _run(["schtasks", "/create", "/tn", task_name(project),

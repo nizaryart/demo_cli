@@ -146,6 +146,43 @@ class Config:
         return t.env if t else None
 
 
+def ensure_workspace(cfg) -> Optional[str]:
+    """Create <project_root>/.demo_cli, or say why it must not be created.
+
+    Returns None on success, otherwise the reason - never raises, because
+    every caller is a command that has other work to do.
+
+    --------------------------------------------------------------------
+    WHY A GUARD IN FRONT OF ONE makedirs CALL
+    --------------------------------------------------------------------
+    `os.makedirs(cfg.workspace, exist_ok=True)` creates the PARENTS too. When
+    the project root does not exist, that quietly invents it - and on Windows
+    a protected project's root is a MOUNT POINT that only exists while the
+    guard is running. So any demo_cli command run while the guard was down
+    left a real directory where the mount point belongs, and WinFsp will not
+    mount over an existing directory. The guard could then never come back.
+
+    Observed 2026-08-29 on the Windows project "demo". After a reboot, the
+    logon task refused with "still exists and is not empty". The culprit was
+    `demo_cli doctor` - the workspace-writable check - so the diagnostic
+    bricked the thing it was diagnosing, and the directory's own timestamps
+    are what proved it.
+
+    The rule is general rather than Windows-shaped: a workspace under a path
+    that does not exist is not this project's workspace, it is a new
+    directory. Refusing costs one warning line; the alternative cost a
+    filesystem guard that could not restart.
+    """
+    root = cfg.project_root
+    if not os.path.isdir(root):
+        return f"{root} does not exist - not creating it"
+    try:
+        os.makedirs(cfg.workspace, exist_ok=True)
+    except OSError as e:
+        return f"{cfg.workspace} could not be created ({e.strerror})"
+    return None
+
+
 def find_project_root(start: Optional[str] = None) -> str:
     """Walk up from `start` looking for a .demo_cli.toml or a .git directory.
     Falls back to CLAUDE_PROJECT_DIR, then the start directory."""
