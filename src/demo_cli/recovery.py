@@ -713,7 +713,18 @@ def _max_snapshot_bytes() -> int:
     return int(mb * 1024 * 1024)
 
 
-def _dir_size(path: str, cap: int, ignore_dirs=None) -> int:
+def _contains(outer: str, inner: str) -> bool:
+    """Is `inner` at or underneath `outer`? Absolute, normalised, and it never
+    raises - commonpath throws on paths from different drives, which on
+    Windows is a legitimate answer of "no", not an error."""
+    try:
+        outer, inner = os.path.abspath(outer), os.path.abspath(inner)
+        return outer == inner or os.path.commonpath([outer, inner]) == outer
+    except ValueError:
+        return False
+
+
+def _dir_size(path: str, cap: int, ignore_dirs=None, skip_path=None) -> int:
     """Sum file sizes under `path`, ignoring the same noise as the copy, and
     short-circuiting as soon as `cap` is exceeded (so we never walk a huge tree
     just to find out it is huge).
@@ -729,7 +740,9 @@ def _dir_size(path: str, cap: int, ignore_dirs=None) -> int:
     ignore = IGNORED_DIRS if ignore_dirs is None else frozenset(ignore_dirs)
     total = 0
     for root, dirs, files in os.walk(path):
-        dirs[:] = [d for d in dirs if d not in ignore]
+        dirs[:] = [d for d in dirs if d not in ignore
+                   and not (skip_path and _contains(skip_path,
+                                                    os.path.join(root, d)))]
         for f in files:
             try:
                 total += os.path.getsize(os.path.join(root, f))
@@ -779,10 +792,38 @@ def snapshot(target: Optional[Target], recovery_dir: str, strategy: str = "snaps
         # Honesty + safety: refuse to "recover" a tree we cannot copy quickly.
         # The measurement and the copy must skip the SAME directories, or the
         # cap does not bound anything - see _dir_size.
-        ignore = _IGNORE if ignore_dirs is None else \
-            shutil.ignore_patterns(*sorted(ignore_dirs))
+        # NEVER COPY A TREE INTO ITSELF.
+        #
+        # The destination lives in recovery_dir. When the target IS the
+        # workspace - `rm -rf .demo_cli`, an ordinary-looking command an agent
+        # can issue - recovery_dir sits INSIDE ref, and copytree copies the
+        # tree it is growing. Observed 2026-08-29: fifteen levels of
+        # .demo_cli/recovery/....snapdir/recovery/....snapdir, stopped only by
+        # Windows MAX_PATH, and `rm -rf` could not reach the bottom to clean it.
+        #
+        # _IGNORE does not cover this. It skips directories NAMED .demo_cli;
+        # here .demo_cli is the source and the child being copied is named
+        # `recovery`. The name-based list cannot see the collision - only the
+        # absolute path can.
+        #
+        # The size cap does not cover it either: _dir_size measures BEFORE the
+        # copy, and the growth happens during it. A guard whose recovery path
+        # is a denial of service against itself is worse than one that
+        # declines, so this is checked, not bounded.
+        if _contains(recovery_dir, ref):
+            return None          # snapshotting a backup into the backup store
+        names = IGNORED_DIRS if ignore_dirs is None else frozenset(ignore_dirs)
+        skip = recovery_dir if _contains(ref, recovery_dir) else None
+
+        def ignore(dirpath, entries):
+            out = {e for e in entries if e in names}
+            if skip:
+                out |= {e for e in entries
+                        if _contains(skip, os.path.join(dirpath, e))}
+            return out
+
         cap = _max_snapshot_bytes()
-        if _dir_size(ref, cap, ignore_dirs) > cap:
+        if _dir_size(ref, cap, ignore_dirs, skip_path=skip) > cap:
             return None
         snap = os.path.join(recovery_dir, f"{os.path.basename(ref.rstrip('/'))}.{ts}.{rid}.snapdir")
         shutil.copytree(ref, snap, dirs_exist_ok=True, ignore=ignore)
