@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import tempfile
 import sys
 from typing import List, Optional
 
@@ -1425,109 +1426,200 @@ def cmd_setup(a) -> int:
     return 0
 
 
+def _teardown_admin_steps(project: str, cfg) -> List[dict]:
+    """The three teardown steps that need Administrator, as data.
+
+    Returned rather than printed, because on Windows these run inside an
+    ELEVATED CHILD whose console closes with it. The parent renders them into
+    the shell the person is actually looking at. Same problem `undo` has, and
+    the same reason mount.log exists: anything that runs where you cannot see
+    it must write down what it did.
+    """
+    from . import mountstate, protect as protect_mod, schedule
+    out: List[dict] = []
+
+    st = mountstate.status(cfg)
+    if st.running:
+        try:
+            import signal
+            os.kill(st.pid, signal.SIGTERM)
+            mountstate.clear(cfg)
+            out.append({"n": 1, "ok": True, "text": f"stopped the filesystem guard (pid {st.pid})"})
+        except Exception as exc:
+            # DO NOT clear the record. The guard is still running; erasing our
+            # note of it would leave a live process nobody can see - doctor
+            # would report "not recorded" while a filesystem is being served.
+            out.append({"n": 1, "ok": False,
+                        "text": f"could not stop the filesystem guard (pid {st.pid})",
+                        "detail": [str(exc), "The record is KEPT so the guard stays visible."],
+                        "remedy": f"demo_cli unmount --root {cfg.project_root}"})
+            return out               # nothing below can succeed while it runs
+    else:
+        mountstate.clear(cfg)
+        out.append({"n": 1, "ok": True, "text": "filesystem guard not running"})
+
+    # "Absent" and "removed" are different facts, and reporting the first as
+    # the second is how a teardown looks complete while leaving things behind.
+    had = schedule.status(project).exists
+    if not had:
+        out.append({"n": 2, "ok": True, "text": "no logon task was registered for this project"})
+    else:
+        schedule.unregister(project)
+        still = schedule.status(project).exists
+        if not still:
+            out.append({"n": 2, "ok": True, "text": "removed the logon task"})
+        else:
+            # This line used to be four words with no cause and no remedy,
+            # while step 1 above named the pid, the reason and the command.
+            # The task survived a "successful" teardown on 2026-08-29 and
+            # would have fired at every logon, mounting a backing that had
+            # just been moved away - silently, forever.
+            out.append({"n": 2, "ok": False, "text": "could not remove the logon task",
+                        "detail": [f"it is still registered as: {schedule.task_name(project)}",
+                                   "it will run at every logon and fail, because the "
+                                   "backing it mounts has been moved back"],
+                        "remedy": f'schtasks /delete /tn "{schedule.task_name(project)}" /f'})
+
+    backing = protect_mod.backing_for(project)
+    if not os.path.isdir(backing):
+        out.append({"n": 3, "ok": True, "text": "project was not protected"})
+        return out
+
+    if os.path.lexists(project):        # the junction must go or the rename has nowhere to land
+        try:
+            os.rmdir(project)
+        except OSError:
+            pass
+    plan = protect_mod.plan_unprotect(project)
+    if not plan.ok:
+        out.append({"n": 3, "ok": False, "text": "could not restore your files",
+                    "detail": plan.problems,
+                    "remedy": f"demo_cli unprotect {project}"})
+        return out
+    try:
+        for line in protect_mod.unprotect(plan):
+            pass
+        out.append({"n": 3, "ok": True, "text": "your files were moved back",
+                    "detail": [f"now at {project}"]})
+    except (PermissionError, OSError) as exc:
+        out.append({"n": 3, "ok": False, "text": "could not restore your files",
+                    "detail": [str(exc), f"they are safe at {backing}"],
+                    "remedy": f"demo_cli unprotect {project}"})
+    return out
+
+
+def _teardown_needs_admin(project: str, cfg) -> bool:
+    from . import mountstate, protect as protect_mod, schedule
+    return bool(mountstate.status(cfg).running
+                or schedule.status(project).exists
+                or os.path.isdir(protect_mod.backing_for(project)))
+
+
+def cmd_teardown_admin(a) -> int:
+    """(internal) The elevated half of teardown. Writes its results as JSON so
+    the unelevated parent can render them; its own console closes with it."""
+    project = os.path.abspath(a.project)
+    steps = _teardown_admin_steps(project, load_config(project))
+    try:
+        with open(a.report, "w", encoding="utf-8") as f:
+            json.dump(steps, f)
+    except OSError:
+        return 2
+    return 0 if all(x["ok"] for x in steps) else 1
+
+
+def _show_step(x: dict) -> None:
+    _step(x["n"], x["text"] if x["ok"] else render.c(x["text"], "yellow"))
+    for line in x.get("detail") or []:
+        print("      " + render.c(line, "dim"))
+    if x.get("remedy"):
+        print("      " + render.c("fix it with:  " + x["remedy"], "dim"))
+
+
 def cmd_teardown(a) -> int:
     """Remove everything setup added, in reverse, on a machine in any state.
 
     It never refuses to continue because a step was already done. A teardown
     that only works when everything is healthy is not a way out - and the
     moment somebody reaches for it is usually the moment something is broken.
+
+    ONE UAC PROMPT, UP FRONT. Three of the four steps need Administrator - the
+    mount runs elevated, the logon task is /rl highest, and the backing is
+    locked to Administrators. The first version discovered that one step at a
+    time: it stopped, told you to open an admin shell, and asked you to re-run.
+    Tearing down `demo` on 2026-08-29 took THREE invocations across two shells,
+    and still left the logon task registered. Teardown is what somebody reaches
+    for when things are already wrong; it is the last place to make them
+    assemble the fix themselves.
     """
-    from . import mountstate, protect as protect_mod, schedule
+    from . import protect as protect_mod
 
     project = os.path.abspath(getattr(a, "project", None) or os.getcwd())
     print(render.c(f"\ndemo_cli {__version__}  teardown  ->  {project}\n", "dim"))
+
+    cfg = load_config(project)
+    needs_admin = os.name == "nt" and _teardown_needs_admin(project, cfg)
+
+    # Nothing here at all is a WRONG TARGET, not a clean teardown. Four
+    # "nothing to do" lines for a path that does not exist read as success and
+    # send somebody away while their real project is still mounted and locked
+    # (observed 2026-08-29: `demo_cli teardown demo` run one directory up).
+    if not needs_admin and not os.path.isdir(project) and not _any_hook_installed(cfg):
+        print(render.c(f"  {project} does not exist, and nothing is registered "
+                       f"for it.", "red"))
+        print(render.c("  Nothing was torn down. Did you mean an absolute path?\n", "dim"))
+        return 1
+
     if not getattr(a, "yes", False):
         print("  This removes the hooks, the logon task, and moves your files back.")
         if input("  Type 'yes' to continue: ").strip().lower() != "yes":
             print("  Nothing was changed.\n")
             return 1
 
-    cfg = load_config(project)
-
-    st = mountstate.status(cfg)
-    if st.running:
-        _step(1, f"stopping the filesystem guard (pid {st.pid})")
+    steps: List[dict] = []
+    if os.name != "nt":
+        steps = _teardown_admin_steps(project, cfg)
+    elif protect_mod.is_elevated():
+        steps = _teardown_admin_steps(project, cfg)
+    elif needs_admin:
+        print(render.c("  [demo_cli] stopping the guard, removing the logon task and "
+                       "moving your files back all need Administrator; asking once.",
+                       "yellow"))
+        report = os.path.join(tempfile.gettempdir(),
+                              f"demo_cli-teardown-{os.getpid()}.json")
+        rc = protect_mod.rerun_elevated(["_teardown-admin", project, "--report", report])
         try:
-            import signal
-            os.kill(st.pid, signal.SIGTERM)
-            mountstate.clear(cfg)
-            print("      " + render.c("stopped", "green"))
+            with open(report, encoding="utf-8") as f:
+                steps = json.load(f)
+            os.unlink(report)
         except Exception:
-            # DO NOT clear the record. The guard is still running; erasing our
-            # note of it would leave a live process nobody can see - doctor
-            # would report "not recorded" while a filesystem is being served.
-            # Losing track of a running process is worse than leaving a record.
-            print("      " + render.c(
-                "could not stop it (it runs elevated). The record is KEPT so "
-                "the guard stays visible.", "yellow"))
-            print("      From an Administrator shell:  demo_cli unmount --root "
-                  + cfg.project_root)
-            print("      Then re-run this teardown.")
-            return 1
+            steps = [{"n": 1, "ok": False,
+                      "text": "the elevated teardown did not report back"
+                              + ("" if rc is not None else " (elevation refused)"),
+                      "remedy": f"demo_cli teardown {project}   (from an Administrator shell)"}]
     else:
-        _step(1, "filesystem guard not running")
-        mountstate.clear(cfg)
+        steps = _teardown_admin_steps(project, cfg)
 
-    if os.name == "nt":
-        # "Absent" and "removed" are different facts, and reporting the first
-        # as the second is how a teardown looks complete while leaving things
-        # behind on some other path.
-        had_task = schedule.status(project).exists
-        ok = schedule.unregister(project)
-        _step(2, "removed the logon task" if (had_task and ok)
-                 else "could not remove the logon task" if had_task
-                 else "no logon task was registered for this project")
+    for x in steps:
+        _show_step(x)
 
-        backing = protect_mod.backing_for(project)
-        if os.path.isdir(backing):
-            # The junction must go first or the rename has nowhere to land.
-            if os.path.lexists(project):
-                try:
-                    os.rmdir(project)
-                except OSError:
-                    pass
-            plan = protect_mod.plan_unprotect(project)
-            if not plan.ok:
-                _step(3, "could not restore: " + "; ".join(plan.problems))
-            elif not protect_mod.is_elevated():
-                # Ask for elevation BEFORE trying. The backing is locked to
-                # Administrators, so an unelevated rename fails - and the
-                # earlier version discovered that by crashing, having already
-                # unlocked nothing and moved nothing.
-                _step(3, "restoring your files (requires administrator rights)")
-                rc = protect_mod.rerun_elevated(["unprotect", project, "--yes"])
-                if rc == 0:
-                    print("      " + render.c("files moved back", "green"))
-                else:
-                    print("      " + render.c(
-                        "elevation refused or failed - your files are safe at "
-                        + protect_mod.backing_for(project), "yellow"))
-                    print("      From an Administrator shell:  demo_cli unprotect "
-                          + project)
-            else:
-                try:
-                    for line in protect_mod.unprotect(plan):
-                        print("      " + render.c(line, "green"))
-                    _step(3, "files moved back")
-                except PermissionError as exc:
-                    _step(3, render.c(str(exc), "red"))
-        else:
-            # A protected project is often a SUBDIRECTORY of where the user is
-            # standing - `lab` holds `myproj`, and teardown run from `lab`
-            # looked for `lab.real`, found nothing, and said "not protected"
-            # while myproj.real sat next to it. Say what we actually found.
-            nearby = _protected_children(project)
-            if nearby:
-                _step(3, "this directory is not protected, but these are:")
-                for child in nearby:
-                    print(f"      {child}")
-                print(f"      {render.c('run: demo_cli teardown ' + nearby[0], 'dim')}")
-            else:
-                _step(3, "project was not protected")
-
+    # Hooks are the user's own config files and need no elevation, so they are
+    # removed HERE rather than in the elevated child - an elevated process is
+    # the wrong thing to be editing a user profile with.
     removed = _remove_hooks(project)
-    _step(4, f"removed hooks: {', '.join(removed)}" if removed
-             else "no hooks to remove")
+    steps.append({"n": 4, "ok": True,
+                  "text": f"removed hooks: {', '.join(removed)}" if removed
+                          else "no hooks to remove"})
+    _show_step(steps[-1])
+
+    failed = [x for x in steps if not x["ok"]]
+    if failed:
+        # A teardown that ends on the cheerful audit-trail note while two
+        # steps failed is the same lie as "installed" when nothing is active.
+        print(render.c(f"\n  {len(failed)} step(s) did not complete: "
+                       + ", ".join(str(x["n"]) for x in failed), "red"))
+        print(render.c("  Re-run this teardown once you have dealt with them.\n", "dim"))
+        return 1
 
     print(f"\n  {render.c('The config and receipts are left in place - they are ', 'dim')}"
           f"{render.c('your audit trail.', 'dim')}")
@@ -2000,6 +2092,12 @@ def build_parser() -> argparse.ArgumentParser:
     td.add_argument("project", nargs="?", help="the project (default: current directory)")
     td.add_argument("--yes", action="store_true", help="skip confirmations")
     td.set_defaults(func=cmd_teardown)
+
+    ta = sub.add_parser("_teardown-admin", parents=[common],
+                        help=argparse.SUPPRESS)
+    ta.add_argument("project")
+    ta.add_argument("--report", required=True)
+    ta.set_defaults(func=cmd_teardown_admin)
 
     rt = sub.add_parser("_register-task", parents=[common],
                         help=argparse.SUPPRESS)
