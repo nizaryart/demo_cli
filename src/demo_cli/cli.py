@@ -978,8 +978,16 @@ def _mount_detached(a, backing) -> int:
         # wrong and shows nothing, because the child's output is redirected to
         # mount.log.
         CREATE_NO_WINDOW = 0x08000000
-        kwargs["creationflags"] = (DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
-                                   | CREATE_NO_WINDOW)
+        # CREATE_NO_WINDOW, *not* combined with DETACHED_PROCESS. Windows
+        # documents CREATE_NO_WINDOW as IGNORED when DETACHED_PROCESS or
+        # CREATE_NEW_CONSOLE is also set - so stacking them threw away the one
+        # flag we added to suppress the window, and the guard ran with a
+        # visible console for its whole life. A window that lives forever is a
+        # window somebody eventually closes, and closing it kills the guard.
+        # CREATE_NO_WINDOW still gives the child its own (invisible) console,
+        # so a Ctrl+C in the parent's console does not reach it.
+        kwargs["creationflags"] = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+        _ = DETACHED_PROCESS
     else:
         kwargs["start_new_session"] = True
 
@@ -987,10 +995,23 @@ def _mount_detached(a, backing) -> int:
         proc = subprocess.Popen(argv, stdout=fh, stderr=fh,
                                 stdin=subprocess.DEVNULL, **kwargs)
 
-    # Give it long enough to fail loudly. A mount that dies immediately - a
-    # mount point that already exists, WinFsp not installed - must not be
-    # reported as started.
-    time.sleep(2.0)
+    # WAIT FOR THE MOUNT POINT, not for a fixed number of seconds. Two seconds
+    # was a guess: on a slow machine the child is still importing when it
+    # expires, so poll() returns None, and the parent reports a guard that has
+    # not started - `Last Result: 0` with nothing mounted (2026-08-29).
+    # --no-wait: return as soon as the child is spawned.
+    #
+    # THE SCHEDULED TASK USES IT, and nothing else should. Its .cmd owns a
+    # console window that stays open for as long as this process runs, so
+    # waiting here would park a window on the user's desktop for minutes at
+    # every logon. Setup does the waiting instead, in the shell the person is
+    # looking at, where progress is wanted rather than alarming.
+    if getattr(a, "no_wait", False):
+        mounted = proc.poll() is None
+    else:
+        mounted = _wait_until(
+            lambda: proc.poll() is not None or os.path.lexists(a.mountpoint),
+            timeout=WAIT_MOUNT, label="waiting for the guard to come up")
     if proc.poll() is not None:
         print(render.c("The filesystem guard exited immediately.", "red"))
         print(f"  see {log}")
@@ -1002,6 +1023,11 @@ def _mount_detached(a, backing) -> int:
             pass
         return 1
 
+    if not mounted:
+        print(render.c(f"The guard is still starting after {int(WAIT_MOUNT)}s "
+                       f"(pid {proc.pid}); it is not reported as running yet.",
+                       "yellow"))
+        print(f"  watch {log}")
     mountstate.write(cfg, proc.pid, os.path.abspath(a.mountpoint), backing)
     print(render.c(f"\ndemo_cli {__version__}  filesystem guard running\n", "dim"))
     print(render.kv("mounted at", os.path.abspath(a.mountpoint)))
@@ -1376,15 +1402,26 @@ def cmd_setup(a) -> int:
         if _ms.status(load_config(project)).running:
             _step(5, "filesystem guard already running")
         elif schedule.run_now(project):
-            import time
-            for _ in range(15):
-                time.sleep(0.4)
-                if _ms.status(load_config(project)).running:
-                    break
-            _step(5, "started the filesystem guard"
-                     if _ms.status(load_config(project)).running else
-                     "asked the task to start the guard - it has not reported "
-                     "in yet; check `demo_cli doctor` in a moment")
+            # The old wait here was 15 x 0.4s. Six seconds, silent - and this
+            # machine took closer to four minutes between `schtasks /run` and
+            # a live mount, so setup reported "not mounted" about a guard that
+            # was still starting, and we spent an hour debugging a success.
+            _step(5, "starting the filesystem guard")
+            up = _wait_until(lambda: _ms.status(load_config(project)).running,
+                             timeout=WAIT_MOUNT,
+                             label="waiting for the guard")
+            if up:
+                print("      " + render.c("the filesystem guard is running", "green"))
+            else:
+                # NOT "failed". We do not know that. Saying so would be the
+                # same unearned certainty as reporting a mount that is not up.
+                print("      " + render.c(
+                    f"still starting after {int(WAIT_MOUNT)}s. It may yet come "
+                    f"up - check:  demo_cli doctor --root {project}", "yellow"))
+                log = os.path.join(protect_mod.backing_for(project),
+                                   ".demo_cli", "mount.log")
+                print("      " + render.c(f"if not, the reason is in {log} "
+                                          f"(needs an Administrator shell)", "dim"))
         else:
             _step(5, "could not start the guard now. It will come up at your "
                      "next logon, or run: demo_cli mount (elevated)")
@@ -1426,6 +1463,60 @@ def cmd_setup(a) -> int:
     return 0
 
 
+WAIT_MOUNT = 240.0        # a guard coming up
+WAIT_UNMOUNT = 120.0      # a guard letting go
+
+
+def _wait_until(check, timeout: float = WAIT_MOUNT, interval: float = 0.5,
+                label: Optional[str] = None) -> bool:
+    """Poll until check() is true. Returns whether it happened in time.
+
+    --------------------------------------------------------------------
+    THE SAME BUG IN THREE PLACES
+    --------------------------------------------------------------------
+    Every one of these assumed a state transition had completed because the
+    call that started it returned:
+
+      _mount_detached          sleep(2), then assume the child started
+      setup step 5             schtasks /run returned, so assume the guard is up
+      teardown step 1 -> 3     the kill returned, so assume the mount is gone
+
+    All three are wrong, and on 2026-08-29 all three fired on the same machine
+    in one evening. Setup reported "protected but not mounted" about a guard
+    that came up three minutes later; teardown's rename hit ERROR_ACCESS_DENIED
+    because WinFsp still held the directory a fraction of a second after the
+    kill - and that error code is indistinguishable from a permissions
+    failure, so the message blamed the ACL.
+
+    Starting something is not the same as it having started. The only honest
+    test is to look at the thing itself.
+
+    WHY IT PRINTS. Setup's old wait was 15 x 0.4s - six seconds, silent. The
+    machine needed four minutes, and silence is what made a slow success read
+    as a failure to both of us for an hour. A progress line costs nothing and
+    removes the whole class of misreading.
+
+    The timeout is a CEILING, not a wait: a fast machine returns on the first
+    poll. It is generous because a slow one is not broken.
+    """
+    import time
+    start = time.monotonic()
+    shown = 0.0
+    while True:
+        try:
+            if check():
+                return True
+        except Exception:
+            pass                       # a check that raises is just "not yet"
+        elapsed = time.monotonic() - start
+        if elapsed >= timeout:
+            return False
+        if label and elapsed - shown >= 5.0:
+            shown = elapsed
+            print(f"      {label}... {int(elapsed)}s", flush=True)
+        time.sleep(interval)
+
+
 def _teardown_admin_steps(project: str, cfg) -> List[dict]:
     """The three teardown steps that need Administrator, as data.
 
@@ -1444,7 +1535,19 @@ def _teardown_admin_steps(project: str, cfg) -> List[dict]:
             import signal
             os.kill(st.pid, signal.SIGTERM)
             mountstate.clear(cfg)
-            out.append({"n": 1, "ok": True, "text": f"stopped the filesystem guard (pid {st.pid})"})
+            # WinFsp does not let go the instant the process is signalled, and
+            # step 3's rename of a directory it still holds fails with
+            # ERROR_ACCESS_DENIED - the same code as a permissions failure, so
+            # the message blamed the ACL and told the user to do what they
+            # were already doing (2026-08-29).
+            gone = _wait_until(
+                lambda: not mountstate.pid_alive(st.pid)
+                and not os.path.lexists(st.mountpoint or project),
+                timeout=WAIT_UNMOUNT, label="waiting for the guard to let go")
+            out.append({"n": 1, "ok": True,
+                        "text": f"stopped the filesystem guard (pid {st.pid})"
+                                + ("" if gone else " - it has not released the "
+                                   "mount point yet; re-run teardown")})
         except Exception as exc:
             # DO NOT clear the record. The guard is still running; erasing our
             # note of it would leave a live process nobody can see - doctor
@@ -2062,6 +2165,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="a path that does NOT yet exist (WinFsp creates it), "
                          "or a drive letter like X: (a directory is preferred - "
                          "Claude Code will not use a bare drive root as its cwd)")
+    mt.add_argument("--no-wait", action="store_true", help=argparse.SUPPRESS)
     mt.add_argument("--backing", metavar="DIR",
                     help="directory holding the real files (STAGE 2). Without "
                          "it the mount is in memory and its contents are LOST "

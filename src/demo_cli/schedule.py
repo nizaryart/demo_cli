@@ -130,10 +130,18 @@ def register(project: str, backing: str, port_free_command: Optional[str] = None
     script = os.path.join(home, f"autostart-{slug}.cmd")
     log = os.path.join(home, f"autostart-{slug}.log")
 
-    with open(script, "w", encoding="utf-8") as f:
+    # newline="" so Python does NOT translate. The lines below already end
+    # \r\n; in text mode Windows turns each of those into \r\r\n, and the
+    # file cmd.exe was handed had a doubled carriage return on every line.
+    with open(script, "w", encoding="utf-8", newline="") as f:
         f.write("@echo off\r\n")
+        # Python block-buffers stdout when it is redirected to a file, so the
+        # mount's output - including the reason it failed - could sit unwritten
+        # in an 8 KB buffer while we stared at an empty log (2026-08-29).
+        f.write("set PYTHONUNBUFFERED=1\r\n")
         f.write(f'echo [%DATE% %TIME%] starting >> "{log}"\r\n')
-        f.write(f'"{exe}" mount "{project}" --backing "{backing}" >> "{log}" 2>&1\r\n')
+        f.write(f'"{exe}" mount "{project}" --backing "{backing}" '
+                f'--no-wait >> "{log}" 2>&1\r\n')
 
     r = _run(["schtasks", "/create", "/tn", task_name(project),
               "/tr", f'"{script}"', "/sc", "onlogon", "/rl", "highest", "/f"])
