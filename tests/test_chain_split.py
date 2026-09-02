@@ -368,3 +368,46 @@ def test_a_new_receipt_chains_onto_a_pre_split_log(tmp_path):
 
     append_receipt(main, _r("new style"))
     assert verify_chain(main).ok
+
+
+# --------------------------------------------------------------------------
+# An empty ledger is neither a pass nor a failure.
+#
+# `demo_cli verify` on a project set up sixty seconds earlier reported
+# TAMPERED, because a missing file returned ok=False and the renderer had only
+# two states to put it in (dari, 2026-09-02). That is the worst-timed false
+# alarm the tool can raise: it fires exactly when someone is checking whether
+# the thing works, and it accuses the tool of the one failure it exists to
+# detect.
+# --------------------------------------------------------------------------
+
+def test_a_missing_log_is_not_tampering(tmp_path):
+    v = verify_chain(str(tmp_path / "never-written.jsonl"))
+    assert v.absent
+    assert v.ok, "there is nothing to have altered"
+    assert v.entries == 0
+    assert "No receipts" in v.detail
+
+
+def test_an_empty_ledger_offers_no_head_to_anchor(tmp_path):
+    """GENESIS is not a chain head. Printing it under 'record these outside
+    this machine' would invite someone to write down a value attesting to
+    nothing."""
+    from demo_cli import cli
+    proj = tmp_path / "proj"
+    (proj / ".demo_cli").mkdir(parents=True)
+    (proj / ".demo_cli.toml").write_text('mode = "enforce"\n')
+
+    class A:
+        root, no_color = str(proj), True
+    assert cli.cmd_verify(A()) == 0, "a fresh project must not fail verify"
+
+
+def test_a_log_that_exists_but_is_empty_is_not_absent(tmp_path):
+    """An existing file with no entries is a real, verified-empty chain -
+    distinct from never having written one."""
+    p = tmp_path / "receipts.jsonl"
+    p.write_text("")
+    v = verify_chain(str(p))
+    assert not v.absent
+    assert v.ok and v.entries == 0

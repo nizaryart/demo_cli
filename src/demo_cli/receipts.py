@@ -385,6 +385,10 @@ class VerifyResult:
     # but not the line immediately before them. See verify_chain.
     out_of_order: List[int] = field(default_factory=list)
     ledger: Optional[str] = None      # which file this result describes
+    # No log at all. NOT an integrity failure - there is nothing to have
+    # altered - but not evidence of protection either, so it gets its own
+    # state rather than being folded into either neighbour.
+    absent: bool = False
 
     @property
     def damaged(self) -> bool:
@@ -404,7 +408,20 @@ def verify_chain(path: str) -> VerifyResult:
     that was edited, inserted, removed or reordered.
     """
     if not os.path.exists(path):
-        return VerifyResult(ok=False, detail="No receipt log found yet.")
+        # A LOG THAT DOES NOT EXIST HAS NOT BEEN TAMPERED WITH.
+        #
+        # This used to return ok=False, which `verify` rendered as TAMPERED -
+        # so a freshly set-up project, seconds old and working perfectly,
+        # was told its audit trail had been altered (dari, 2026-09-02). That
+        # is a false alarm of the worst kind: it fires exactly when someone is
+        # checking whether the tool works, and it accuses the tool of the one
+        # thing it exists to detect.
+        #
+        # Reported as its own state instead. Not a failure - and not a pass
+        # either, which is why `absent` is set and the renderer says plainly
+        # that nothing has been recorded.
+        return VerifyResult(ok=True, absent=True, ledger=path,
+                            detail="No receipts recorded yet.")
 
     rows = []
     damaged: List[int] = []

@@ -218,10 +218,13 @@ def cmd_verify(a) -> int:
     from .receipts import verify_cross_links
     links = verify_cross_links(main_path, fs_path) if fs is not None else None
 
+    # No head for an empty ledger - GENESIS is not something to anchor, and
+    # printing it as if it were a chain head would invite someone to record a
+    # value that attests to nothing.
     heads = {}
-    if v.ok:
+    if v.ok and not v.absent:
         heads["main"] = v.head
-    if fs is not None and fs.ok:
+    if fs is not None and fs.ok and not fs.absent:
         heads["fs"] = fs.head
     render.render_verify(v, __version__, fs=fs, heads=heads or None, links=links)
 

@@ -34,6 +34,9 @@ _DECISION_COLOR = {
     # edited. Colouring it like tampering would say with the palette what the
     # wording is careful not to say.
     "DAMAGED": "yellow", "OUT OF ORDER": "yellow",
+    # Dim, not green: an empty ledger is not a passed integrity check, and
+    # colouring it like one would tell the reader they are covered.
+    "NO RECEIPTS": "dim",
 }
 _TONE_COLOR = {"add": "green", "del": "red", "mod": "yellow", "meta": "cyan", "info": "dim"}
 
@@ -201,6 +204,8 @@ def _verify_block(name: str, v: VerifyResult) -> List[str]:
               verifier asserting something it cannot know.
     TAMPERED  a line parses but its hash or link is wrong. Content changed.
     """
+    if v.absent:
+        return ["  " + c(f"{name:<12} no receipts recorded yet", "dim")]
     if v.reordered and not v.broken_at:
         # NOT "TAMPERED". Every referenced receipt is present; only the order
         # is wrong. Saying an entry was removed when it is demonstrably still
@@ -242,7 +247,9 @@ def render_verify(v: VerifyResult, version: str, fs: Optional[VerifyResult] = No
     ok = v.ok and (fs.ok if fs else True) and (links.ok if links else True)
     damaged = v.damaged or (fs.damaged if fs else False)
     reordered = v.reordered or (fs.reordered if fs else False)
-    if ok:
+    if v.absent and (fs is None or fs.absent):
+        label = "NO RECEIPTS"
+    elif ok:
         label = "DAMAGED" if damaged else "VERIFIED"
     else:
         label = "OUT OF ORDER" if reordered and not v.broken_at else "TAMPERED"
@@ -267,7 +274,15 @@ def render_verify(v: VerifyResult, version: str, fs: Optional[VerifyResult] = No
             lines.append("             " + c(
                 "a receipt references a hash absent from the other chain - "
                 "entries were removed", "red"))
-    if v.ok:
+    if v.absent and (fs is None or fs.absent):
+        # SAY WHAT THIS IS NOT. "verify" exiting 0 on an empty ledger could be
+        # read as "the guard is working" - it means only that nothing has been
+        # recorded. doctor is the command that answers the other question.
+        lines += ["", "  " + c("Nothing has been recorded here yet. This is not "
+                               "a passed integrity check,", "dim"),
+                  "  " + c("and not evidence that anything is being guarded - "
+                           "run `demo_cli doctor` for that.", "dim")]
+    if v.ok and not v.absent:
         summary = ", ".join(f"{k}:{n}" for k, n in sorted(v.decisions.items())) or "none"
         lines += ["", c("Decisions", "cyan"), kv("main", summary)]
     if heads:
