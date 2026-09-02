@@ -204,10 +204,37 @@ def cmd_log(a) -> int:
 
 
 def cmd_verify(a) -> int:
+    from .receipts import CHAIN_FS, chain_path
+
     cfg = load_config(getattr(a, "root", None))
-    v = verify_chain(cfg.receipts_path)
-    render.render_verify(v, __version__)
-    return 0 if v.ok else 1
+    main_path = cfg.receipts_path
+    fs_path = chain_path(main_path, CHAIN_FS)
+
+    v = verify_chain(main_path)
+    # Absent on a project that has never been mounted - not a failure, and not
+    # something to report as one. Only verified when the file exists.
+    fs = verify_chain(fs_path) if os.path.exists(fs_path) else None
+
+    from .receipts import verify_cross_links
+    links = verify_cross_links(main_path, fs_path) if fs is not None else None
+
+    heads = {}
+    if v.ok:
+        heads["main"] = v.head
+    if fs is not None and fs.ok:
+        heads["fs"] = fs.head
+    render.render_verify(v, __version__, fs=fs, heads=heads or None, links=links)
+
+    # DAMAGE DOES NOT FAIL THE COMMAND. A torn line is a write that did not
+    # finish; the entries around it are intact and verified. Exiting non-zero
+    # would make every script treat a self-inflicted corruption as evidence of
+    # tampering - which is the same false alarm the wording used to raise.
+    #
+    # AN UNRESOLVED CROSS-LINK DOES FAIL IT. That is not damage: it means a
+    # receipt referenced a hash that is no longer in the other chain, which is
+    # what removing entries looks like.
+    ok = v.ok and (fs.ok if fs else True) and (links.ok if links else True)
+    return 0 if ok else 1
 
 
 def cmd_report(a) -> int:

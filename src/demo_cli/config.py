@@ -183,6 +183,55 @@ def ensure_workspace(cfg) -> Optional[str]:
     return None
 
 
+BACKING_SUFFIX = ".real"
+
+
+def redirect_to_mount(root: str) -> str:
+    """A backing directory is not a project - it is the inside of one.
+
+    THE THIRD LOCK DOMAIN. A protected project's files live in `<project>.real`,
+    and that directory holds a real `.demo_cli.toml`, so `find_project_root`
+    walking up from an Administrator shell standing there resolves the project
+    to the BACKING. Every ledger write from that shell then goes straight to
+    NTFS, while the hook's writes go through the WinFsp mount - a third set of
+    byte-range locks that composes with neither of the other two.
+
+    That is not hypothetical: reading logs from `labubu.real` in an elevated
+    shell is what we did all through 2026-09-02, and a `demo_cli undo` or
+    `verify` from that same prompt would have written there.
+
+    Splitting the ledgers by writer does NOT fix this, because the split is by
+    ROLE and a CLI command run from the backing still claims the main role.
+    Without this the split would fix two domains of three and the corruption
+    would continue at a lower rate - which is worse than not fixing it, since
+    it would look solved.
+
+    Only redirects while the guard is actually mounted. With no mount there is
+    no second lock domain, the backing is the only copy of the files, and
+    refusing to work there would lock a user out of their own recovery points.
+    """
+    # THE FILESYSTEM GUARD IS EXEMPT, and must be. It IS the mount; sending
+    # its own ledger writes back through itself would route every append
+    # through the operations handler that is making the append - reentrancy
+    # into a filesystem from inside its own callback, on a winfspy thread
+    # pool. The backing is the correct destination for that one process, and
+    # it is the only writer there, which is the whole point of the split.
+    if os.environ.get("DEMO_CLI_FS_GUARD"):
+        return root
+    if not root.endswith(BACKING_SUFFIX):
+        return root
+    project = root[:-len(BACKING_SUFFIX)]
+    if not os.path.isdir(project):
+        return root
+    try:
+        from . import mountstate
+        if mountstate.status(Config(project_root=project)).running:
+            return project
+    except Exception:
+        pass            # never let this bookkeeping block a command
+    return root
+
+
 def find_project_root(start: Optional[str] = None) -> str:
     """Walk up from `start` looking for a .demo_cli.toml or a .git directory.
     Falls back to CLAUDE_PROJECT_DIR, then the start directory."""
@@ -199,7 +248,7 @@ def find_project_root(start: Optional[str] = None) -> str:
 
 def load_config(start: Optional[str] = None) -> Config:
     """Load configuration from the nearest .demo_cli.toml, or return defaults."""
-    root = find_project_root(start)
+    root = redirect_to_mount(find_project_root(start))
     cfg = Config(project_root=root)
     path = os.path.join(root, CONFIG_NAME)
     if not os.path.exists(path):

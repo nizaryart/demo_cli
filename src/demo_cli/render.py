@@ -187,23 +187,75 @@ def render_result(r: GuardResult, version: str) -> None:
     _print(lines)
 
 
-def render_verify(v: VerifyResult, version: str) -> None:
+def _verify_block(name: str, v: VerifyResult) -> List[str]:
+    """One chain's result. Three outcomes, and the middle one is the point.
+
+    VERIFIED  hashes and links hold.
+    DAMAGED   a line will not parse. That is a WRITE that did not finish, not
+              an edit - so every readable entry is still verified and said to
+              be. Calling this "the log was altered", as this used to, is the
+              verifier asserting something it cannot know.
+    TAMPERED  a line parses but its hash or link is wrong. Content changed.
+    """
+    if not v.ok:
+        out = ["  " + c(f"{name:<12} TAMPERED", "red")]
+        if v.broken_at:
+            out.append(f"             broken at line {v.broken_at}")
+        out.append("             " + c(v.detail or "verification failed.", "red"))
+        return out
+    if v.damaged:
+        where = ", ".join(str(n) for n in v.damaged_lines[:5])
+        more = "" if len(v.damaged_lines) <= 5 else f" (+{len(v.damaged_lines) - 5} more)"
+        return [
+            "  " + c(f"{name:<12} {v.entries} entries verified, "
+                     f"{len(v.damaged_lines)} unreadable", "yellow"),
+            f"             {v.segments} intact segment{'s' if v.segments != 1 else ''}; "
+            f"malformed at line {where}{more}",
+            "             " + c("a torn write, not an alteration - nothing was "
+                                 "edited", "dim"),
+        ]
+    return ["  " + c(f"{name:<12} {v.entries} entries    INTACT", "green")]
+
+
+def render_verify(v: VerifyResult, version: str, fs: Optional[VerifyResult] = None,
+                  heads: Optional[dict] = None, links=None) -> None:
+    """Report every chain. `fs` is the filesystem guard's own log; it is absent
+    on a project that has never been mounted, and that is not a failure."""
+    ok = v.ok and (fs.ok if fs else True) and (links.ok if links else True)
+    damaged = v.damaged or (fs.damaged if fs else False)
+    label = "TAMPERED" if not ok else ("DAMAGED" if damaged else "VERIFIED")
+    lines = ["", c(f"demo_cli {version}", "dim") + "  " + _label(label), "",
+             c("Receipt chains", "cyan")]
+    lines += _verify_block("main", v)
+    if fs is not None:
+        lines += _verify_block("fs", fs)
+    if links is not None and links.checked:
+        if links.ok:
+            lines.append("  " + c(f"{'cross-links':<12} {links.verified} verified"
+                                  f"    all resolve", "green"))
+        else:
+            lines.append("  " + c(f"{'cross-links':<12} "
+                                  f"{len(links.unresolved)} UNRESOLVED", "red"))
+            lines.append("             " + c(
+                "a receipt references a hash absent from the other chain - "
+                "entries were removed", "red"))
     if v.ok:
         summary = ", ".join(f"{k}:{n}" for k, n in sorted(v.decisions.items())) or "none"
-        _print(["", c(f"demo_cli {version}", "dim") + "  " + _label("VERIFIED"), "",
-                c("Receipt chain", "green"),
-                kv("entries", v.entries),
-                kv("head", v.head[:16] + "..."),
-                kv("decisions", summary),
-                "  " + c("Chain intact. Every entry links to the one before it.", "green"), ""])
-    else:
-        lines = ["", c(f"demo_cli {version}", "dim") + "  " + _label("TAMPERED"), "",
-                 c("Receipt chain", "red")]
-        if v.broken_at:
-            lines.append(kv("broken at", f"line {v.broken_at}"))
-        lines.append("  " + c(v.detail or "Chain verification failed.", "red"))
-        lines.append("")
-        _print(lines)
+        lines += ["", c("Decisions", "cyan"), kv("main", summary)]
+    if heads:
+        # PRINTED SO THEY CAN BE ANCHORED SOMEWHERE WE DO NOT CONTROL.
+        # A hash chain proves nothing against someone who can rewrite the whole
+        # file; the standard answer is to publish the head where they cannot
+        # reach it. Automating that is out of scope, but showing the value
+        # makes the manual version - paste it into a commit message or a CI
+        # log - available today.
+        lines += ["", c("Chain heads", "cyan")]
+        for name, head in heads.items():
+            lines.append(kv(name, head[:32] + "..." if len(head) > 32 else head))
+        lines.append("  " + c("record these outside this machine (a commit "
+                              "message, a CI log) to detect a full rewrite", "dim"))
+    lines.append("")
+    _print(lines)
 
 
 def render_diff(entry: dict, lines: List[DiffLine], version: str) -> None:

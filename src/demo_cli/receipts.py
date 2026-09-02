@@ -27,6 +27,65 @@ from .version import release_tag
 RECEIPT_VERSION = "2.0"
 GENESIS = "0" * 64
 
+# --------------------------------------------------------------------------
+# ONE WRITER PER FILE.
+#
+# The receipt log used to be a single file, and on Windows that file is
+# reachable by two paths: through the WinFsp mount (which the hook and the
+# egress addon use) and directly in the backing directory (which the mount
+# process itself uses). Byte-range locks do not compose across WinFsp - a lock
+# taken through the mount and a lock taken on NTFS are different locks - so
+# both sides held "the" lock at once and appended at stale offsets.
+#
+# Observed 2026-09-02 on the labubu project: `demo_cli verify` reported
+# TAMPERED at line 349, and the file contained records cut mid-key with the
+# next record written over the remains. Nothing had tampered with anything;
+# the guard had corrupted its own audit trail.
+#
+# The fix is not better locking. It is removing the need for locking to work
+# across the boundary at all: each chain is written from exactly one side.
+# Splitting happens on WRITE; every read merges. See recovery.load_entries and
+# cli.cmd_verify - no command anyone types changes shape.
+CHAIN_MAIN = "main"     # hook, egress, CLI - written through the mount
+CHAIN_FS = "fs"         # the filesystem guard - written in the backing
+
+_FS_SUFFIX = "-fs"
+
+
+def _base_path(path: str) -> str:
+    """The main chain's path, whichever chain's path was handed in.
+
+    Normalising first makes chain_path idempotent: chain_path(fs_path, FS) is
+    the fs path, not the fs path with a second suffix. Without this, deriving
+    a peer from an already-routed path returned that path itself - so an fs
+    receipt anchored to its own chain instead of the main one, and every
+    peer_head came back None.
+    """
+    root, ext = os.path.splitext(path)
+    if root.endswith(_FS_SUFFIX):
+        return root[:-len(_FS_SUFFIX)] + ext
+    return path
+
+
+def chain_path(path: str, chain: str = CHAIN_MAIN) -> str:
+    """Where a given chain's receipts live.
+
+    receipts.jsonl -> receipts-fs.jsonl. Derived rather than configured: two
+    settings that must agree is a way for them to disagree.
+    """
+    base = _base_path(path)
+    if chain != CHAIN_FS:
+        return base
+    root, ext = os.path.splitext(base)
+    return root + _FS_SUFFIX + ext
+
+
+def peer_path(path: str, chain: str = CHAIN_MAIN) -> str:
+    """The OTHER chain's file, for cross-chain reads. Accepts either chain's
+    path, because callers hold whichever one they happen to be writing."""
+    return chain_path(_base_path(path),
+                      CHAIN_MAIN if chain == CHAIN_FS else CHAIN_FS)
+
 
 def _canon(d: dict) -> str:
     return json.dumps(d, sort_keys=True, separators=(",", ":"))
@@ -143,6 +202,14 @@ class Receipt:
     receipt_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     timestamp: str = field(default_factory=_now)
     prev_receipt_hash: str = GENESIS
+    # Which log this belongs to. Advisory for grouping during verification,
+    # never a filter for reading: receipts written before the split have no
+    # `chain` and must keep verifying exactly as they did.
+    chain: str = CHAIN_MAIN
+    # The other chain's head hash when this was written, or None when there is
+    # no other chain yet. Proves this receipt came after that one; see the
+    # CROSS-CHAIN ANCHORING note above.
+    peer_head: Optional[str] = None
     receipt_hash: str = ""
 
     def finalize(self) -> "Receipt":
@@ -167,6 +234,82 @@ def last_hash(path: str) -> str:
     return last
 
 
+# --------------------------------------------------------------------------
+# CROSS-CHAIN ANCHORING
+#
+# Splitting the log by writer stopped the corruption, but it cost the one
+# property a single chain had: nothing linked a hook receipt to the filesystem
+# capture that followed it. Two separate chains are two separate stories.
+#
+# Each receipt therefore records the OTHER chain's head hash at the moment it
+# was written. That single field buys two things:
+#
+#   ORDER. A receipt naming H(K) must have been written after K existed - you
+#   cannot reference a hash that has not been computed yet. So "the guard
+#   evaluated the command before the deletion happened" becomes provable from
+#   the files alone, with no trust in either machine's clock.
+#
+#   MUTUAL WITNESS. Delete K from the main chain and two things break: that
+#   chain's own links, AND every fs receipt pointing at a hash now absent.
+#   This closes truncation, the one attack a lone hash chain misses entirely -
+#   lop off the tail of a single chain and what remains verifies perfectly.
+#
+# peer_head sits inside the hashed body, so it cannot be edited without
+# breaking its own receipt's hash. It costs nothing to protect.
+#
+# WHAT IT DOES NOT DO: stop someone who can rewrite BOTH files consistently.
+# Neither does a single chain - same threat model, no regression. The answer
+# to that is an external anchor, which `verify` now prints the heads for.
+_PEER_CACHE: Dict[str, tuple] = {}
+_PEER_TTL = 1.0          # seconds
+
+
+def _tail_hash(path: str, max_bytes: int = 65536) -> str:
+    """The last receipt_hash in a log, read from the tail rather than the whole
+    file. The fs guard writes one receipt per file in a recursive delete, so a
+    full O(n) scan per append turns a 200-file delete into 200 full reads."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            start = max(0, f.tell() - max_bytes)
+            f.seek(start)
+            chunk = f.read()
+    except OSError:
+        return GENESIS
+    lines = chunk.decode("utf-8", errors="replace").splitlines()
+    if start > 0:
+        lines = lines[1:]                # partial line from the mid-file seek
+    for line in reversed(lines):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            return json.loads(line)["receipt_hash"]
+        except Exception:
+            continue                     # torn line: keep walking backwards
+    return GENESIS
+
+
+def peer_head(path: str, chain: str) -> Optional[str]:
+    """The other chain's head, cached briefly.
+
+    A STALE VALUE IS SAFE, which is what makes caching free here. If this
+    returns a head from a second ago, the claim "this receipt was written
+    after that one" is still true - just less tight. Staleness can only weaken
+    an ordering edge, never create a false one.
+    """
+    other = peer_path(path, chain)
+    now = time.monotonic()
+    cached = _PEER_CACHE.get(other)
+    if cached and now - cached[0] < _PEER_TTL:
+        return cached[1]
+    if not os.path.exists(other):
+        return None                      # no peer chain yet: nothing to anchor
+    head = _tail_hash(other)
+    _PEER_CACHE[other] = (now, head)
+    return head
+
+
 def append_receipt(path: str, receipt: Receipt) -> Receipt:
     """Chain `receipt` to the log at `path` and persist it.
 
@@ -176,10 +319,20 @@ def append_receipt(path: str, receipt: Receipt) -> Receipt:
     cannot read the same last hash and append competing receipts.
     """
     receipt.action_raw = redact(receipt.action_raw)
+    # ROUTE BY THE RECEIPT'S OWN ROLE, not by the caller's path. A caller that
+    # passes cfg.receipts_path and sets chain="fs" gets the fs file; nobody has
+    # to remember to build the right path at each call site, and a new writer
+    # cannot land in the wrong chain by forgetting.
+    path = chain_path(path, getattr(receipt, "chain", CHAIN_MAIN))
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
 
     with _chain_lock(path):
         receipt.prev_receipt_hash = last_hash(path)
+        # Read INSIDE the lock, before finalize, so the anchored value is the
+        # one that gets hashed. Outside it, a concurrent append could change
+        # the peer head between reading and sealing.
+        if receipt.peer_head is None:
+            receipt.peer_head = peer_head(path, getattr(receipt, "chain", CHAIN_MAIN))
         receipt.finalize()
         with open(path, "a", encoding="utf-8") as f:
             f.write(_canon(asdict(receipt)) + "\n")
@@ -196,14 +349,40 @@ class VerifyResult:
     decisions: Dict[str, int] = field(default_factory=dict)
     broken_at: Optional[int] = None   # 1-based line number
     detail: Optional[str] = None
+    # DAMAGE IS NOT TAMPERING, and saying so was a lie the verifier told.
+    #
+    # A line that will not parse is a WRITE that did not complete - a torn
+    # append, a process killed mid-write, or the lock-domain bug that produced
+    # exactly this on labubu (line 349, 2026-09-02). Nothing was altered.
+    # Reporting "the log was altered" is the verifier claiming knowledge it
+    # does not have, which is the same unearned certainty as an unearned
+    # REVERSIBLE - the invariant this whole tool exists to keep.
+    #
+    # So: damaged lines are recorded and SKIPPED, and verification resumes
+    # from the next entry as a new segment. Tampering - a line that parses but
+    # whose hash or link is wrong - still fails hard, because that is a claim
+    # the evidence supports.
+    damaged_lines: List[int] = field(default_factory=list)
+    segments: int = 1
+
+    @property
+    def damaged(self) -> bool:
+        return bool(self.damaged_lines)
 
 
 def verify_chain(path: str) -> VerifyResult:
-    """Walk the receipt log end to end and report whether the hash chain holds."""
+    """Walk the receipt log end to end and report whether the hash chain holds.
+
+    Returns ok=True for an intact chain, INCLUDING one interrupted by torn
+    writes: every entry that survives is verified, and `damaged_lines` /
+    `segments` say what could not be read. ok=False means tampering - content
+    that was edited, inserted, removed or reordered.
+    """
     if not os.path.exists(path):
         return VerifyResult(ok=False, detail="No receipt log found yet.")
 
     rows = []
+    damaged: List[int] = []
     with open(path, encoding="utf-8") as f:
         for n, line in enumerate(f, 1):
             line = line.strip()
@@ -212,32 +391,128 @@ def verify_chain(path: str) -> VerifyResult:
             try:
                 rows.append((n, json.loads(line)))
             except Exception:
-                return VerifyResult(ok=False, broken_at=n,
-                                    detail="Line is not valid JSON; the log was altered.")
+                damaged.append(n)
 
+    # A torn line takes its hash with it, so the NEXT readable entry has no
+    # predecessor to link to. That entry starts a new segment: unverifiable
+    # against what came before, which is not the same as inconsistent with it.
+    #
+    # `after_damage` is true only for the first readable entry following a
+    # damaged one. Everywhere else a broken link still fails hard - otherwise
+    # one torn line would excuse every reordering after it, and an attacker
+    # who can corrupt a line could hide anything that follows.
+    damaged_set = set(damaged)
     prev = GENESIS
+    prev_line = 0
+    segments = 1
     for n, r in rows:
+        after_damage = any(d in damaged_set for d in range(prev_line + 1, n))
         stored = r.get("receipt_hash", "")
         body = {k: v for k, v in r.items() if k != "receipt_hash"}
         recomputed = hashlib.sha256(
             (_canon(body) + r.get("prev_receipt_hash", "")).encode()).hexdigest()
-        if r.get("prev_receipt_hash") != prev:
-            return VerifyResult(ok=False, broken_at=n,
-                                detail="An entry was inserted, removed, or reordered.")
+        # SELF-CONSISTENCY IS CHECKED FIRST, and is never excused. It needs no
+        # predecessor, so damage cannot be used as cover for an edited field.
         if recomputed != stored:
-            return VerifyResult(ok=False, broken_at=n,
+            return VerifyResult(ok=False, broken_at=n, damaged_lines=damaged,
                                 detail="A field in this entry was edited after it was written.")
+        if r.get("prev_receipt_hash") != prev:
+            if not after_damage:
+                return VerifyResult(ok=False, broken_at=n, damaged_lines=damaged,
+                                    detail="An entry was inserted, removed, or reordered.")
+            segments += 1
         prev = stored
+        prev_line = n
 
     decisions: Dict[str, int] = {}
     for _, r in rows:
         d = r.get("decision", "?")
         decisions[d] = decisions.get(d, 0) + 1
-    return VerifyResult(ok=True, entries=len(rows), head=prev, decisions=decisions)
+    detail = None
+    if damaged:
+        detail = (f"{len(damaged)} malformed line(s) - a torn write, not an "
+                  f"alteration. Every readable entry verified.")
+    return VerifyResult(ok=True, entries=len(rows), head=prev,
+                        decisions=decisions, damaged_lines=damaged,
+                        segments=segments, detail=detail)
 
 
 # writes and verifies) plus the shareable proof-card builder. They reuse the
 # same _canon / hashing already defined above, so nothing else changes.
+
+
+@dataclass
+class CrossLinkResult:
+    """How the two chains vouch for each other."""
+    verified: int = 0            # peer_head values that resolve to a real entry
+    unresolved: List[str] = field(default_factory=list)
+    checked: bool = False        # False when there is no second chain to check
+
+    @property
+    def ok(self) -> bool:
+        return not self.unresolved
+
+
+def verify_cross_links(main_path: str, fs_path: str) -> CrossLinkResult:
+    """Check that every peer_head names a hash that exists in the other chain.
+
+    An unresolved link is REAL evidence, and it is the thing a single chain
+    could never show: entries were removed from the end of a log. Truncate the
+    main chain and its own hashes still verify perfectly - a valid, shorter
+    history. But the fs chain still carries peer_head values pointing at the
+    receipts that were cut, and those no longer resolve.
+
+    Reads only; never raises. A missing file means there is nothing to check,
+    which is reported as checked=False rather than as a pass - "we did not
+    look" and "we looked and it was fine" are different answers.
+    """
+    res = CrossLinkResult()
+    if not (os.path.exists(main_path) and os.path.exists(fs_path)):
+        return res
+    res.checked = True
+
+    def hashes(p):
+        out = set()
+        try:
+            with open(p, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        h = json.loads(line).get("receipt_hash")
+                    except Exception:
+                        continue          # torn line: not evidence of anything
+                    if h:
+                        out.add(h)
+        except OSError:
+            pass
+        return out
+
+    known = {CHAIN_MAIN: hashes(main_path), CHAIN_FS: hashes(fs_path)}
+    for path, chain in ((main_path, CHAIN_MAIN), (fs_path, CHAIN_FS)):
+        peer = known[CHAIN_FS if chain == CHAIN_MAIN else CHAIN_MAIN]
+        try:
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        r = json.loads(line)
+                    except Exception:
+                        continue
+                    ph = r.get("peer_head")
+                    # GENESIS is "the peer chain was empty", not a reference.
+                    if not ph or ph == GENESIS:
+                        continue
+                    if ph in peer:
+                        res.verified += 1
+                    else:
+                        res.unresolved.append(ph[:16])
+        except OSError:
+            pass
+    return res
 
 
 def load_receipts(path: str) -> List[dict]:

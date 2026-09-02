@@ -22,7 +22,7 @@ import shutil
 import subprocess
 import uuid
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from .classify import (POSIX, POWERSHELL, effective_command, effective_segments,
                        join_continuations,
@@ -661,6 +661,36 @@ def _index_path(recovery_dir: str) -> str:
     return os.path.join(recovery_dir, "index.jsonl")
 
 
+def _index_fs_path(recovery_dir: str) -> str:
+    """The filesystem guard's own index.
+
+    Same reason the receipt chain is split: this process writes in the backing
+    directory while the hook writes through the mount, and WinFsp does not
+    carry byte-range locks between them. The receipt file was visibly torn by
+    that on 2026-09-02; the index was not, but only because the hook happens
+    to snapshot rarely - one write on the whole labubu run against fsguard's
+    206. Low contention is not a property to rely on.
+
+    The index failing is WORSE than the receipt file failing, which is why it
+    is fixed at the same time rather than later. A torn receipt line makes
+    `verify` shout. A torn index line is skipped by load_entries, so a
+    recovery point that exists on disk becomes unreachable - the tool silently
+    loses a recovery it already told you it had.
+    """
+    return os.path.join(recovery_dir, "index-fs.jsonl")
+
+
+def in_backing() -> bool:
+    """True when this process writes the backing directly - i.e. it is the
+    filesystem guard. Set by fsmount at mount time.
+
+    A flag rather than a path comparison: the guard knows what it is, and
+    inferring it from cwd or path shape is how a third writer ends up in the
+    wrong chain silently.
+    """
+    return bool(os.environ.get("DEMO_CLI_FS_GUARD"))
+
+
 def _record(recovery_dir: str, entry: dict) -> None:
     """Append one entry to the recovery index, durably and under a lock.
 
@@ -689,7 +719,7 @@ def _record(recovery_dir: str, entry: dict) -> None:
     from .receipts import _chain_lock          # local: avoids an import cycle
 
     os.makedirs(recovery_dir, exist_ok=True)
-    path = _index_path(recovery_dir)
+    path = _index_fs_path(recovery_dir) if in_backing() else _index_path(recovery_dir)
     with _chain_lock(path):
         needs_newline = False
         try:
@@ -932,19 +962,50 @@ def snapshot_before_restore(entry: Optional[dict],
                           target=target)
 
 
-def load_entries(recovery_dir: str) -> List[dict]:
-    idx = _index_path(recovery_dir)
+def _read_index(path: str) -> Tuple[List[dict], int]:
+    """One index file's entries, and how many lines could not be read."""
     entries: List[dict] = []
-    if os.path.exists(idx):
-        with open(idx, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    try:
-                        entries.append(json.loads(line))
-                    except Exception:
-                        pass
-    return entries
+    unreadable = 0
+    if not os.path.exists(path):
+        return entries, unreadable
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except Exception:
+                unreadable += 1
+    return entries, unreadable
+
+
+def unreadable_entries(recovery_dir: str) -> int:
+    """How many index lines could not be parsed, across both indexes.
+
+    Exposed because the count MATTERS: each one is a recovery point that
+    exists on disk and that `undo` can no longer find. Silently dropping them
+    - which load_entries used to do with a bare `except: pass` - means the
+    tool promises a recovery it can no longer deliver, and says nothing. That
+    is the exact failure the honesty invariant exists to prevent, committed by
+    the recovery ledger itself.
+    """
+    return (_read_index(_index_path(recovery_dir))[1]
+            + _read_index(_index_fs_path(recovery_dir))[1])
+
+
+def load_entries(recovery_dir: str) -> List[dict]:
+    """Every recovery point, from both indexes, oldest first.
+
+    SPLIT ON WRITE, MERGED ON READ. The two files exist so that each is
+    written from only one side of the WinFsp mount; nothing that reads them
+    needs to know, so `undo`, `log` and `diff` are unchanged. Sorted by
+    timestamp so a merged listing stays chronological rather than showing one
+    file's history and then the other's.
+    """
+    entries = _read_index(_index_path(recovery_dir))[0]
+    entries += _read_index(_index_fs_path(recovery_dir))[0]
+    return sorted(entries, key=lambda e: str(e.get("timestamp") or ""))
 
 
 def latest(recovery_dir: str, target_ref: Optional[str] = None) -> Optional[dict]:

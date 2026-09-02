@@ -99,7 +99,15 @@ def pending(cfg, mark: bool = True) -> List[str]:
     user's agent. An empty list is the correct answer to "we could not tell".
     """
     try:
-        path = cfg.receipts_path
+        # The fs guard's own chain since the split. Falls back to the main
+        # file so a project whose captures predate the split still reports
+        # them - both are read, and a receipt only counts once because the
+        # agent_id filter and the timestamp marker do not care which file it
+        # came from.
+        from .receipts import CHAIN_FS, chain_path
+        path = chain_path(cfg.receipts_path, CHAIN_FS)
+        if not os.path.exists(path):
+            path = cfg.receipts_path
         if not os.path.exists(path):
             return []
         since = _last_seen(cfg)

@@ -56,7 +56,7 @@ from typing import Optional
 from . import fsguard, recovery
 from .config import Config, load_config
 from .context import build_context
-from .receipts import Receipt, append_receipt
+from .receipts import CHAIN_FS, Receipt, append_receipt
 
 
 def available() -> bool:
@@ -909,6 +909,13 @@ def build_passthrough_operations(config: Config, backing_dir: str,
                     context=ctx.as_dict(),
                     agent_id="fsguard",
                     session_id="passthrough",
+                    # THE FS CHAIN, not the main one. This process writes in
+                    # the backing directory; the hook and egress write through
+                    # the mount. Byte-range locks do not compose across
+                    # WinFsp, so sharing one file meant both sides appending
+                    # at stale offsets - it corrupted the audit trail on
+                    # 2026-09-02. One writer per file is the fix.
+                    chain=CHAIN_FS,
                 ))
             except Exception as exc:                      # pragma: no cover
                 sys.stderr.write(f"demo_cli [fs] receipt error: {exc}\n")
@@ -966,6 +973,21 @@ def mount(mountpoint: str, config: Optional[Config] = None,
     # being protected, not the shell that launched the protection - the mount
     # may outlive that shell entirely, which is precisely what --detach is for.
     #
+    # THIS PROCESS IS THE ONE THAT WRITES THE BACKING DIRECTLY.
+    #
+    # Set BEFORE load_config, which is not cosmetic: config.redirect_to_mount
+    # sends a backing path back to the mount for every other caller, and this
+    # is the one process that must not be redirected. It IS the mount, so
+    # routing its ledger writes through itself would reenter the filesystem
+    # from inside its own callback, on a winfspy thread pool.
+    #
+    # Everything downstream - recovery._record, and append_receipt via the
+    # chain field - routes to the fs-side files because of this flag. Set from
+    # the single place that knows it for certain rather than inferred from a
+    # path shape deeper down: a writer that guesses wrong lands in the other
+    # chain and silently reintroduces the cross-mount lock collision.
+    os.environ["DEMO_CLI_FS_GUARD"] = "1"
+
     if config is None:
         config = load_config(config_anchor(str(path), backing))
 
@@ -1026,7 +1048,43 @@ def mount(mountpoint: str, config: Optional[Config] = None,
         pass
     finally:
         fs.stop()
+        _join_receipt(config, operations.captured)
         sys.stderr.write(
             f"demo_cli filesystem guard stopped. "
             f"{operations.captured} snapshot(s) taken.\n")
     return operations
+
+
+def _join_receipt(config, captured: int) -> None:
+    """A dense anchor point written into the fs chain at shutdown.
+
+    Cross-chain links only prove order WHERE ONE EXISTS, and a long burst of
+    filesystem captures with no agent activity between them produces one edge
+    for the whole burst - a `Remove-Item t*.txt` over 200 files wrote 200 fs
+    receipts and nothing to the main chain at all.
+
+    Writing one receipt at a clean shutdown pins both chains together at a
+    known moment, so nothing can be reordered across it. Cheap, and it also
+    records how many captures the run took, which is the number `verify` can
+    be checked against.
+
+    Best-effort by design: a guard that fails to STOP because it could not
+    write a bookkeeping entry would be a far worse bug than a missing anchor.
+    """
+    try:
+        from .receipts import CHAIN_FS, Receipt, append_receipt
+        append_receipt(config.receipts_path, Receipt(
+            action_raw=f"[fs] guard stopped after {captured} capture(s)",
+            action_type="filesystem",
+            target_environment="unknown",
+            decision="ALLOW",
+            reason="Clean shutdown; anchors both receipt chains at this point.",
+            mode="enforce-fs",
+            matched_rule="fs_join",
+            classification="safe",
+            agent_id="fsguard",
+            session_id="passthrough",
+            chain=CHAIN_FS,
+        ))
+    except Exception as exc:                              # pragma: no cover
+        sys.stderr.write(f"demo_cli [fs] join receipt failed: {exc}\n")
