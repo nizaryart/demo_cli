@@ -113,3 +113,70 @@ def test_the_admin_half_writes_a_readable_report(tmp_path):
         steps = json.load(f)
     assert rc == 0 and steps
     assert all("text" in x for x in steps)
+
+
+# --------------------------------------------------------------------------
+# A clean teardown must leave a clean doctor.
+#
+# On 2026-09-02 teardown ran perfectly - guard stopped, task removed, files
+# moved back, hooks removed, one UAC prompt - and `doctor` immediately
+# afterwards reported:
+#
+#   [x] filesystem guard  RECORDED BUT NOT RUNNING - pid 18792 is gone, so
+#                         C:\Users\pc\Desktop\labubu is unguarded while the
+#                         record says otherwise
+#   [!] backing locked    cannot tell for C:\Users\pc\Desktop\labubu.real
+#
+# Both were false. Nothing was unguarded, because nothing was protected, and
+# the backing it named no longer existed. The cause was one stale mount.json:
+# step 1 clears it THROUGH the mount while the guard is being killed, that
+# unlink fails, and mountstate.clear swallows the error - so the record rode
+# back inside .demo_cli when the files were restored.
+#
+# A correct teardown that ends in a red FAIL teaches people to ignore doctor.
+# --------------------------------------------------------------------------
+
+def test_teardown_removes_the_mount_record_it_leaves_behind(tmp_path):
+    """The stale record must not survive the move-back."""
+    from demo_cli import protect as protect_mod
+    from demo_cli.config import load_config
+
+    project = str(tmp_path / "proj")
+    backing = protect_mod.backing_for(project)
+    os.makedirs(os.path.join(backing, ".demo_cli"))
+    with open(os.path.join(backing, ".demo_cli", "mount.json"), "w") as f:
+        json.dump({"pid": 18792, "mountpoint": project, "backing": backing,
+                   "host": os.name}, f)
+
+    cli._teardown_admin_steps(project, load_config(project))
+
+    # Wherever the files ended up, no mount.json may be left claiming a guard.
+    for root in (project, backing):
+        leftover = os.path.join(root, ".demo_cli", "mount.json")
+        assert not os.path.exists(leftover), f"stale record survived at {leftover}"
+
+
+def test_a_stale_record_on_an_unprotected_project_is_a_warning_not_a_failure(tmp_path):
+    """The distinction the old code missed.
+
+    backing present + pid gone -> the project IS protected and unguarded. fail.
+    backing absent  + pid gone -> torn down, record left behind. warn.
+
+    Collapsing the second into the first is what put a red FAIL on a correct
+    teardown; collapsing the first into the second would hide a genuinely
+    unguarded project, so both directions matter.
+    """
+    project = str(tmp_path / "proj")
+    os.makedirs(os.path.join(project, ".demo_cli"))
+    with open(os.path.join(project, ".demo_cli", "mount.json"), "w") as f:
+        json.dump({"pid": 999999, "mountpoint": project, "host": os.name}, f)
+
+    class A:
+        root, no_color, port = project, True, 8080
+    rc = cli.cmd_doctor(A())
+
+    from demo_cli.config import load_config
+    from demo_cli import mountstate
+    st = mountstate.status(load_config(project))
+    assert st.stale, "precondition: the record must look stale"
+    assert rc == 0, "a torn-down project must not fail doctor"

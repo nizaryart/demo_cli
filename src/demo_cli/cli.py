@@ -481,17 +481,37 @@ def _mount_checks(cfg) -> List[tuple]:
                     f"recorded for {where} (pid {st.pid}) but its state cannot "
                     f"be checked from here"))
     elif st.stale:
-        out.append(("fail", "filesystem guard",
-                    f"RECORDED BUT NOT RUNNING - pid {st.pid} is gone, so {where} "
-                    f"is unguarded while the record says otherwise. "
-                    f"Restart it, or clear with: demo_cli unmount"))
+        # TWO VERY DIFFERENT SITUATIONS WEAR THE SAME RECORD, and calling both
+        # a failure cost a clean teardown a red FAIL on 2026-09-02.
+        #
+        #   backing still there -> the project IS protected and its guard died.
+        #                          Real, dangerous, unguarded. fail.
+        #   backing gone        -> the project was torn down and the record was
+        #                          left behind. Nothing claims protection it
+        #                          does not have; there is nothing to guard.
+        #                          Untidy, not unsafe. warn.
+        if os.path.isdir(protect_mod.backing_for(cfg.project_root)):
+            out.append(("fail", "filesystem guard",
+                        f"RECORDED BUT NOT RUNNING - pid {st.pid} is gone, so {where} "
+                        f"is unguarded while the record says otherwise. "
+                        f"Restart it, or clear with: demo_cli unmount"))
+        else:
+            out.append(("warn", "filesystem guard",
+                        f"not running, and this project is not protected - the "
+                        f"record for pid {st.pid} is left over from a teardown. "
+                        f"Clear it with: demo_cli unmount --root {cfg.project_root}"))
     else:
         out.append(("ok", "filesystem guard", f"mounted at {where} (pid {st.pid}{age})"))
 
     # A mount over a writable backing directory is bypassable by anything that
     # writes to the backing path instead - demonstrated live on 2026-08-25 by
     # an ordinary Remove-Item that the guard never saw.
-    if st.backing:
+    if st.backing and not os.path.isdir(st.backing):
+        # The record names a backing that no longer exists - a torn-down
+        # project. "cannot tell for <path>" invited the reader to go and check
+        # a directory that is not there.
+        pass
+    elif st.backing:
         locked = protect_mod.is_locked(st.backing)
         if locked is True:
             out.append(("ok", "backing locked", st.backing))
@@ -1633,8 +1653,34 @@ def _teardown_admin_steps(project: str, cfg) -> List[dict]:
     try:
         for line in protect_mod.unprotect(plan):
             pass
+        detail = [f"now at {project}"]
+        # CLEAR THE MOUNT RECORD AGAIN, HERE, AT ITS FINAL LOCATION.
+        #
+        # Step 1 already called mountstate.clear(), but that ran while the
+        # guard was being killed and it deleted THROUGH the mount - so the
+        # unlink hit a filesystem that was going away, failed, and clear()
+        # swallows OSError. The record then rode along inside .demo_cli when
+        # the backing was moved back, and doctor reported
+        #
+        #   [x] filesystem guard  RECORDED BUT NOT RUNNING - pid 18792 is gone
+        #
+        # about a project that had just been torn down correctly (2026-09-02).
+        # A clean teardown that ends in a red FAIL teaches people to ignore
+        # doctor, which is the opposite of what it is for.
+        #
+        # Now the files are back on real disk, so this delete is an ordinary
+        # one - and it is CHECKED, because a silent best-effort is what
+        # produced the stale record in the first place.
+        leftover = os.path.join(project, cfg.workspace_dir, "mount.json")
+        if os.path.exists(leftover):
+            try:
+                os.unlink(leftover)
+            except OSError as exc:
+                detail.append(f"the stale mount record could not be removed "
+                              f"({exc.strerror}); doctor will report a guard "
+                              f"that is not running until it is deleted: {leftover}")
         out.append({"n": 3, "ok": True, "text": "your files were moved back",
-                    "detail": [f"now at {project}"]})
+                    "detail": detail})
     except (PermissionError, OSError) as exc:
         out.append({"n": 3, "ok": False, "text": "could not restore your files",
                     "detail": [str(exc), f"they are safe at {backing}"],
