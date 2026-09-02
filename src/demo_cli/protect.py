@@ -189,6 +189,23 @@ def rerun_elevated(args: List[str]) -> Optional[int]:
     info.lpVerb = "runas"                        # this is what prompts UAC
     info.lpFile = "cmd.exe"
     info.lpParameters = params
+    # THE CHILD DOES NOT INHERIT OUR WORKING DIRECTORY. With lpDirectory left
+    # NULL an elevated process starts in C:\Windows\system32, so any argument
+    # that was relative - or any command that resolves its project from the
+    # current directory - means something different on the other side of the
+    # UAC prompt.
+    #
+    # `demo_cli undo <id>` did exactly that on 2026-09-02: the child looked for
+    # the recovery point in C:\Windows\system32\.demo_cli\recovery, found
+    # nothing, and exited 1, while the parent reported that the recovery
+    # needed Administrator. It had Administrator.
+    #
+    # Callers should still pass absolute paths - undo now always sends --root -
+    # but this closes the class rather than one instance of it.
+    try:
+        info.lpDirectory = os.getcwd()
+    except OSError:
+        info.lpDirectory = None                  # deleted cwd: let Windows choose
     info.nShow = 0                               # SW_HIDE: no console flash
     if not shell32.ShellExecuteExW(ctypes.byref(info)) or not info.hProcess:
         return None                              # cancelled at the prompt, or refused

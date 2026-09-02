@@ -23,7 +23,7 @@ import os
 
 import pytest
 
-from demo_cli import recovery
+from demo_cli import cli, recovery
 
 
 def _entry(tmp_path, content=b"irreplaceable"):
@@ -195,3 +195,55 @@ def test_a_directory_entry_is_left_alone(tmp_path):
     d.mkdir()
     entry = {"kind": "dir", "recovery_point": str(d), "target": str(tmp_path / "t")}
     assert recovery.snapshot_before_restore(entry, str(tmp_path / "rec")) is None
+
+
+# --------------------------------------------------------------------------
+# The elevated child does not inherit a working directory.
+#
+# `demo_cli undo 93201f46` from inside the project asked for Administrator,
+# got it, and still failed - because ShellExecute starts an elevated process
+# in C:\Windows\system32, so the child resolved its project root there:
+#
+#   No recovery point matched '93201f46'.
+#   searched  C:\Windows\system32\.demo_cli\recovery
+#
+# Meanwhile the parent printed "This recovery point needs Administrator" - a
+# true sentence with the wrong reason attached. The child HAD Administrator;
+# it was looking in the wrong place. Observed on dari, 2026-09-02.
+# --------------------------------------------------------------------------
+
+def test_the_elevated_undo_always_carries_a_root(tmp_path):
+    """Without --root the child resolves a different ledger entirely."""
+    class A:
+        id = "93201f46"
+        target = None
+        root = None
+    argv = cli._undo_argv(A(), root=str(tmp_path))
+    assert "--root" in argv, "the elevated child cannot find the ledger without it"
+    assert argv[argv.index("--root") + 1] == os.path.abspath(str(tmp_path))
+
+
+def test_an_explicit_root_still_wins(tmp_path):
+    """A --root the user typed is not overridden by the caller's fallback."""
+    explicit = tmp_path / "typed"
+    explicit.mkdir()
+
+    class A:
+        id = "abc"
+        target = None
+        root = str(explicit)
+    argv = cli._undo_argv(A(), root=str(tmp_path / "fallback"))
+    assert argv[argv.index("--root") + 1] == os.path.abspath(str(explicit))
+
+
+def test_the_elevated_root_is_absolute(tmp_path, monkeypatch):
+    """A relative root would mean a different directory on the other side of
+    the UAC prompt - which is the whole bug."""
+    monkeypatch.chdir(tmp_path)
+
+    class A:
+        id = "abc"
+        target = None
+        root = "."
+    argv = cli._undo_argv(A())
+    assert os.path.isabs(argv[argv.index("--root") + 1])

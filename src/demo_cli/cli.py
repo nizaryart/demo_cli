@@ -84,15 +84,30 @@ def _resolve_entry(cfg, a):
     return recovery.latest(cfg.recovery_dir, ref)
 
 
-def _undo_argv(a) -> List[str]:
+def _undo_argv(a, root: Optional[str] = None) -> List[str]:
     """This same undo, as a command line, for the elevated re-run."""
     argv = ["undo"]
     if getattr(a, "id", None):
         argv.append(a.id)
     if getattr(a, "target", None):
         argv += ["--target", os.path.abspath(a.target)]
-    if getattr(a, "root", None):
-        argv += ["--root", os.path.abspath(a.root)]
+    # ALWAYS PASS THE ROOT, not only when the user typed one.
+    #
+    # The elevated child is launched by ShellExecute, which does not inherit
+    # this process's working directory - it starts in C:\Windows\system32. So
+    # an undo that relied on the current directory (the normal way to run it)
+    # re-ran up there, resolved a project root of system32, and reported
+    #
+    #   No recovery point matched '93201f46'.
+    #   searched  C:\Windows\system32\.demo_cli\recovery
+    #
+    # while the parent told the user their recovery needed Administrator - a
+    # true statement with the wrong reason attached (dari, 2026-09-02). The
+    # child had every right to read the file; it was looking in the wrong
+    # place. rerun_elevated now sets lpDirectory too, but a recovery path must
+    # not depend on inheriting a directory to find its own ledger.
+    argv += ["--root", os.path.abspath(
+        getattr(a, "root", None) or root or os.getcwd())]
     # This process already took the pre-restore snapshot - the target lives in
     # the mount and is readable unelevated, even when the recovery point is
     # not. Without this the elevated child would take a second one of bytes
@@ -101,7 +116,7 @@ def _undo_argv(a) -> List[str]:
     return argv
 
 
-def _undo_elevated(a) -> Optional[int]:
+def _undo_elevated(a, root: Optional[str] = None) -> Optional[int]:
     """Retry an undo that was refused for lack of privilege, via UAC.
 
     WHY ASK RATHER THAN INSTRUCT. The filesystem guard writes its recovery
@@ -124,7 +139,7 @@ def _undo_elevated(a) -> Optional[int]:
         return None                     # already admin: elevating again changes nothing
     print(render.c("[demo_cli] this recovery point lives in the protected backing; "
                    "asking for Administrator.", "yellow"))
-    return protect_mod.rerun_elevated(_undo_argv(a))
+    return protect_mod.rerun_elevated(_undo_argv(a, root))
 
 
 def cmd_undo(a) -> int:
@@ -146,7 +161,7 @@ def cmd_undo(a) -> int:
     result = recovery.restore(entry)
 
     if not result.ok and result.denied:
-        rc = _undo_elevated(a)
+        rc = _undo_elevated(a, cfg.project_root)
         if rc == 0:
             # The elevated process owns its own console, which closes with it,
             # so its RESTORED banner is never seen. Say it here, in the shell
@@ -159,6 +174,20 @@ def cmd_undo(a) -> int:
         if rc is not None:
             print(render.c("The elevated attempt did not restore it either "
                            f"(exit {rc}).", "red"))
+            # SHOW WHAT IT SAID. The elevated console closes with the process,
+            # so without this a completely diagnosable failure arrives as a
+            # bare exit code - and the message printed underneath blames the
+            # ACL, because that is the only reason this path knows about.
+            #
+            # On 2026-09-02 the log held the whole answer ("searched
+            # C:\\Windows\\system32\\.demo_cli\\recovery") while the user was
+            # told their recovery point needed Administrator. It already had
+            # Administrator. teardown prints this; undo did not - the same
+            # rule applied to one caller and not the other.
+            from . import protect as protect_mod
+            out = protect_mod.elevated_output()
+            for line in (out.splitlines() or ["(it printed nothing)"]):
+                print("  " + render.c(line, "dim"))
 
     # Pass the ledger we searched: "not found" is unactionable without it, and
     # the recovery dir follows the project root, which follows the directory a
