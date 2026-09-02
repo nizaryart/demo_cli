@@ -24,7 +24,8 @@ import uuid
 from dataclasses import dataclass
 from typing import List, Optional
 
-from .classify import (POSIX, POWERSHELL, effective_command, join_continuations,
+from .classify import (POSIX, POWERSHELL, effective_command, effective_segments,
+                       join_continuations,
                        strip_ps_escapes,
                        redirect_target, split_segments,
                        substitute_assignments)
@@ -542,17 +543,20 @@ def extract_path_operand(cmd: str, dialect: str = POSIX) -> Optional[str]:
     # does the same on the same input; if only one of them did, the classifier
     # would call `powershell -c "Remove-Item x"` destructive while the operand
     # extractor looked for a path in text that no longer describes the action.
-    cmd, dialect = effective_command(cmd, dialect)
-    cmd = join_continuations(cmd, dialect)
-    if dialect == POWERSHELL:
-        cmd = strip_ps_escapes(cmd)     # same normalisation as the classifier
+    #
+    # SPLIT BEFORE UNWRAPPING, not after. `echo hi; bash -c "rm -rf ./out"`
+    # used to unwrap nothing (the line starts with `echo`) and the nested rm's
+    # operand was never found - the command was still flagged by the unanchored
+    # rm_rf rule, so the guard escalated instead of snapshotting. Both callers
+    # now go through the one function so they cannot drift apart.
     # `T=notes.txt; rm $T` names its target in the same string it uses it in.
-    # Resolving that here rather than in the classifier keeps the change to
-    # WHAT WE SNAPSHOT, and leaves WHETHER IT IS DESTRUCTIVE alone: `rm $T` is
-    # already classified as an rm either way. Returns the command untouched
-    # unless every reference resolved, so this can only ever narrow an
-    # escalation into a precise snapshot, never widen anything.
-    cmd = substitute_assignments(cmd, dialect)
+    # Resolving that (substitute=True) rather than in the classifier keeps the
+    # change to WHAT WE SNAPSHOT, and leaves WHETHER IT IS DESTRUCTIVE alone:
+    # `rm $T` is already classified as an rm either way. It happens per nesting
+    # level, before that level is split, because the assignment and its use are
+    # sibling segments. Returns the command untouched unless every reference
+    # resolved, so this can only ever narrow an escalation into a precise
+    # snapshot, never widen anything.
 
     # DISPATCH ON THE SEGMENT, NOT THE LINE.
     #
@@ -565,7 +569,8 @@ def extract_path_operand(cmd: str, dialect: str = POSIX) -> Optional[str]:
     # Several destructive segments (`rm a.txt; rm b.txt`) return None. Picking
     # one would snapshot a.txt while b.txt died unrecorded, with the receipt
     # claiming a recovery - the partial-recovery lie FIX #5 exists to prevent.
-    segments = split_segments(cmd, dialect) or [cmd]
+    segments = [seg for seg, _ in
+                effective_segments(cmd, dialect, substitute=True)] or [cmd]
 
     def _rm(seg: str) -> Optional[str]:
         # Collect every operand BEFORE deciding anything. Filtering to
@@ -615,7 +620,13 @@ def extract_path_operand(cmd: str, dialect: str = POSIX) -> Optional[str]:
     # Truncating output redirection ('> file'): snapshot the file it overwrites.
     # Uses the same quote-aware detector as the classifier, so classify (is it
     # destructive?) and recovery (what to snapshot?) can never disagree.
-    tgt = redirect_target(cmd)
+    #
+    # Per SEGMENT, and only when exactly one segment redirects. `cmd` is the
+    # raw line now, not a normalised whole, and `a > x; b > y` must escalate
+    # for the same reason two rm segments do: snapshotting x while y is
+    # truncated unrecorded is the partial-recovery lie.
+    redirects = [t for t in (redirect_target(seg) for seg in segments) if t]
+    tgt = redirects[0] if len(redirects) == 1 else None
     if tgt:
         ap = os.path.abspath(tgt)
         return ap if os.path.exists(ap) else None

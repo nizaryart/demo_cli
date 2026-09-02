@@ -553,6 +553,57 @@ def _strip_quotes(s: str) -> str:
     return s
 
 
+# A redirection ENDS the payload. In `-Command "Remove-Item x" 2>&1` the quoted
+# script is what the nested shell runs; the `2>&1` is the OUTER shell deciding
+# where that script's output goes. It was never part of the nested command.
+_REDIRECTION_TOKEN = re.compile(r"^\d*(?:>>|>|<)")
+
+
+def _payload_tokens(toks: List[str]) -> str:
+    """The script a `-c` / `-Command` flag carries, and nothing else.
+
+    Two shapes, and confusing them was the bug:
+
+        quoted   -c "rm -rf x" 2>&1   -> the ONE quoted token is the script
+        bare     -c rm -rf x   2>&1   -> tokens up to the first redirection
+
+    WHAT WENT WRONG (2026-09-02, found by an agent on the labubu lab project).
+    This used to be `" ".join(toks)`, so a trailing redirection was joined into
+    the payload:
+
+        "Remove-Item -Force notes.txt" 2>&1
+
+    `_strip_quotes` only strips when the WHOLE string is a matching pair, and
+    this is not one - so the quotes stayed on, the payload began with a `"`
+    character, and every rule anchored `^\\s*Remove-Item` silently stopped
+    matching. Unanchored rules (rm_rf, ps_remove_item_rf) still fired but lost
+    their operand, degrading a clean snapshot into an ESCALATE; anchored rules
+    did not fire at all, which is a SILENT PASS. Both `bash -c` and `cmd /c`
+    had it too, so this was never Windows-only.
+
+    -EncodedCommand was the one branch immune to it, because it already took
+    exactly one token. That is the shape; this makes the other three match it.
+    """
+    if not toks:
+        return ""
+    first = toks[0]
+    quoted = len(first) >= 2 and first[0] in "\"'" and first[-1] == first[0]
+    # The quoted token is the whole script ONLY if nothing but a redirection
+    # follows it. `bash -c "a -c "b -c "..." is degenerate quoting, not a
+    # script plus a redirection, and taking the first token there would throw
+    # the payload away - it is how `'bash -c "' * 12` lost its innermost
+    # `rm x`. Fall through to the join, which peels one level per recursion
+    # exactly as this did before the fix.
+    if quoted and (len(toks) == 1 or _REDIRECTION_TOKEN.match(toks[1])):
+        return _strip_quotes(first)
+    out = []
+    for tok in toks:
+        if _REDIRECTION_TOKEN.match(tok):
+            break
+        out.append(tok)
+    return _strip_quotes(" ".join(out))
+
+
 def _decode_encoded(payload: str) -> Optional[str]:
     """PowerShell's -EncodedCommand is base64 UTF-16LE. Decoding is not
     evaluating - nothing runs, so this is safe for a pre-execution guard."""
@@ -585,7 +636,7 @@ def unwrap_nested(cmd: str) -> Optional[Tuple[str, str]]:
             return None
         for i, tok in enumerate(toks[1:], start=1):
             if _PS_COMMAND_FLAG.match(tok) and i + 1 < len(toks):
-                return _strip_quotes(" ".join(toks[i + 1:])), POWERSHELL
+                return _payload_tokens(toks[i + 1:]), POWERSHELL
             if _PS_ENCODED_FLAG.match(tok) and i + 1 < len(toks):
                 decoded = _decode_encoded(_strip_quotes(toks[i + 1]))
                 return (decoded, POWERSHELL) if decoded else None
@@ -596,12 +647,25 @@ def unwrap_nested(cmd: str) -> Optional[Tuple[str, str]]:
         # cmd.exe's own verbs are closest to POSIX for splitting purposes; the
         # dialect only decides quoting and continuation, and cmd uses neither
         # PowerShell's backtick nor a distinct grammar we model.
-        return _strip_quotes(cmd[m.end():]), POSIX
+        return _tokenised_payload(cmd[m.end():]), POSIX
 
     m = _POSIX_SH.match(cmd)
     if m:
-        return _strip_quotes(cmd[m.end():]), POSIX
+        return _tokenised_payload(cmd[m.end():]), POSIX
     return None
+
+
+def _tokenised_payload(rest: str) -> str:
+    """`_payload_tokens` for the branches that carry raw text, not tokens.
+
+    Falls back to the old whole-string strip when shlex cannot tokenise -
+    an unbalanced quote must not make a command LESS visible than it was
+    before this function existed.
+    """
+    try:
+        return _payload_tokens(shlex.split(rest, posix=False))
+    except ValueError:
+        return _strip_quotes(rest)
 
 
 def effective_command(cmd: str, dialect: str = POSIX) -> Tuple[str, str]:
@@ -621,6 +685,52 @@ def effective_command(cmd: str, dialect: str = POSIX) -> Tuple[str, str]:
             break
         cmd, dialect = nested
     return cmd, dialect
+
+
+def effective_segments(cmd: str, dialect: str = POSIX,
+                       substitute: bool = False) -> List[Tuple[str, str]]:
+    """Every command that will actually run, each with the dialect to judge it in.
+
+    SPLITTING AND UNWRAPPING ARE MUTUALLY RECURSIVE, and the order was the bug.
+    Both callers used to unwrap the whole LINE first and split afterwards, so
+
+        echo hi; powershell -Command "Remove-Item x"
+
+    found no wrapper - the line starts with `echo` - and the nested
+    Remove-Item was never judged at all. An agent hit this by accident on
+    2026-09-02 and reported the guard as missing the deletion entirely.
+
+    Split first, unwrap each segment, then split the payload it yields, down
+    to `_MAX_NESTING`. `substitute` is for recovery only: `T=notes.txt; rm $T`
+    names its target in a sibling segment, so the substitution has to happen
+    at each level BEFORE that level is split.
+
+    Used by classify_pipeline AND recovery.extract_path_operand, which is the
+    whole point - the two must agree on what the command IS, or one calls a
+    deletion destructive while the other looks for its target in text that no
+    longer describes the action.
+    """
+    return _effective_segments(cmd, dialect, substitute, 0)
+
+
+def _effective_segments(cmd: str, dialect: str, substitute: bool,
+                        depth: int) -> List[Tuple[str, str]]:
+    cmd = join_continuations(cmd, dialect)
+    if dialect == POWERSHELL:
+        # After continuations, so an end-of-line backtick has already been
+        # consumed as one. What is left means "the literal next character".
+        cmd = strip_ps_escapes(cmd)
+    if substitute:
+        cmd = substitute_assignments(cmd, dialect)
+    out: List[Tuple[str, str]] = []
+    for seg in split_segments(cmd, dialect) or [cmd]:
+        nested = unwrap_nested(seg) if depth < _MAX_NESTING else None
+        if nested and nested[0].strip():
+            out.extend(_effective_segments(nested[0], nested[1],
+                                           substitute, depth + 1))
+        else:
+            out.append((seg, dialect))
+    return out
 
 
 def split_segments(cmd: str, dialect: str = POSIX) -> List[str]:
@@ -838,17 +948,12 @@ def classify_pipeline(cmd: str, dialect: str = POSIX) -> Classification:
     execution is detected on the full string because the pipe *is* the payload.
     """
     # `powershell -Command "Remove-Item x"` IS a Remove-Item. Judge the payload
-    # and judge it in ITS dialect - recovery.extract_path_operand does exactly
-    # the same, or the two would disagree about what the command even is.
-    cmd, dialect = effective_command(cmd, dialect)
-    cmd = join_continuations(cmd, dialect)
-    if dialect == POWERSHELL:
-        # After continuations, so an end-of-line backtick has already been
-        # consumed as one. What is left means "the literal next character".
-        cmd = strip_ps_escapes(cmd)
-    segments = split_segments(cmd, dialect)
+    # and judge it in ITS dialect - recovery.extract_path_operand calls the
+    # same function, or the two would disagree about what the command even is.
+    segments = [seg for seg, _ in effective_segments(cmd, dialect)]
     seg_results = [_classify_segment(seg) for seg in segments]
     if not seg_results:
+        segments = [cmd]
         seg_results = [_classify_segment(cmd)]
 
     def any_of(key):
@@ -865,7 +970,12 @@ def classify_pipeline(cmd: str, dialect: str = POSIX) -> Classification:
         is_sql_read=any_of("is_sql_read"),
         is_sql_mutating=any_of("is_sql_mutating"),
         is_file_writer=any_of("is_file_writer"),
-        remote_exec=bool(_REMOTE_EXEC.search(cmd)),
+        # The original line AND every effective segment. `cmd` is no longer
+        # rewritten to the unwrapped payload, so searching it alone would stop
+        # seeing a nested `ssh host ...`. A superset of what was searched
+        # before, so nothing that used to be caught can slip through.
+        remote_exec=bool(_REMOTE_EXEC.search(cmd))
+        or any(_REMOTE_EXEC.search(s) for s in segments),
         is_pipeline=len(seg_results) > 1,
         matched_rule=matched_rule,
         action_type=action_type,
