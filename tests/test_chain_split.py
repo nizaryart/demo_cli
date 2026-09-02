@@ -154,6 +154,81 @@ def test_damage_cannot_be_used_as_cover_for_tampering(tmp_path):
     assert not v.ok, "an edited entry after a torn line is still tampering"
 
 
+def test_interleaved_writers_are_out_of_order_not_removal(tmp_path):
+    """THE SHAPE THE LOCK BUG ACTUALLY PRODUCES, from labubu line 348.
+
+        347  claude-code  prev=6855f5d0  hash=3b076749
+        348  egress       prev=b9f88269  hash=c7184adc   <- not 347's hash
+        349  UNPARSEABLE (1 char)
+
+    Line 348 linked to an fsguard receipt that was real and present, just
+    stored further along and torn. Two writers appending at stale offsets
+    leave entries out of FILE order while the chain itself is complete.
+
+    "An entry was inserted, removed, or reordered" was wrong here in the way
+    that matters: nothing was removed, and the receipt it named was still in
+    the log. The verdict stays a failure - the chain is not linear - but it
+    must not accuse.
+    """
+    main = str(tmp_path / "receipts.jsonl")
+    a = append_receipt(main, _r("first"))
+    b = append_receipt(main, _r("second"))
+    c = append_receipt(main, _r("third"))
+    rows = open(main).read().splitlines()
+    with open(main, "w") as f:                    # swap the last two
+        f.write(rows[0] + "\n" + rows[2] + "\n" + rows[1] + "\n")
+
+    v = verify_chain(main)
+    assert not v.ok, "a non-linear chain is still a failure"
+    assert v.reordered
+    assert v.broken_at is None, "not a hard break - do not report a location as tampering"
+    assert "nothing was removed" in v.detail or "removed" in v.detail
+
+
+def test_a_link_to_a_torn_receipt_is_not_called_a_removal(tmp_path):
+    """A torn line keeps its hash as readable text. An entry linking to it is
+    pointing at something that IS in the file, so calling it a removal
+    contradicts the evidence."""
+    main = str(tmp_path / "receipts.jsonl")
+    append_receipt(main, _r("first"))
+    second = append_receipt(main, _r("second"))
+    append_receipt(main, _r("third"))
+    rows = open(main).read().splitlines()
+    with open(main, "w") as f:
+        f.write(rows[0] + "\n")
+        # second survives only as wreckage, but its hash is still legible
+        f.write('garbage"receipt_hash":"%s"}\n' % second.receipt_hash)
+        f.write(rows[2] + "\n")
+
+    v = verify_chain(main)
+    assert v.damaged
+    assert "missing" not in (v.detail or "")
+
+
+def test_a_genuinely_missing_entry_is_still_reported_as_missing(tmp_path):
+    """The forgiving paths must not swallow a real removal: when the
+    referenced hash is nowhere in the file, an entry is gone."""
+    main = str(tmp_path / "receipts.jsonl")
+    append_receipt(main, _r("first"))
+    append_receipt(main, _r("second"))
+    append_receipt(main, _r("third"))
+    rows = open(main).read().splitlines()
+    with open(main, "w") as f:
+        f.write(rows[0] + "\n" + rows[2] + "\n")   # second deleted outright
+
+    v = verify_chain(main)
+    assert not v.ok
+    assert "missing" in v.detail
+
+
+def test_the_ledger_path_is_reported(tmp_path):
+    """Run from the wrong directory, verify checked a different project's log
+    and said VERIFIED. Naming the file it read is what makes that visible."""
+    main = str(tmp_path / "receipts.jsonl")
+    append_receipt(main, _r("x"))
+    assert verify_chain(main).ledger == main
+
+
 def test_removing_entries_is_still_caught_without_damage(tmp_path):
     main = str(tmp_path / "receipts.jsonl")
     for i in range(4):
@@ -163,7 +238,9 @@ def test_removing_entries_is_still_caught_without_damage(tmp_path):
         f.write("\n".join(rows[:1] + rows[2:]) + "\n")     # drop the second
     v = verify_chain(main)
     assert not v.ok
-    assert "removed" in v.detail or "reordered" in v.detail
+    # "missing", not "removed, inserted, or reordered" - the dropped receipt's
+    # hash is nowhere in the file, which is the one thing that IS established.
+    assert "missing" in v.detail
 
 
 # --------------------------------------------------------------------------
@@ -236,19 +313,26 @@ def test_no_second_chain_means_not_checked_rather_than_passed(tmp_path):
     assert links.verified == 0
 
 
-def test_a_stale_peer_head_is_still_a_true_ordering_claim(tmp_path):
-    """The peer head is cached, so a burst may anchor to a slightly older
-    entry. That WEAKENS an edge; it can never create a false one - the
-    referenced receipt still existed before this one was written."""
+def test_the_peer_head_cache_never_serves_a_stale_head(tmp_path):
+    """CAUGHT BY test_truncating_one_chain_is_caught_by_the_other.
+
+    The cache was first keyed on a 1-second clock. During a fast burst every
+    receipt then anchored to the same older head, so the NEWEST peer entries
+    were referenced by nothing - and truncating exactly those, the easiest and
+    most useful entries to remove, went undetected. The guarantee was quietly
+    weakest precisely where it mattered most.
+
+    Keying on (size, mtime) instead costs one stat and is always current.
+    """
     main = str(tmp_path / "receipts.jsonl")
-    append_receipt(main, _r("k1", chain=CHAIN_MAIN))
+    k1 = append_receipt(main, _r("k1", chain=CHAIN_MAIN))
     f1 = append_receipt(main, _r("[fs] a", chain=CHAIN_FS))
-    append_receipt(main, _r("k2", chain=CHAIN_MAIN))
+    k2 = append_receipt(main, _r("k2", chain=CHAIN_MAIN))
     f2 = append_receipt(main, _r("[fs] b", chain=CHAIN_FS))
-    # Whatever the cache did, both anchors must name real main-chain entries.
-    known = {json.loads(l)["receipt_hash"] for l in open(main)}
-    for f in (f1, f2):
-        assert f.peer_head in known
+    assert f1.peer_head == k1.receipt_hash
+    assert f2.peer_head == k2.receipt_hash, (
+        "the second fs receipt must anchor to the newest main entry, not a "
+        "cached older one")
 
 
 # --------------------------------------------------------------------------
