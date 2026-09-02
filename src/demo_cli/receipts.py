@@ -15,6 +15,7 @@ import datetime
 import hashlib
 import json
 import os
+import re
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -26,6 +27,10 @@ from .version import release_tag
 
 RECEIPT_VERSION = "2.0"
 GENESIS = "0" * 64
+
+# A sha256 hex digest as it appears in a torn line's surviving text. Used to
+# tell "the predecessor is unreadable" apart from "the predecessor is gone".
+_HASH_TOKEN = re.compile(r"\b[0-9a-f]{64}\b")
 
 # --------------------------------------------------------------------------
 # ONE WRITER PER FILE.
@@ -260,8 +265,7 @@ def last_hash(path: str) -> str:
 # WHAT IT DOES NOT DO: stop someone who can rewrite BOTH files consistently.
 # Neither does a single chain - same threat model, no regression. The answer
 # to that is an external anchor, which `verify` now prints the heads for.
-_PEER_CACHE: Dict[str, tuple] = {}
-_PEER_TTL = 1.0          # seconds
+_PEER_CACHE: Dict[str, tuple] = {}   # path -> ((size, mtime_ns), head)
 
 
 def _tail_hash(path: str, max_bytes: int = 65536) -> str:
@@ -291,22 +295,35 @@ def _tail_hash(path: str, max_bytes: int = 65536) -> str:
 
 
 def peer_head(path: str, chain: str) -> Optional[str]:
-    """The other chain's head, cached briefly.
+    """The other chain's head, cached against its file identity.
 
-    A STALE VALUE IS SAFE, which is what makes caching free here. If this
-    returns a head from a second ago, the claim "this receipt was written
-    after that one" is still true - just less tight. Staleness can only weaken
-    an ordering edge, never create a false one.
+    CACHED ON (size, mtime), NOT ON A CLOCK. A time-based cache was the first
+    attempt and it silently weakened the guarantee: during a fast burst every
+    receipt anchored to the same older head, so the NEWEST peer entries were
+    referenced by nothing - and truncating exactly those, the easiest and most
+    useful thing to remove, went undetected. A test caught it.
+
+    Stat is microseconds and changes the instant the peer is appended to, by
+    any process. So the burst optimisation survives - during a long run of fs
+    captures the main chain is not moving, so the file is read once - while
+    every anchor stays current.
+
+    A stale value would still be SAFE in the sense that "written after that
+    one" remains true. But safe is not the same as useful: an edge to an old
+    entry proves less, and the entries that most need covering are the recent
+    ones.
     """
     other = peer_path(path, chain)
-    now = time.monotonic()
-    cached = _PEER_CACHE.get(other)
-    if cached and now - cached[0] < _PEER_TTL:
-        return cached[1]
-    if not os.path.exists(other):
+    try:
+        st = os.stat(other)
+    except OSError:
         return None                      # no peer chain yet: nothing to anchor
+    key = (st.st_size, st.st_mtime_ns)
+    cached = _PEER_CACHE.get(other)
+    if cached and cached[0] == key:
+        return cached[1]
     head = _tail_hash(other)
-    _PEER_CACHE[other] = (now, head)
+    _PEER_CACHE[other] = (key, head)
     return head
 
 
@@ -364,10 +381,18 @@ class VerifyResult:
     # the evidence supports.
     damaged_lines: List[int] = field(default_factory=list)
     segments: int = 1
+    # Entries whose prev_receipt_hash names a receipt that IS in this file,
+    # but not the line immediately before them. See verify_chain.
+    out_of_order: List[int] = field(default_factory=list)
+    ledger: Optional[str] = None      # which file this result describes
 
     @property
     def damaged(self) -> bool:
         return bool(self.damaged_lines)
+
+    @property
+    def reordered(self) -> bool:
+        return bool(self.out_of_order)
 
 
 def verify_chain(path: str) -> VerifyResult:
@@ -383,6 +408,10 @@ def verify_chain(path: str) -> VerifyResult:
 
     rows = []
     damaged: List[int] = []
+    # Hashes recoverable from lines that will NOT parse. A torn record still
+    # carries its hash as readable text, and an entry that legitimately links
+    # to it must not be called a removal just because the line is unreadable.
+    salvaged: set = set()
     with open(path, encoding="utf-8") as f:
         for n, line in enumerate(f, 1):
             line = line.strip()
@@ -392,6 +421,7 @@ def verify_chain(path: str) -> VerifyResult:
                 rows.append((n, json.loads(line)))
             except Exception:
                 damaged.append(n)
+                salvaged.update(_HASH_TOKEN.findall(line))
 
     # A torn line takes its hash with it, so the NEXT readable entry has no
     # predecessor to link to. That entry starts a new segment: unverifiable
@@ -401,10 +431,15 @@ def verify_chain(path: str) -> VerifyResult:
     # damaged one. Everywhere else a broken link still fails hard - otherwise
     # one torn line would excuse every reordering after it, and an attacker
     # who can corrupt a line could hide anything that follows.
+    # Every hash this file contains, readable or salvaged. A link naming one
+    # of these points at an entry that IS here - so nothing was removed, the
+    # entries are merely not in chain order.
+    present = {r.get("receipt_hash") for _, r in rows} | salvaged
     damaged_set = set(damaged)
     prev = GENESIS
     prev_line = 0
     segments = 1
+    out_of_order: List[int] = []
     for n, r in rows:
         after_damage = any(d in damaged_set for d in range(prev_line + 1, n))
         stored = r.get("receipt_hash", "")
@@ -412,15 +447,34 @@ def verify_chain(path: str) -> VerifyResult:
         recomputed = hashlib.sha256(
             (_canon(body) + r.get("prev_receipt_hash", "")).encode()).hexdigest()
         # SELF-CONSISTENCY IS CHECKED FIRST, and is never excused. It needs no
-        # predecessor, so damage cannot be used as cover for an edited field.
+        # predecessor, so neither damage nor disorder can cover an edited field.
         if recomputed != stored:
             return VerifyResult(ok=False, broken_at=n, damaged_lines=damaged,
+                                out_of_order=out_of_order, ledger=path,
                                 detail="A field in this entry was edited after it was written.")
-        if r.get("prev_receipt_hash") != prev:
-            if not after_damage:
+        link = r.get("prev_receipt_hash")
+        if link != prev:
+            if after_damage:
+                segments += 1
+            elif link in present:
+                # OUT OF ORDER, NOT REMOVED. The predecessor is in this file,
+                # just not on the preceding line. That is what concurrent
+                # writers appending at stale offsets produce, and it is the
+                # commonest shape of the WinFsp lock-domain bug - observed on
+                # labubu at line 348, where an egress receipt correctly linked
+                # to an fsguard receipt stored further along and torn.
+                #
+                # Reported, and still a failure, but NOT called tampering:
+                # "an entry was removed" is a claim the evidence contradicts,
+                # since the entry is right there. Deliberate reordering
+                # produces the same shape, so the wording names both causes
+                # and asserts neither.
+                out_of_order.append(n)
+            else:
                 return VerifyResult(ok=False, broken_at=n, damaged_lines=damaged,
-                                    detail="An entry was inserted, removed, or reordered.")
-            segments += 1
+                                    out_of_order=out_of_order, ledger=path,
+                                    detail="An entry is missing: this one links to a "
+                                           "receipt that is not in the log.")
         prev = stored
         prev_line = n
 
@@ -428,13 +482,24 @@ def verify_chain(path: str) -> VerifyResult:
     for _, r in rows:
         d = r.get("decision", "?")
         decisions[d] = decisions.get(d, 0) + 1
-    detail = None
+    notes = []
     if damaged:
-        detail = (f"{len(damaged)} malformed line(s) - a torn write, not an "
-                  f"alteration. Every readable entry verified.")
-    return VerifyResult(ok=True, entries=len(rows), head=prev,
+        notes.append(f"{len(damaged)} malformed line(s) - a torn write, not an "
+                     f"alteration. Every readable entry verified.")
+    if out_of_order:
+        n_ooo = len(out_of_order)
+        notes.append(f"{n_ooo} entr{'y' if n_ooo == 1 else 'ies'} out of chain order. Every "
+                     f"referenced receipt is present, so nothing was removed - "
+                     f"consistent with concurrent writers appending at stale "
+                     f"offsets, or with deliberate reordering.")
+    # OUT OF ORDER STILL FAILS. The chain is not linear, and a verifier that
+    # returned ok for that would be excusing the one shape a reordering attack
+    # produces. What changes is the WORDING, not the verdict: it names what is
+    # true (the order is wrong) instead of what is not (an entry was removed).
+    return VerifyResult(ok=not out_of_order, entries=len(rows), head=prev,
                         decisions=decisions, damaged_lines=damaged,
-                        segments=segments, detail=detail)
+                        segments=segments, out_of_order=out_of_order,
+                        ledger=path, detail=" ".join(notes) or None)
 
 
 # writes and verifies) plus the shareable proof-card builder. They reuse the

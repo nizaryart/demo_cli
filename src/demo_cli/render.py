@@ -30,6 +30,10 @@ _DECISION_COLOR = {
     ALLOW: "green", DRY_RUN: "yellow", REVERSIBLE: "yellow",
     CONTEXT_MISMATCH: "red", ESCALATE: "red",
     "RESTORED": "green", "VERIFIED": "green", "TAMPERED": "red", "DIFF": "cyan",
+    # Amber, not red: the log is not linear, but nothing was removed or
+    # edited. Colouring it like tampering would say with the palette what the
+    # wording is careful not to say.
+    "DAMAGED": "yellow", "OUT OF ORDER": "yellow",
 }
 _TONE_COLOR = {"add": "green", "del": "red", "mod": "yellow", "meta": "cyan", "info": "dim"}
 
@@ -197,6 +201,20 @@ def _verify_block(name: str, v: VerifyResult) -> List[str]:
               verifier asserting something it cannot know.
     TAMPERED  a line parses but its hash or link is wrong. Content changed.
     """
+    if v.reordered and not v.broken_at:
+        # NOT "TAMPERED". Every referenced receipt is present; only the order
+        # is wrong. Saying an entry was removed when it is demonstrably still
+        # in the file is the verifier asserting something false.
+        out = ["  " + c(f"{name:<12} {v.entries} entries, "
+                        f"{len(v.out_of_order)} OUT OF ORDER", "yellow")]
+        lines_ = ", ".join(str(n) for n in v.out_of_order[:5])
+        more = "" if len(v.out_of_order) <= 5 else f" (+{len(v.out_of_order) - 5} more)"
+        out.append(f"             at line {lines_}{more}")
+        if v.damaged:
+            out.append(f"             {len(v.damaged_lines)} malformed line(s) as well")
+        out.append("             " + c("nothing was removed - every referenced "
+                                       "receipt is still in the log", "dim"))
+        return out
     if not v.ok:
         out = ["  " + c(f"{name:<12} TAMPERED", "red")]
         if v.broken_at:
@@ -223,9 +241,19 @@ def render_verify(v: VerifyResult, version: str, fs: Optional[VerifyResult] = No
     on a project that has never been mounted, and that is not a failure."""
     ok = v.ok and (fs.ok if fs else True) and (links.ok if links else True)
     damaged = v.damaged or (fs.damaged if fs else False)
-    label = "TAMPERED" if not ok else ("DAMAGED" if damaged else "VERIFIED")
-    lines = ["", c(f"demo_cli {version}", "dim") + "  " + _label(label), "",
-             c("Receipt chains", "cyan")]
+    reordered = v.reordered or (fs.reordered if fs else False)
+    if ok:
+        label = "DAMAGED" if damaged else "VERIFIED"
+    else:
+        label = "OUT OF ORDER" if reordered and not v.broken_at else "TAMPERED"
+    lines = ["", c(f"demo_cli {version}", "dim") + "  " + _label(label), ""]
+    # WHICH LEDGER. `verify` run from the wrong directory silently checks a
+    # different project's log: on 2026-09-02 running it from Desktop reported
+    # VERIFIED over 7 unrelated entries while labubu's own chain was broken.
+    # A clean pass for a project you did not ask about is worse than an error.
+    if v.ledger:
+        lines += [kv("ledger", v.ledger), ""]
+    lines.append(c("Receipt chains", "cyan"))
     lines += _verify_block("main", v)
     if fs is not None:
         lines += _verify_block("fs", fs)
