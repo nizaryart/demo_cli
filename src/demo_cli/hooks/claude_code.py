@@ -30,6 +30,7 @@ import sys
 from typing import Dict
 
 from . import attributed
+from .. import fsreport
 from ..classify import POSIX, POWERSHELL
 from ..config import load_config
 from ..context import Intent
@@ -115,6 +116,19 @@ def run_pretooluse(stdin, stdout) -> int:
 
     try:
         cfg = load_config(start=cwd)
+        # WHAT THE FILESYSTEM LAYER DID, BEFORE ANYTHING ELSE.
+        #
+        # It runs in another process, does not block, and logs to a file
+        # inside the Administrators-only backing directory - so the agent
+        # cannot see it work, and on 2026-09-02 one reported four snapshotted
+        # deletions as "unblocked destructions". Reported here because this is
+        # the only channel that reaches the agent. One command behind by
+        # nature: PreToolUse fires before the command runs, so these belong to
+        # the PREVIOUS one, and the wording says so.
+        fs_note = fsreport.summary(cfg)
+        if fs_note:
+            _stderr("")
+            _stderr(fs_note)
         guard = Guard(config=cfg)
         if is_shell:
             command = (tool_input.get("command") or "").strip()
@@ -163,6 +177,12 @@ def run_pretooluse(stdin, stdout) -> int:
         _loud_save(result)          # <-- make the save FELT, on stderr
     elif result.decision.is_blocking:
         _loud_block(result)         # <-- make the block legible, with report link
+    if fs_note:
+        # Also on the decision reason, not only stderr. Whether hook stderr
+        # reaches the model is up to the host and its version; this field
+        # reliably does, and an agent that cannot see the fs layer draws
+        # wrong conclusions about the whole guard.
+        reason += "\n\n" + fs_note
     _emit(stdout, result.permission, reason)
     return 0
 

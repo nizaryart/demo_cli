@@ -195,7 +195,11 @@ def cmd_diff(a) -> int:
 
 def cmd_log(a) -> int:
     cfg = load_config(getattr(a, "root", None))
-    render.render_log(recovery.load_entries(cfg.recovery_dir), __version__)
+    entries = recovery.load_entries(cfg.recovery_dir)
+    last = getattr(a, "last", None)
+    if last and last > 0:
+        entries = entries[-last:]
+    render.render_log(entries, __version__)
     return 0
 
 
@@ -2079,7 +2083,15 @@ def build_parser() -> argparse.ArgumentParser:
     df.add_argument("--target", default=None)
     df.set_defaults(func=cmd_diff)
 
-    lg = sub.add_parser("log", parents=[common], help="list captured recovery points")
+    # `receipts` is an ALIAS, not a second command. Two different agents have
+    # now guessed `demo_cli receipts` and got an argparse usage error - the
+    # workspace file is called receipts.jsonl and doctor talks about "agent
+    # receipts", so the name is one the tool teaches people. A guessable name
+    # that errors is a small failure the guard can simply not have.
+    lg = sub.add_parser("log", parents=[common], aliases=["receipts"],
+                        help="list captured recovery points")
+    lg.add_argument("--last", type=int, default=None, metavar="N",
+                    help="show only the N most recent")
     lg.set_defaults(func=cmd_log)
 
     vf = sub.add_parser("verify", parents=[common], help="verify the receipt hash-chain")
