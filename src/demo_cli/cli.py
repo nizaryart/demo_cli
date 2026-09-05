@@ -492,9 +492,11 @@ def _mount_checks(cfg) -> List[tuple]:
 
     if not st.recorded:
         if not fsmount.available():
+            # Deliberately does NOT name a cause. The driver/binding lines
+            # above already did, separately and correctly; repeating a guess
+            # here is how the wrong one got printed for three weeks.
             return [("warn", "filesystem guard",
-                     "not running; winfspy not importable "
-                     "(pipx inject demo-cli winfspy)")]
+                     "not running - see the winfsp lines above for why")]
         # Telling somebody to protect a project that is already protected
         # reads as the tool not knowing its own state. guarded.assess makes
         # the same distinction; this is the second copy of that message and
@@ -603,11 +605,13 @@ def cmd_doctor(a) -> int:
             writable = False
         checks.append(("ok" if writable else "fail", "workspace writable", ws))
 
-    pg = bool(shutil.which("pg_dump") and shutil.which("pg_restore"))
-    checks.append(("ok" if pg else "warn", "postgres tools",
-                   "pg_dump/pg_restore found" if pg else "missing (postgres snapshot disabled)"))
-    git = bool(shutil.which("git"))
-    checks.append(("ok" if git else "warn", "git", "found" if git else "missing (branch/remote context off)"))
+    # Prerequisites, each with the command that fixes it. Moved out to deps.py
+    # so the verdicts are pure functions testable off Windows - and so the
+    # WinFsp driver stops being conflated with the winfspy binding, which is
+    # the fourth time a diagnostic in this project has been able to name only
+    # one cause and named it wrongly.
+    from . import deps as deps_mod
+    checks.extend(d.as_check() for d in deps_mod.check_all(cfg.project_root))
 
     hosts = _host_hook_status(cfg)
     for label, path in hosts:
