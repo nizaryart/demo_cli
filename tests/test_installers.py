@@ -145,6 +145,23 @@ def test_the_windows_installer_verifies_winfsp_by_probe_not_exit_code(ps):
     assert "Do NOT trust $LASTEXITCODE" in ps
 
 
+def test_winget_asks_for_the_full_feature_set(ps):
+    """`winget show --id WinFsp.WinFsp` reports Installer Type: wix, so winget
+    runs msiexec and --custom reaches it. The DEFAULT feature set may omit the
+    Developer feature the winfspy binding needs, and the user would only learn
+    that one step later from an import error that looks like a packaging
+    fault. Asking up front costs nothing and removes a round trip."""
+    assert 'ADDLOCAL=ALL' in ps
+    assert '--custom "ADDLOCAL=ALL"' in ps, "must reach the MSI, not just be printed"
+
+
+def test_the_pinned_winget_id_is_the_stable_package(ps):
+    """A `winget search winfsp` also lists WinFsp.WinFsp.Beta. Pinning the
+    stable id is deliberate; a driver is not the place to track a beta."""
+    assert "--id WinFsp.WinFsp " in ps or "--id WinFsp.WinFsp\n" in ps
+    assert "WinFsp.WinFsp.Beta" not in ps
+
+
 def test_the_windows_extra_is_only_requested_when_the_driver_is_there(ps):
     assert "demo_cli[windows] @" in ps
     assert "without the [windows] extra" in ps

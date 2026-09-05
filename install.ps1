@@ -145,7 +145,15 @@ if ($dll) {
         if (Get-Command winget -ErrorAction SilentlyContinue) {
             Say "  running winget (it will raise its own Administrator prompt)..."
             $ErrorActionPreference = "Continue"
-            winget install --id WinFsp.WinFsp --accept-package-agreements --accept-source-agreements 2>&1 | Out-Null
+            # --custom "ADDLOCAL=ALL" reaches the MSI underneath. Verified
+            # 2026-09-05: `winget show --id WinFsp.WinFsp` reports
+            # "Installer Type: wix", so winget shells out to msiexec and
+            # passes this through. Without it the DEFAULT feature set is
+            # installed, which may omit the Developer feature that the
+            # winfspy binding needs - and the user only finds out one step
+            # later, from an import error that looks like a packaging fault.
+            winget install --id WinFsp.WinFsp --custom "ADDLOCAL=ALL" `
+                --accept-package-agreements --accept-source-agreements 2>&1 | Out-Null
             $ErrorActionPreference = "Stop"
             # Do NOT trust $LASTEXITCODE. Re-probe.
             $dll = Find-WinFspDll (Find-WinFsp)
@@ -156,7 +164,8 @@ if ($dll) {
             Warn "  automatic install did not work (winget missing, declined, or"
             Warn "  a different package id). Do it by hand - it takes a minute:"
             Say  ""
-            Say  "      1. download the MSI:  https://winfsp.dev/rel/"
+            Say  "      1. download the MSI from https://winfsp.dev/rel/"
+            Say  "         (or the release page: github.com/winfsp/winfsp/releases)"
             Say  "      2. from an Administrator prompt:"
             Say  "           msiexec /i winfsp-<version>.msi ADDLOCAL=ALL"
             Say  ""
