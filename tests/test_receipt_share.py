@@ -97,7 +97,13 @@ def test_share_card_install_command_is_pinned_not_a_moving_branch():
 
 
 def test_release_tag_matches_version():
-    """0.4.0b8 -> v0.4.0-beta.8, so pinned commands follow the version bump."""
+    """1.0.5 -> v1.0.5, so pinned commands follow the version bump.
+
+    Deliberately asserts the SHAPE, not a literal tag: the point is that the
+    command in a shared receipt tracks __version__, and a test that hardcodes
+    one tag has to be edited on every release, which is how it silently stops
+    checking anything.
+    """
     from demo_cli.version import release_tag, __version__
     tag = release_tag()
     assert tag.startswith("v")

@@ -1,0 +1,326 @@
+<title>demo_cli Call Graph</title>
+<style>
+  :root{
+    --bg:#F6F8F9; --surface:#FFFFFF; --surface-2:#EBF0F2; --raised:#FDFEFE;
+    --ink:#131A1F; --ink-2:#45555F; --muted:#75868F;
+    --line:#D3DBDF; --line-strong:#AFBCC3;
+    --spine:#0F766E; --spine-fill:rgba(15,118,110,.10);
+    --entry:#B4530A; --entry-fill:rgba(180,83,10,.10);
+    --self:#9F1239;  --self-fill:rgba(159,18,57,.10);
+    --mono:ui-monospace,"SF Mono",SFMono-Regular,"JetBrains Mono",Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+    --bg:#0D1317; --surface:#121B20; --surface-2:#18242B; --raised:#162127;
+    --ink:#DDE5E9; --ink-2:#A2B3BB; --muted:#7C8E97;
+    --line:#233138; --line-strong:#37484F;
+    --spine:#5EC5B8; --spine-fill:rgba(94,197,184,.13);
+    --entry:#F0954B; --entry-fill:rgba(240,149,75,.14);
+    --self:#FB7185;  --self-fill:rgba(251,113,133,.13);
+  }}
+  :root[data-theme="dark"]{
+    --bg:#0D1317; --surface:#121B20; --surface-2:#18242B; --raised:#162127;
+    --ink:#DDE5E9; --ink-2:#A2B3BB; --muted:#7C8E97;
+    --line:#233138; --line-strong:#37484F;
+    --spine:#5EC5B8; --spine-fill:rgba(94,197,184,.13);
+    --entry:#F0954B; --entry-fill:rgba(240,149,75,.14);
+    --self:#FB7185;  --self-fill:rgba(251,113,133,.13);
+  }
+  *{box-sizing:border-box}
+  body{background:var(--bg);color:var(--ink);font-family:var(--mono);
+       font-size:14px;line-height:1.55;margin:0;padding:0}
+  .wrap{max-width:1140px;margin:0 auto;padding:0 18px 80px}
+
+  header.top{position:sticky;top:0;z-index:20;background:var(--bg);
+    border-bottom:1px solid var(--line);padding:14px 0 12px;margin-bottom:26px}
+  .brand{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
+  h1{font-size:17px;font-weight:600;letter-spacing:-.01em;margin:0}
+  .badge{font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;
+    padding:2px 8px;border-radius:3px;border:1px solid var(--entry);
+    color:var(--entry);background:var(--entry-fill)}
+  .meta{font-size:11.5px;color:var(--muted);margin-left:auto}
+  .navbar{display:flex;gap:10px;align-items:center;margin-top:11px;flex-wrap:wrap}
+  button{font-family:var(--mono);font-size:12px;background:var(--surface-2);
+    color:var(--ink);border:1px solid var(--line-strong);border-radius:4px;
+    padding:5px 11px;cursor:pointer}
+  button:hover{border-color:var(--spine);color:var(--spine)}
+  button:disabled{opacity:.35;cursor:default}
+  button:disabled:hover{border-color:var(--line-strong);color:var(--ink)}
+  #crumb{font-size:12px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #crumb b{color:var(--ink);font-weight:600}
+  input[type=search]{font-family:var(--mono);font-size:12px;background:var(--surface);
+    color:var(--ink);border:1px solid var(--line-strong);border-radius:4px;
+    padding:5px 10px;min-width:210px}
+  input[type=search]:focus{outline:none;border-color:var(--spine)}
+
+  h2{font-size:13px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;
+    color:var(--muted);margin:30px 0 12px;padding-bottom:8px;border-bottom:1px solid var(--line)}
+  p.note{color:var(--ink-2);font-size:13px;max-width:78ch;margin:0 0 16px}
+
+  svg{display:block;max-width:100%;height:auto;margin:0 auto}
+  .fig{background:var(--surface);border:1px solid var(--line);border-radius:6px;
+    padding:20px 14px;overflow-x:auto;margin-bottom:18px}
+  .n-box{cursor:pointer}
+  .n-box rect{fill:var(--surface-2);stroke:var(--line-strong);stroke-width:1.2}
+  .n-box:hover rect{stroke:var(--spine);stroke-width:2}
+  .n-box.spine rect{fill:var(--spine-fill);stroke:var(--spine);stroke-width:1.5}
+  .n-box.entry rect{fill:var(--entry-fill);stroke:var(--entry);stroke-width:1.5}
+  .n-box.self rect{fill:var(--self-fill);stroke:var(--self);stroke-width:2}
+  .n-box.ext{cursor:default}
+  .n-box.ext rect{fill:none;stroke:var(--line);stroke-width:1;stroke-dasharray:4 3}
+  .n-box.ext:hover rect{stroke:var(--line)}
+  .n-box.ext .n-name{fill:var(--muted)}
+  .n-name{font-size:11.5px;fill:var(--ink);pointer-events:none}
+  .n-sub{font-size:9.5px;fill:var(--muted);pointer-events:none}
+  .edge{stroke:var(--line-strong);stroke-width:1.3;fill:none}
+  .lbl{font-size:10px;fill:var(--muted)}
+
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:8px}
+  .card{background:var(--surface);border:1px solid var(--line);border-radius:5px;
+    padding:9px 12px;cursor:pointer}
+  .card:hover{border-color:var(--spine)}
+  .card .fn{font-size:12.5px;color:var(--ink)}
+  .card .loc{font-size:10.5px;color:var(--muted);margin-top:2px}
+  .modhead{font-size:11px;color:var(--spine);letter-spacing:.08em;
+    text-transform:uppercase;margin:20px 0 8px}
+
+  pre{background:var(--surface-2);border:1px solid var(--line);border-radius:5px;
+    padding:14px 16px;overflow-x:auto;font-size:12px;line-height:1.55;margin:0}
+  .doc{color:var(--ink-2);font-size:13px;margin:0 0 14px;max-width:80ch}
+  .loc-line{font-size:12px;color:var(--muted);margin-bottom:14px}
+  .empty{color:var(--muted);font-size:12.5px;font-style:italic}
+  .legend{display:flex;gap:9px;flex-wrap:wrap;margin-bottom:20px}
+  .key{display:flex;align-items:center;gap:7px;font-size:11px;color:var(--ink-2);
+    border:1px solid var(--line);border-radius:4px;padding:5px 10px;background:var(--surface)}
+  .sw{width:11px;height:11px;border-radius:2px}
+</style>
+
+<div class="wrap">
+<header class="top">
+  <div class="brand">
+    <h1>demo_cli call graph</h1>
+    <span class="badge">__VARIANT__</span>
+    <span class="meta" id="meta"></span>
+  </div>
+  <div class="navbar">
+    <button id="home">overview</button>
+    <button id="back">&larr; back</button>
+    <input type="search" id="find" placeholder="find a function…" autocomplete="off">
+    <span id="crumb"></span>
+  </div>
+</header>
+<main id="view"></main>
+</div>
+
+<script>
+const D = __DATA__;
+const F = D.funcs;
+const short = q => q.split(".").pop();
+const modOf = q => F[q] ? F[q].module : q.split(".").slice(0,-1).join(".");
+let stack = [];
+
+document.getElementById("meta").textContent =
+  D.reachable + " of " + D.total + " functions reachable from the hook entry points"
+  + (D.redefined && Object.keys(D.redefined).length
+     ? "  ·  " + D.definitions + " definitions (" + Object.keys(D.redefined).join(", ")
+       + " is defined more than once — an import fallback; only one exists at runtime)"
+     : "");
+
+/* ---------- tiny SVG helpers -------------------------------------------- */
+function el(tag, attrs, parent){
+  const n = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const k in attrs) n.setAttribute(k, attrs[k]);
+  if (parent) parent.appendChild(n);
+  return n;
+}
+function node(svg, x, y, w, h, qual, cls, sub){
+  const g = el("g", {class:"n-box " + (cls||""), transform:`translate(${x},${y})`}, svg);
+  el("rect", {width:w, height:h, rx:4}, g);
+  const label = short(qual);
+  const t = el("text", {class:"n-name", x:w/2, y: sub ? h/2 - 2 : h/2 + 4,
+                        "text-anchor":"middle"}, g);
+  t.textContent = label.length > 26 ? label.slice(0,25)+"…" : label;
+  const s = el("text", {class:"n-sub", x:w/2, y:h/2+13, "text-anchor":"middle"}, g);
+  s.textContent = sub || modOf(qual);
+  if (F[qual]) g.addEventListener("click", () => go(qual));
+  return g;
+}
+function arrow(svg, x1,y1,x2,y2){
+  el("path", {class:"edge", d:`M${x1},${y1} L${x1},${(y1+y2)/2} L${x2},${(y1+y2)/2} L${x2},${y2}`,
+              "marker-end":"url(#ar)"}, svg);
+}
+function defs(svg){
+  const d = el("defs", {}, svg);
+  const m = el("marker", {id:"ar", viewBox:"0 0 10 10", refX:"9", refY:"5",
+                          markerWidth:"5", markerHeight:"5", orient:"auto-start-reverse"}, d);
+  el("path", {d:"M0,1 L9,5 L0,9 z", fill:"var(--line-strong)"}, m);
+}
+
+/* ---------- overview ----------------------------------------------------- */
+function overview(){
+  stack = [];
+  const v = document.getElementById("view");
+  v.innerHTML = `
+    <div class="legend">
+      <span class="key"><span class="sw" style="background:var(--entry-fill);border:1.5px solid var(--entry)"></span>entry point — the agent calls this</span>
+      <span class="key"><span class="sw" style="background:var(--spine-fill);border:1.5px solid var(--spine)"></span>pipeline stage</span>
+      <span class="key"><span class="sw" style="background:var(--surface-2);border:1.5px solid var(--line-strong)"></span>helper</span>
+    </div>
+    <p class="note">Every box is clickable — it opens that function, showing who calls it,
+    what it calls, and its source. Edges were extracted from the source with Python's
+    parser, so each arrow is a call site that really exists.</p>`;
+
+  const W = 1060, svg = el("svg", {viewBox:`0 0 ${W} 640`, role:"img",
+    "aria-label":"Call graph overview: three hook entry points converge on Guard.evaluate, which runs six pipeline stages in order."}, v);
+  v.insertBefore(Object.assign(document.createElement("div"), {className:"fig"}), null).appendChild(svg);
+  defs(svg);
+
+  // row 1 - entries
+  const ew = 300, gap = 30, x0 = (W - (3*ew + 2*gap))/2;
+  D.entries.forEach((e,i) => {
+    node(svg, x0 + i*(ew+gap), 20, ew, 44, e, "entry", modOf(e).replace("hooks.",""));
+  });
+  el("text",{class:"lbl", x:x0, y:14},svg).textContent = "HOOK ENTRY POINTS  (one per host)";
+
+  // row 2 - the guard
+  const gw = 360, gx = (W-gw)/2;
+  D.entries.forEach((e,i) => arrow(svg, x0 + i*(ew+gap) + ew/2, 64, gx+gw/2, 118));
+  node(svg, gx, 118, gw, 50, "guard.Guard.evaluate", "spine", "the reference monitor");
+
+  // row 3 - the pipeline, in execution order
+  el("text",{class:"lbl", x:40, y:206},svg).textContent =
+    "PIPELINE  (order matters: the snapshot happens BEFORE decide, so decide cannot lie)";
+  const pw = 158, pgap = 14, px0 = (W - (6*pw + 5*pgap))/2;
+  D.spine.forEach((s,i) => {
+    const x = px0 + i*(pw+pgap);
+    arrow(svg, gx+gw/2, 168, x+pw/2, 222);
+    node(svg, x, 222, pw, 52, s[0], "spine", s[1]);
+    const t = el("text",{class:"lbl", x:x+pw/2, y:292, "text-anchor":"middle"},svg);
+    t.textContent = s[2].length>24 ? s[2].slice(0,23)+"…" : s[2];
+  });
+
+  // module index
+  const idx = document.createElement("div");
+  idx.innerHTML = "<h2>every reachable function, by module</h2>";
+  const mods = {};
+  Object.keys(F).forEach(q => (mods[F[q].module] = mods[F[q].module]||[]).push(q));
+  Object.keys(mods).sort().forEach(m => {
+    const h = document.createElement("div");
+    h.className = "modhead"; h.textContent = m + "  ·  " + mods[m].length;
+    idx.appendChild(h);
+    const g = document.createElement("div"); g.className = "grid";
+    mods[m].sort().forEach(q => g.appendChild(card(q)));
+    idx.appendChild(g);
+  });
+  v.appendChild(idx);
+  crumb("");
+}
+
+function card(q){
+  const c = document.createElement("div");
+  c.className = "card";
+  c.innerHTML = `<div class="fn">${short(q)}()</div>
+                 <div class="loc">${F[q].file}:${F[q].line}</div>`;
+  c.addEventListener("click", () => go(q));
+  return c;
+}
+
+/* ---------- one function ------------------------------------------------- */
+function detail(q){
+  const f = F[q], v = document.getElementById("view");
+  v.innerHTML = "";
+  // Callers may live OUTSIDE this graph (cli.py, egress, the syscall guard all
+  // reuse the same core). Hiding them would understate how shared the core is,
+  // so they are drawn dimmed and unclickable rather than dropped.
+  const inC  = f.callers.filter(c => F[c]);
+  const extC = f.callers.filter(c => !F[c]);
+  const callers = inC.concat(extC);
+  const callees = f.calls.filter(c => F[c]);
+
+  const rows = Math.ceil(Math.max(callees.length,1)/5);
+  const H = 150 + rows*74 + (callers.length ? 0 : -60);
+  const W = 1060;
+  const fig = document.createElement("div"); fig.className = "fig"; v.appendChild(fig);
+  const svg = el("svg", {viewBox:`0 0 ${W} ${H}`, role:"img",
+    "aria-label":`${short(q)}: ${callers.length} callers above, ${callees.length} callees below`}, fig);
+  defs(svg);
+
+  const bw = 190, bh = 40;
+  // callers
+  if (callers.length){
+    el("text",{class:"lbl", x:20, y:14},svg).textContent = "CALLED BY";
+    const n = Math.min(callers.length,5), tw = n*bw + (n-1)*16, sx=(W-tw)/2;
+    callers.slice(0,5).forEach((c,i)=>{
+      node(svg, sx+i*(bw+16), 22, bw, bh, c, F[c] ? "" : "ext", modOf(c));
+      arrow(svg, sx+i*(bw+16)+bw/2, 62, W/2, 96);
+    });
+    if (callers.length>5){
+      const t=el("text",{class:"lbl",x:W-20,y:52,"text-anchor":"end"},svg);
+      t.textContent = "+"+(callers.length-5)+" more";
+    }
+  }
+  // the function itself
+  node(svg, (W-300)/2, 96, 300, 48, q, "self", f.module);
+  // callees
+  if (callees.length){
+    el("text",{class:"lbl", x:20, y:180},svg).textContent = "CALLS";
+    callees.forEach((c,i)=>{
+      const r = Math.floor(i/5), col = i%5;
+      const n = Math.min(callees.length - r*5, 5), tw = n*bw + (n-1)*16, sx=(W-tw)/2;
+      const y = 190 + r*74;
+      arrow(svg, W/2, 144, sx+col*(bw+16)+bw/2, y);
+      node(svg, sx+col*(bw+16), y, bw, bh, c, "", modOf(c));
+    });
+  }
+
+  const info = document.createElement("div");
+  const extNote = extC.length
+    ? `<p class="doc"><b>${extC.length}</b> further caller${extC.length>1?"s":""} outside
+       this graph (dashed, not clickable): ${extC.map(e=>esc(short(e))+"() in "+esc(modOf(e))).join(", ")}.
+       Those are reached from other entry points — the CLI, the egress proxy, the syscall guard —
+       which is what "shared core" means concretely.</p>`
+    : "";
+  info.innerHTML =
+    `<h2>${f.cls ? f.cls+"." : ""}${f.name}()</h2>
+     <div class="loc-line">${f.file}:${f.line}${f.cls ? "  ·  method of "+f.cls : ""}</div>
+     ${f.doc ? `<p class="doc">${esc(f.doc)}</p>` : `<p class="doc empty">no docstring</p>`}
+     ${extNote}
+     <h2>source</h2><pre>${esc(f.source)}</pre>`;
+  v.appendChild(info);
+  crumb(q);
+}
+
+function esc(s){ return (s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+
+function crumb(q){
+  const c = document.getElementById("crumb");
+  c.innerHTML = q ? stack.map(s=>short(s)+"()").concat("<b>"+short(q)+"()</b>").join(" › ")
+                  : "overview";
+  document.getElementById("back").disabled = stack.length === 0;
+}
+function go(q){
+  if (currentQual) stack.push(currentQual);
+  currentQual = q;
+  detail(q);
+  window.scrollTo(0,0);
+}
+let currentQual = null;
+
+document.getElementById("home").addEventListener("click", ()=>{currentQual=null; overview();});
+document.getElementById("back").addEventListener("click", ()=>{
+  const prev = stack.pop();
+  if (prev){ currentQual = prev; detail(prev); } else { currentQual=null; overview(); }
+  window.scrollTo(0,0);
+});
+document.getElementById("find").addEventListener("input", e=>{
+  const t = e.target.value.trim().toLowerCase();
+  if (!t) return;
+  const hit = Object.keys(F).find(q => short(q).toLowerCase().startsWith(t))
+           || Object.keys(F).find(q => q.toLowerCase().includes(t));
+  if (hit){ currentQual = hit; detail(hit); }
+});
+document.addEventListener("keydown", e=>{
+  if (e.key === "Escape") document.getElementById("back").click();
+});
+
+overview();
+</script>

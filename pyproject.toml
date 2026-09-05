@@ -13,6 +13,8 @@ authors = [{ name = "WePwn" }]
 keywords = ["ai-agents", "safety", "guardrails", "claude-code", "recovery", "audit"]
 classifiers = [
     "Development Status :: 4 - Beta",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
     "Topic :: Software Development :: Quality Assurance",
@@ -24,9 +26,22 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=7"]
 
+# The filesystem guard (Windows). `fsmount.py` genuinely imports winfspy, so
+# this is a real dependency - but an OPTIONAL one, on purpose:
+#
+#   winfspy is a binding, not the driver. It is useless without WinFsp itself
+#   (an MSI from winfsp.dev, installed with the Developer feature), and on a
+#   machine without it the install can fail outright. As a hard dependency
+#   that failure would take the STRING layer down with it - a user who only
+#   wanted the classifier would end up with no demo_cli at all.
+#
+#   So the installer checks for the driver first, installs it if missing, and
+#   only then asks for this extra. Order matters; see install.ps1.
+windows = ["winfspy>=0.8.4; sys_platform == 'win32'"]
+
 [project.urls]
-Homepage = "https://github.com/WePwn/demo_cli"
-Issues = "https://github.com/WePwn/demo_cli/issues"
+Homepage = "https://github.com/nizaryart/DEMO_LOADING"
+Issues = "https://github.com/nizaryart/DEMO_LOADING/issues"
 
 [project.scripts]
 demo_cli = "demo_cli.cli:main"

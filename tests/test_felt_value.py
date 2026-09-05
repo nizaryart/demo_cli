@@ -50,7 +50,7 @@ def test_felt_save_carries_the_prefilled_report_link():
     open(os.path.join(d, "a.txt"), "w").write("x")
     _, err = _run_hook("rm -rf a.txt", cwd=d)
     assert "report it (prefilled)" in err
-    assert "github.com/WePwn/demo_cli/issues/new" in err
+    assert "github.com/nizaryart/DEMO_LOADING/issues/new" in err
 
 
 def test_block_prints_honest_no_capture_line():

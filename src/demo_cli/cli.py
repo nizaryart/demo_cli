@@ -26,7 +26,7 @@ _EXIT = {ESCALATE: 2, CONTEXT_MISMATCH: 1}
 
 _CONFIG_TEMPLATE = """\
 # demo_cli configuration. All fields are optional; defaults are safe.
-# Docs: https://github.com/WePwn/demo_cli
+# Docs: https://github.com/nizaryart/DEMO_LOADING
 
 mode = "shadow"            # "shadow" observes only; "enforce" gates actions
 

@@ -76,7 +76,7 @@ def _print(lines: List[str]) -> None:
     print("\n".join(lines))
 
 
-_ISSUE_BASE = "https://github.com/WePwn/demo_cli/issues/new"
+_ISSUE_BASE = "https://github.com/nizaryart/DEMO_LOADING/issues/new"
 
 # Only prompt on decisions a user might consider *wrong* — a hard stop, a
 # context mismatch, or a snapshot that fired. Plain ALLOWs stay silent so the

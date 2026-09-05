@@ -634,7 +634,7 @@ def find_receipt(path: str, receipt_id: Optional[str] = None) -> Optional[dict]:
     return matches[-1] if matches else None
 
 
-def share_card(receipt: dict, *, repo: str = "github.com/WePwn/demo_cli") -> str:
+def share_card(receipt: dict, *, repo: str = "github.com/nizaryart/DEMO_LOADING") -> str:
     """Build a copy-pasteable, plain-text (markdown-safe) proof card for a
     single receipt, plus a one-line command anyone can run to verify the chain
     this receipt belongs to.

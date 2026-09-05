@@ -2,11 +2,15 @@
 
 import re
 
-__version__ = "0.4.0b8"
+__version__ = "1.0.5"
 
 
 def release_tag() -> str:
-    """The git tag matching this version: 0.4.0b8 -> v0.4.0-beta.8.
+    """The git tag matching this version: 1.0.5 -> v1.0.5.
+
+    The beta form is still understood (0.4.0b8 -> v0.4.0-beta.8) because
+    receipts written by those versions quote a tag this function produced,
+    and a shared receipt must stay verifiable after the fork left betas.
 
     Derived from __version__ so any command we print for a user to run stays
     pinned to the exact code they are looking at, and cannot drift back to a
