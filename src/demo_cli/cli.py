@@ -537,27 +537,21 @@ def _mount_checks(cfg) -> List[tuple]:
     else:
         out.append(("ok", "filesystem guard", f"mounted at {where} (pid {st.pid}{age})"))
 
-    # A mount over a writable backing directory is bypassable by anything that
-    # writes to the backing path instead - demonstrated live on 2026-08-25 by
-    # an ordinary Remove-Item that the guard never saw.
-    if st.backing and not os.path.isdir(st.backing):
-        # The record names a backing that no longer exists - a torn-down
-        # project. "cannot tell for <path>" invited the reader to go and check
-        # a directory that is not there.
-        pass
-    elif st.backing:
-        locked = protect_mod.is_locked(st.backing)
-        if locked is True:
-            out.append(("ok", "backing locked", st.backing))
-        elif locked is False:
-            out.append(("warn", "backing locked",
-                        f"NO - {st.backing} is writable directly, which bypasses "
-                        f"the guard entirely. Re-run `demo_cli protect` from an "
-                        f"Administrator shell"))
-        else:
-            out.append(("warn", "backing locked",
-                        f"cannot tell for {st.backing}"))
-    elif st.running:
+    # THE BACKING LOCK IS CHECKED IN deps.py, NOT HERE.
+    #
+    # It used to be in both, and the two copies had already drifted: this one
+    # said "warn", deps says "fail", for the same fact. A doctor report that
+    # prints one label twice with two severities is worse than either verdict
+    # alone - the reader cannot tell which to believe. Observed on real
+    # hardware 2026-09-05, both lines visible in one report.
+    #
+    # deps wins the merge on coverage: it keys on the backing directory
+    # EXISTING, so it also catches a protected project whose guard has never
+    # started, whereas st.backing is only populated once a mount is recorded.
+    # It wins on severity too - the comment that used to sit here noted the
+    # bypass was demonstrated live on 2026-08-25 by an ordinary Remove-Item
+    # the guard never saw, and a demonstrated bypass is not a warning.
+    if not st.backing and st.running:
         out.append(("warn", "filesystem guard storage",
                     "IN MEMORY - contents are lost on unmount. "
                     "For real work: demo_cli protect <project>"))

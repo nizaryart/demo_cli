@@ -226,3 +226,52 @@ def test_check_all_survives_a_project_that_does_not_exist():
     that crashes - a diagnostic that cannot run diagnoses nothing."""
     out = deps.check_all("/nonexistent/project/path")
     assert out and all(isinstance(d, deps.Dep) for d in out)
+
+
+# --------------------------------------------------------------------------
+# One fact, one line. Found on real hardware 2026-09-05.
+# --------------------------------------------------------------------------
+
+def test_only_deps_emits_the_backing_lock_verdict():
+    """`backing locked` was checked in BOTH deps.py and cli._mount_checks, and
+    the two copies had drifted to different severities - a doctor report
+    printed the same label twice, once as [x] fail and once as [!] warn, for
+    the same directory. The reader has no way to know which to believe.
+
+    Cheap and structural on purpose: this is the check that would have caught
+    it, and the one that keeps a future edit from re-adding a second opinion.
+    """
+    import os
+    src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                       "src", "demo_cli")
+    emitters = []
+    for name in sorted(os.listdir(src)):
+        if not name.endswith(".py"):
+            continue
+        with open(os.path.join(src, name), encoding="utf-8") as f:
+            body = f.read()
+        # The label as it reaches render_doctor: a quoted check name.
+        if '"backing locked"' in body:
+            emitters.append(name)
+    assert emitters == ["deps.py"], (
+        f"more than one module produces the 'backing locked' verdict: {emitters}")
+
+
+def test_a_doctor_report_never_repeats_a_label(tmp_path, monkeypatch):
+    """The general invariant behind the bug above. Two checks may disagree
+    internally, but the report must resolve that before printing - a duplicated
+    label is an unresolved disagreement shown to the user."""
+    from demo_cli import cli, render
+
+    captured = {}
+    monkeypatch.setattr(render, "render_doctor",
+                        lambda checks, version: captured.setdefault("c", checks))
+
+    class Args:
+        root = str(tmp_path)
+        no_color = True
+    cli.cmd_doctor(Args())
+
+    labels = [name for _, name, _ in captured["c"]]
+    dupes = {n for n in labels if labels.count(n) > 1}
+    assert not dupes, f"doctor printed these labels more than once: {sorted(dupes)}"
