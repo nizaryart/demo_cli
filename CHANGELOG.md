@@ -1,5 +1,232 @@
 # Changelog
 
+## 1.0.6 - 2026-09-06 - installation, and diagnosing it honestly
+
+* **The installer was shipping a different tool.** `install.sh` and
+  `install.ps1` both pinned `git+https://github.com/WePwn/demo_cli.git@v0.4.0-beta.8`,
+  a tag from 2026-07-19 that contains none of the work since: no filesystem
+  guard, no `protect`/`setup`/`teardown`, no split ledger, neither classifier
+  fix. Upstream's push is disabled by design, so that tag will never contain
+  it. Anyone following the README would have installed July's code and filed
+  reports against software that no longer exists. All URLs now point at the
+  repository the code actually lives in, pinned to the current release tag.
+
+* **The WinFsp driver and the `winfspy` binding are diagnosed separately.**
+  `doctor` caught any `ImportError` from `import winfspy` and always answered
+  `pipx inject demo-cli winfspy`. That is right when the binding is missing
+  and wrong when the binding is fine and the *driver* is absent - the user
+  runs it, pip reports success, nothing changes. The new `deps` module probes
+  the two independently and gives four machine states four different answers,
+  in dependency order, and prints the real exception rather than inventing a
+  third cause when both are present and it still fails. This was the fourth
+  instance in one week of a diagnostic that could name only one cause naming
+  it wrongly (see 2026-09-02).
+
+* **`doctor` checks the prerequisites it never checked.** `mitmdump` was not
+  checked at all, so the egress layer could be entirely absent from a green
+  report. Added, along with an elevation warning worded per platform (on
+  Windows it names the ACL bypass; on Linux, where there is no ACL
+  separation, it names the ledger instead) and a re-check of the backing
+  directory's ACL, which `protect` applied once and nothing ever verified
+  again.
+
+* **`backing locked` was reported twice, with two severities.** The check
+  existed in both `deps` and `cli._mount_checks`, and the copies had drifted
+  - one `fail`, one `warn`, for the same directory in the same report. The
+  surviving check keys on the backing directory existing rather than on a
+  mount being recorded, so it also catches a protected project whose guard
+  has never started.
+
+* **`protect` re-applies the lock instead of refusing.** `doctor`'s
+  remediation for an unlocked backing was `demo_cli protect <project>`, and
+  `protect` refused it: *"<backing> already exists. Refusing to merge two
+  trees."* The refusal is correct in general, but on an already-protected
+  project there are not two trees - there is one tree seen twice, the mount
+  and its backing - so nothing needs moving and only the lock can be missing.
+  `protect` now detects that case from demo_cli's own mount record (never
+  from the directory name, because a false positive would apply an
+  Administrators-only ACL to unrelated data) and re-locks without moving
+  anything. `setup` inherits the repair.
+
+* **An elevated repair reports its own outcome.** `ShellExecuteExW` gives the
+  elevated child its own console, which closes on exit, so a successful
+  relock printed nothing and looked like a no-op. The parent now reads the
+  ACL itself rather than relaying the child or trusting its exit code.
+
+* **Remediations name the real path.** `demo_cli protect <project>` became
+  `demo_cli protect C:\path\to\project   (re-applies the lock; moves
+  nothing)`. A command the reader has to edit before running is one they can
+  edit wrongly.
+
+* **The installers prepare the machine and nothing else.** They no longer
+  write a config or install a hook; that is `demo_cli setup`, run per project
+  after reading what it will move. Both now **refuse to run elevated**: pipx
+  installs per user, so an elevated install puts `demo_cli` on the
+  Administrator's PATH and leaves it absent from the shell where the agent
+  runs - the hook registers, `doctor` looks green, and nothing is ever gated.
+  On Linux there is a second reason: root-owned receipts that the user's own
+  unelevated `undo` cannot read.
+
+* **One elevation prompt, at the point of need.** Only the WinFsp MSI
+  requires Administrator; `winget` owns that prompt so the script itself
+  stays unelevated, `--custom "ADDLOCAL=ALL"` reaches the MSI so the
+  Developer feature the binding needs is present, and the result is confirmed
+  by re-reading the registry rather than by an exit code.
+
+* **The PATH check can now answer no.** Both scripts previously tested `PATH`
+  after editing `PATH` themselves. They now check the *persisted* path - the
+  user registry on Windows, the shell profiles on POSIX - because the shell
+  that launches the agent is a different shell, and that is the one that has
+  to find `demo_cli`.
+
+* **Packaging.** `winfspy` is declared as an optional `[windows]` extra
+  (`fsmount` genuinely imports it) rather than a hard dependency, so a
+  machine without the driver still gets the string layer instead of a failed
+  install. `mitmproxy` is deliberately *not* declared: the proxy is located
+  with `shutil.which("mitmdump")`, so an extra would install the library and
+  leave the binary off `PATH`.
+
+* Tests: 826 passing (Linux 826; Windows 807 + 19 platform-gated skips), up
+  from 779. New: `tests/test_deps.py`, `tests/test_installers.py` - including
+  one that fails if the tag pinned in the install scripts ever disagrees with
+  `version.release_tag()`, which is how 1.0.5 came to be published without
+  the release it was cut for.
+
+## 1.0.5 - 2026-09-05 - first versioned release of the red-team fork
+
+Everything between `0.4.0b8` (2026-07-19) and this release landed unversioned
+on the working branch over seven weeks. It is grouped by theme below, with
+the date each piece was proven on real hardware rather than the date it was
+written. Version numbering restarts at 1.0.x because this fork has diverged
+substantially from upstream and a shared receipt must name unambiguously
+which codebase verified it.
+
+### Windows: a behavioural guard, not a port (2026-08-23 - 2026-08-25)
+
+* **The filesystem guard.** `ptrace` has no Windows equivalent that avoids
+  kernel driver signing, so the behavioural layer is implemented over
+  **WinFsp**, whose kernel driver ships already signed. The project directory
+  becomes a user-mode passthrough mount; deletes and truncations are seen as
+  operations rather than inferred from command text, snapshotted, then passed
+  through. This closes the same gap the syscall guard closes on Linux - what
+  the string layer cannot read, the kernel already knows.
+* Judgement and plumbing are split: `fsguard` holds the decisions and is
+  testable on any platform, `fsmount` holds the `winfspy` subclass and is
+  not. `fspassthrough` holds the backing-store operations.
+* Measured cost on real hardware: 200 writes took 0.294s outside the mount
+  and 1.131s inside - roughly 4ms of guard overhead per operation.
+
+### Windows: making the guard unbypassable (2026-08-25 - 2026-08-29)
+
+* **`protect` / `unprotect`.** The project is relocated to `<project>.real`
+  and its original path becomes the mount, so the guard cannot be sidestepped
+  by using the real path. The backing directory is locked to Administrators
+  and SYSTEM, which is what makes an unelevated agent physically unable to
+  reach around the mount.
+* The ACL is applied in two passes. A single `icacls` call with `/T` strips
+  inherited access from every existing child and has its `(OI)(CI)` grant
+  rejected on files, leaving them with an empty DACL - unreadable by
+  everyone, including their owner. Found live on 2026-08-25.
+* **`setup` and `teardown`.** One command to make a project guarded - config,
+  hooks for every host present, relocation, logon task, mount - and one to
+  reverse all of it in any machine state. Setup will not move files without
+  printing exactly what it will do and asking.
+* **`guarded`** launches an agent with every available layer started and
+  reports coverage before handing over the terminal, re-checking on a
+  heartbeat so a layer that drops mid-session is announced.
+* A reboot test on 2026-08-29 produced seven defects, three of them the same
+  defect in different clothes. The most consequential: `doctor`'s
+  workspace-writable check called `os.makedirs`, which creates parents - and
+  on a protected project the parent *is* the mount point, so running the
+  diagnostic while the guard was down left a real directory where the mount
+  belonged and the guard could never return. A diagnostic that bricks what it
+  diagnoses.
+
+### Receipts: a tamper-evident ledger across two writers (2026-09-02)
+
+* **Split chains.** The hook, CLI and egress layers write through the mount;
+  the filesystem guard writes in the backing. These are different lock
+  domains - a byte-range lock taken through WinFsp and one taken on NTFS are
+  not the same lock - so a single append-only file was being interleaved and
+  torn. Receipts now carry a `chain` field and are routed to separate files.
+* **Cross-chain anchoring.** Each receipt records `peer_head`, the other
+  chain's head hash at the moment of writing. A lone hash chain cannot detect
+  truncation of its own tail; an anchor in the other chain proves the entry
+  existed and closes it. Staleness weakens the claim without falsifying it.
+* **`verify` distinguishes five outcomes** instead of two: VERIFIED, DAMAGED
+  (a torn line, salvaged), OUT OF ORDER, TAMPERED (a self-hash mismatch,
+  never excused), and NO RECEIPTS - because an empty ledger was previously
+  reported as tampering.
+* `verify` now prints which ledger it read. Run from the wrong directory it
+  had silently verified a stray ledger and reported success.
+* Proven by comparison, not assertion: two lab projects ran the same
+  experiment on the same machine. The first corrupted its own audit trail
+  twice; the second, after these changes, came through with 232 and 205
+  entries intact and 237 cross-links resolved.
+
+### Classifier (2026-09-02)
+
+* **A trailing redirection no longer swallows a nested payload.**
+  `powershell -Command "Remove-Item -Force notes.txt" 2>&1` joined the `2>&1`
+  into the script text, so the payload began with a quote character and every
+  anchored rule stopped matching. The `2>&1` belongs to the outer shell.
+* **A nested shell is found anywhere in a pipeline.** Unwrapping ran once on
+  the whole line before splitting, so `echo hi; powershell -Command
+  "Remove-Item x"` was never judged at all.
+* Both were found by an agent working a scripted lab exercise, then
+  reproduced on Linux against bash and cmd - neither was Windows-specific.
+  Both survived the suite because unanchored rules still fired on the mangled
+  text, so the command still looked destructive and only its *operand* went
+  missing: an honest escalation instead of a silent pass, which is why
+  nothing was obviously broken.
+
+### Recovery
+
+* **`checkpoint`** (2026-08-25) captures the project root when an action is
+  known to mutate but its target cannot be resolved - converting *"I cannot
+  tell what you will destroy"* into *"then I preserve everything you could,
+  or I refuse"*. It refuses rather than capturing partially.
+* **Segment-based operand resolution** (2026-08-25) judges redirection per
+  pipeline segment, with exactly-one-match discipline, so two redirecting
+  targets escalate rather than snapshotting one and truncating the other
+  unrecorded.
+* The recovery index merges both chains' entries in timestamp order, so
+  `undo` and `log` see one history regardless of which layer captured it.
+
+### Egress (2026-07-27; Windows 2026-08-26)
+
+* Destructive external and SaaS API calls are gated on the wire through a
+  mitmproxy addon, which sees the HTTP method, host, path and body an
+  obfuscated command can hide. On Windows, `egress --trust-ca` installs
+  mitmproxy's CA into the **current user's** store - no elevation - and
+  `--untrust-ca` removes it.
+
+### Hosts
+
+* **Codex adapter** (2026-08-17). Four defects were found within an hour of
+  meeting a real Codex, none visible to 208 unit tests, the published docs,
+  or the binary's own embedded JSON schemas. The worst: `install-hook
+  --codex` wrote a config Codex parsed and silently discarded, while the
+  installer printed "Installed" - no error, no hook, no protection.
+* From that: **`doctor` reports whether a hook has ever actually fired**, per
+  host, from the receipts. Config present, hook registered and binary on PATH
+  are all paperwork; a receipt written by an agent is evidence. "Installed
+  but inert" has been the dangerous state repeatedly in this project.
+* `doctor` runs an end-to-end self-test through the same entry point the host
+  uses, once per shell tool.
+
+### Platform discipline
+
+* No module was forked for Windows. One tree, every platform difference
+  behind an `os.name` branch or a small strategy function - the constraint
+  set at the start of the port and held through it.
+
+### Packaging (2026-09-05)
+
+* Version `0.4.0b8` -> `1.0.5`; repository, issue links and the install
+  command embedded in every exported receipt repointed away from an upstream
+  this work cannot reach.
+
 ## 0.4.0b8 - honesty + release hardening
 
 * **The shared-receipt install command is pinned to the release tag.** A

@@ -17,8 +17,9 @@ The whole design in one line: **recovery is the default; blocking is the fallbac
 Default mode is observe-only: it logs what it *would* have caught and touches nothing. Run it a week on a low-stakes project, read the receipts, then decide whether to let it act.
 
 ```bash
-# one line: installs, wires the hook, and verifies it actually fires.
-# pinned to a release tag, not the moving beta branch. read it first: install.sh
+# one line: installs demo_cli and its prerequisites, then verifies the install.
+# it touches no project of yours - wiring one up is `demo_cli setup`, below.
+# pinned to a release tag, not a moving branch. read it first: install.sh
 curl -fsSL https://raw.githubusercontent.com/nizaryart/DEMO_LOADING/v1.0.6/install.sh | sh
 ```
 
@@ -27,12 +28,21 @@ curl -fsSL https://raw.githubusercontent.com/nizaryart/DEMO_LOADING/v1.0.6/insta
 irm https://raw.githubusercontent.com/nizaryart/DEMO_LOADING/v1.0.6/install.ps1 | iex
 ```
 
-It ends by running `demo_cli doctor`, which fails **loud** if the hook is
-installed but not reachable on your PATH — the one case where Claude Code would
-otherwise skip protection silently. (Yes, it's `curl | sh`, the exact
-opaque-execution pattern demo_cli itself escalates. Read it first, it's ~90
-lines: [install.sh](install.sh).) Prefer to do it by hand? See
-[Install](#install) below.
+It ends by running `demo_cli doctor`, which names every missing prerequisite
+with the exact command that fixes it, and fails **loud** if `demo_cli` is not
+reachable on the PATH your agent's shell will actually have — the one case
+where Claude Code skips protection silently.
+
+The installer **refuses to run elevated**, on both platforms. `pipx` installs
+per user, so an elevated install puts `demo_cli` on the administrator's PATH
+and leaves it missing from the shell where your agent runs: the hook
+registers, `doctor` looks green, and nothing is ever gated. The one step that
+genuinely needs Administrator (the WinFsp driver on Windows) raises its own
+prompt when it gets there.
+
+(Yes, it's `curl | sh`, the exact opaque-execution pattern demo_cli itself
+escalates. Read it first: [install.sh](install.sh), ~180 lines.) Prefer to do
+it by hand? See [Install](#install) below.
 
 ### Why you can trust it
 
@@ -88,6 +98,32 @@ demo_cli starts from the opposite default: **recovery, not blocking.**
 
 Blocking is the fallback for the un-recoverable, not the default for everything.
 That's the whole design.
+
+### Four layers, because a command line is not the whole truth
+
+The hook reads the command **text**. That is enough for `rm -rf ./build`, and
+not enough for `python cleanup.py` — which is opaque, or `rm $(cat list.txt)`
+— which is obviously dangerous and whose target cannot be resolved before it
+runs. Those are two different gaps, and they need different answers.
+
+| Layer | What it sees | How | Linux | Windows |
+|---|---|---|---|---|
+| **String** | the command, before it runs | agent hook (Claude Code, Cursor, Codex) | yes | yes |
+| **Shell** | commands you type yourself in the agent's `!` mode | bash `DEBUG` trap via `BASH_ENV` | yes | — |
+| **Behavioural** | what is *actually* being destroyed, at the moment it happens | `ptrace` / a WinFsp filesystem guard | `demo_cli run` | mounted |
+| **Egress** | the HTTP request an obfuscated command cannot hide | mitmproxy addon | yes | yes |
+
+The behavioural layer is the one that answers the opaque command. On Linux it
+traces syscalls; on Windows the project directory becomes a user-mode
+passthrough filesystem, so a delete is seen as an *operation* rather than
+inferred from a string. Neither is a substitute for the other layer — a
+snapshot taken because the kernel told you a file was about to be truncated is
+worth more than one taken because a regex matched.
+
+**Windows has no shell layer** and this is stated, not hidden: there is no
+`DEBUG` trap in PowerShell, so commands you type in `!` mode there are not
+captured. `demo_cli doctor` reports coverage honestly rather than implying
+four layers everywhere.
 
 ### And when it cannot recover, it says so
 
@@ -182,9 +218,118 @@ Scope for this beta: the Cursor adapter gates **shell commands** only
 
 ---
 
+## How it works with Codex
+
+Codex supports hooks through `~/.codex/hooks.json`. demo_cli registers a
+`PreToolUse` handler that gates both `Bash` and Codex's `apply_patch`.
+
+```bash
+demo_cli install-hook --codex
+```
+
+Two things learned the hard way, and worth knowing before you trust any hook
+installer:
+
+- **Codex's config is nested** — a group with an optional `matcher`, containing
+  handlers tagged `type: "command"`. Written in the flat form, Codex parses it,
+  silently discards it, and reports nothing. The installer said "Installed" and
+  there was no hook, no error and no protection.
+- **Installed is not active.** After that, `demo_cli doctor` stopped trusting
+  configuration files as evidence. It reports, per host, whether a receipt has
+  ever actually been written by an agent — the only proof that the guard is in
+  the loop.
+
+---
+
+## How it works on Windows
+
+The behavioural layer on Linux is `ptrace`. Windows has no equivalent that
+avoids signing your own kernel driver, so demo_cli uses **[WinFsp](https://winfsp.dev)**,
+whose driver ships already signed, and implements the guard in user mode on top
+of it — the same arrangement as shelling out to `mitmdump` or `pg_dump` rather
+than bundling them.
+
+```
+your agent writes to       C:\project          <- the mount (a reparse point)
+                                 |
+                           WinFsp driver (signed, third-party)
+                                 |
+                           demo_cli's filesystem guard   <- sees the operation,
+                                 |                          snapshots, then
+your real files live in    C:\project.real     <- passes it through
+                           ACL: Administrators + SYSTEM only
+```
+
+**The project directory keeps its path.** `setup` moves your files to
+`<project>.real` and mounts the guard at the original location, so nothing in
+your tooling has to change and there is no unguarded path to write through.
+The backing directory is locked to Administrators and SYSTEM — which is what
+makes the separation real rather than advisory.
+
+**Which is why you launch the agent unelevated.** The guard holds exactly as
+long as the agent has fewer privileges than it does. `setup` arranges that,
+`guarded` keeps it, and `doctor` warns you if the shell you are standing in
+would break it.
+
+### Prerequisites
+
+Install **WinFsp** with the Developer feature, then the Python binding:
+
+```powershell
+winget install --id WinFsp.WinFsp --custom "ADDLOCAL=ALL"
+pipx inject demo-cli winfspy
+```
+
+`install.ps1` does both for you and confirms the result by reading the
+registry rather than trusting an exit code. If you skip WinFsp entirely,
+everything else still works — you get the string and egress layers, and
+`doctor` says so plainly instead of failing.
+
+### Guarding a project
+
+```powershell
+cd C:\Users\you\Desktop      # NOT inside the project - a process's cwd
+                             # holds the directory open and it cannot move
+demo_cli setup C:\path\to\project
+```
+
+`setup` writes the config, installs a hook for every host present, **moves
+your files** (printing exactly what it will do and asking first), locks the
+backing, registers a logon task so the guard returns after a reboot, and
+mounts. Then:
+
+```powershell
+demo_cli guarded claude          # start the agent with every available layer up
+demo_cli doctor                  # coverage, prerequisites, and what is missing
+demo_cli teardown <project>      # reverse all of it, in any machine state
+```
+
+`teardown` stops the guard, removes the logon task, moves your files back and
+removes the hooks. It deliberately leaves the config and receipts — they are
+your audit trail.
+
+### The receipt ledger is split, and cross-linked
+
+The hook writes through the mount; the filesystem guard writes underneath it.
+Those are different lock domains — a byte-range lock taken through WinFsp and
+one taken on NTFS are not the same lock — so a single append-only file gets
+interleaved and torn. demo_cli keeps two chains and **anchors each receipt to
+the other chain's head hash at the moment it was written**.
+
+That is not bookkeeping. A lone hash chain cannot detect truncation of its own
+tail: cut the last N entries and what remains verifies perfectly. An anchor in
+the other chain proves those entries existed. `demo_cli verify` reports both
+chains, the cross-links it resolved, and distinguishes five outcomes — VERIFIED,
+DAMAGED, OUT OF ORDER, TAMPERED, and NO RECEIPTS — instead of collapsing an
+empty ledger into "tampered".
+
+---
+
 ## Install
 
-Requires Python 3.9+.
+Requires Python 3.9+. The filesystem guard on Windows additionally requires
+[WinFsp](https://winfsp.dev) — see [Prerequisites](#prerequisites). Everything
+else works without it.
 
 > **Pin to a release, not to `beta`.** The commands below reference a fixed,
 > tagged release so you get exactly the code you reviewed. `@beta` is a moving
@@ -208,6 +353,11 @@ demo_cli --version        # should print 1.0.6
 demo_cli init && demo_cli install-hook && demo_cli doctor
 ```
 
+Step 3 sets up the **string layer** only, and moves nothing. For every layer
+this machine can run — including the filesystem guard, which relocates your
+project — use `demo_cli setup <project>` instead. It prints what it will move
+and asks before it does.
+
 **From a clone (read everything first, verify the tag):**
 
 ```bash
@@ -221,8 +371,9 @@ demo_cli --version
 
 **One line (convenience only).** This is `curl | sh`, the exact opaque
 fetch-and-run pattern demo_cli itself escalates. It's here because it's
-convenient, not because it's the safe way. Read the script first, it's ~90
-lines: [install.sh](install.sh) / [install.ps1](install.ps1).
+convenient, not because it's the safe way. Read the script first:
+[install.sh](install.sh) / [install.ps1](install.ps1). They prepare the
+machine — Python, pipx, WinFsp, demo_cli — and touch no project of yours.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nizaryart/DEMO_LOADING/v1.0.6/install.sh | sh
@@ -328,19 +479,34 @@ A production database is reached via a connection string, not by a file called
 | Command | What it does |
 |---|---|
 | `check "<cmd>"` | evaluate a command; flags: `--db`, `--db-url`, `--target`, `--mode`, `--intent-env`, `--actual-env`, `--reason`, `--approval-token`, `--json`, `--quiet` |
-| `log` | list captured recovery points (id, when, kind, size, action) |
+| `log` (alias `receipts`) | list captured recovery points (id, when, kind, size, action); `--last N` |
 | `undo [id]` | restore a recovery point by id, or the latest |
 | `diff [id]` | show what changed since a recovery point |
-| `verify` | walk the receipt hash-chain → INTACT or TAMPERED |
+| `verify` | walk both receipt chains and their cross-links → VERIFIED, DAMAGED, OUT OF ORDER, TAMPERED, or NO RECEIPTS |
 | `report` | summarise recorded decisions |
 | `receipt [id]` | print a copy-pasteable, tamper-evident proof card for a receipt (latest, or by id); `--list` shows recent receipt ids |
 | `status` | mode, hook state, receipts, chain integrity, recovery count |
-| `doctor` | check python version, config, pg tools, hook registration, PATH |
+| `doctor` | every prerequisite with the command that fixes it (git, pg tools, mitmdump, the WinFsp driver and the winfspy binding *separately*), config, workspace, hook registration per host, PATH, an end-to-end hook self-test, the backing ACL, and whether an agent has ever actually been gated here |
 | `prune` | delete old recovery artefacts (`--keep N`, `--older-than DAYS`); receipts are never pruned |
 | `init` | scaffold `.demo_cli.toml` |
 | `install-hook` | write PreToolUse entries into `.claude/settings.json` (add `--cursor` for `.cursor/hooks.json`) |
 | `hook` | (internal) called by Claude Code; reads tool JSON on stdin, writes permission decision on stdout |
 | `hook-cursor` | (internal) called by Cursor; reads `beforeShellExecution` JSON on stdin, writes permission decision on stdout |
+| `hook-codex` | (internal) called by Codex; gates `Bash` and `apply_patch` |
+
+**Every layer, and the machine underneath it**
+
+| Command | What it does |
+|---|---|
+| `setup [project]` | one command to make a project guarded: config, hooks for every host present, relocation, backing lock, logon task, mount. Always asks before moving files |
+| `teardown [project]` | reverse everything `setup` did, in any machine state. Leaves config and receipts as your audit trail |
+| `guarded <agent…>` | launch an agent with every available layer started, print coverage first, and re-check on a heartbeat so a layer that drops mid-session is announced |
+| `run <cmd…>` | run one command under the behavioural (syscall) guard **[Linux]** |
+| `install-shell-guard` | catch commands typed in the agent's `!` mode, via `BASH_ENV` **[Linux]** |
+| `protect <project>` | relocate a project so its path becomes the guarded mount; on an already-protected project, re-apply the backing lock without moving anything **[Windows]** |
+| `unprotect <project>` | move it back and remove the lock **[Windows]** |
+| `mount` / `unmount` | start or stop the filesystem guard directly **[Windows]** |
+| `egress` | gate destructive external/SaaS API calls on the wire (needs `mitmdump`); `--trust-ca` / `--untrust-ca` manage mitmproxy's CA in your **user** store on Windows |
 
 Exit codes for `check`: `0` allow, `1` context mismatch, `2` escalate.
 
@@ -401,7 +567,10 @@ legitimate override; an agent cannot forge it.
 - Adversarial agents deliberately evading classification
 - Reversing already-sent external effects
 - Reversing an action after it has already been undone once (single undo depth per recovery point)
-- Adapters for agents other than Claude Code and Cursor (Aider, Cline, planned)
+- Adapters for agents other than Claude Code, Cursor and Codex (Aider, Cline, planned)
+- **Codex on Windows is untested.** The adapter is proven on Linux; whether
+  Codex's hooks fire on Windows has not been established either way. Until it
+  is, assume no protection there and use Claude Code
 
 **Shell parsing is pattern-based, not a full AST (roadmap).** Commands are matched
 with expansion (globs, braces) and structural rules, not a complete shell grammar.
@@ -436,6 +605,19 @@ recovery point and escalates rather than being captured.
 - **A pathological brace expansion falls back to the literal token,** which means
   the honest escalate path rather than an unbounded expansion. Bounded by
   `_BRACE_MAX`.
+- **The filesystem guard costs about 4ms per operation.** Measured on real
+  hardware: 200 writes took 0.294s outside the mount and 1.131s inside. Fine
+  for source trees, noticeable on a build directory — which is one reason
+  `node_modules`, `.git` and `__pycache__` are ignored.
+- **`demo_cli log` shows 0B for a recovery point it cannot read.** Run
+  unelevated against an ACL-locked backing, `entry_size()` cannot stat the file
+  and reports zero. "0 bytes" and "I cannot see it" are different facts and
+  should not share a rendering.
+- **No `!`-mode capture on Windows.** PowerShell has no `DEBUG` trap
+  equivalent, so the shell layer is Linux-only. Commands you type yourself in
+  the agent's `!` mode on Windows are not seen.
+- **The egress proxy can outlive a hard kill.** `guarded` stops the proxy it
+  started, but only on a clean exit, and `teardown` does not check the port.
 
 ---
 
@@ -457,6 +639,12 @@ print(result.permission)          # allow
 pip install -e ".[dev]"
 pytest -q
 ```
+
+**826 passing**, identical from the same commit on both platforms — Linux 826,
+Windows 807 plus 19 platform-gated skips (the `ptrace` guard and the bash
+`DEBUG`-trap shell guard, which have no Windows equivalent). No module is
+forked per platform: every difference lives behind an `os.name` branch or a
+small strategy function in one shared tree.
 
 ---
 
