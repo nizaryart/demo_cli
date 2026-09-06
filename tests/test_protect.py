@@ -452,3 +452,34 @@ def test_a_blocked_relocate_names_the_likely_cause(tmp_path):
             Backing.relocate(str(source), str(tmp_path / "proj.real"))
         assert "Nothing was moved" in str(exc.value)
     assert source.exists()
+
+
+# --------------------------------------------------------------------------
+# The relock repair path (2026-09-05). Gated on Windows, so what is testable
+# here is that it stays out of the way everywhere else.
+# --------------------------------------------------------------------------
+
+def test_relock_target_is_windows_only(tmp_path):
+    """The whole mechanism is an NTFS ACL. On POSIX it must return None so
+    cmd_protect takes the ordinary path and nothing changes."""
+    import os
+    from demo_cli.cli import _relock_target
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (tmp_path / "proj.real").mkdir()
+    result = _relock_target(str(proj), None)
+    if os.name != "nt":
+        assert result is None
+
+
+def test_relock_refuses_without_a_mount_record_naming_that_backing(tmp_path):
+    """A false positive would apply an Administrators-only ACL to a directory
+    that merely happens to be called X.real - locking somebody's data away.
+    Evidence must be demo_cli's own mount record, never the name."""
+    from demo_cli.cli import _relock_target
+
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (tmp_path / "proj.real").mkdir()          # a stranger's directory
+    assert _relock_target(str(proj), None) is None

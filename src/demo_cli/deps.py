@@ -217,7 +217,7 @@ def judge_elevation(elevated: bool, windows: bool) -> Optional[Dep]:
 
 
 def judge_backing_lock(backing_exists: bool, locked: Optional[bool],
-                       backing: str) -> Optional[Dep]:
+                       backing: str, project: str = "<project>") -> Optional[Dep]:
     """Is the ACL that makes protection real still in place?
 
     protect sets this lock once. Nothing has ever re-checked it, so a project
@@ -234,10 +234,13 @@ def judge_backing_lock(backing_exists: bool, locked: Optional[bool],
         return Dep("backing locked", None,
                    f"cannot tell for {backing} (icacls unavailable or "
                    f"unreadable)", "", severity="warn")
+    # The real path, not a <placeholder>. A remediation the reader has to
+    # edit before running is one they may edit wrongly, and doctor already
+    # knows which project it is looking at.
     return Dep("backing locked", False,
                f"NOT LOCKED - {backing} is writable without elevation, so the "
                f"guard can be bypassed by writing the real files directly",
-               "demo_cli protect <project>   (re-applies the ACL)",
+               f"demo_cli protect {project}   (re-applies the lock; moves nothing)",
                severity="fail")
 
 
@@ -285,7 +288,8 @@ def check_all(project_root: Optional[str] = None) -> List[Dep]:
         backing = protect_mod.backing_for(project_root)
         exists = os.path.isdir(backing)
         lock = judge_backing_lock(
-            exists, protect_mod.is_locked(backing) if exists else None, backing)
+            exists, protect_mod.is_locked(backing) if exists else None, backing,
+            project_root)
         if lock:
             out.append(lock)
 

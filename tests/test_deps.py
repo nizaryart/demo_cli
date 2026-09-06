@@ -275,3 +275,38 @@ def test_a_doctor_report_never_repeats_a_label(tmp_path, monkeypatch):
     labels = [name for _, name, _ in captured["c"]]
     dupes = {n for n in labels if labels.count(n) > 1}
     assert not dupes, f"doctor printed these labels more than once: {sorted(dupes)}"
+
+
+def test_every_printed_fix_is_a_command_that_actually_parses():
+    """A remediation is a promise that running it helps. doctor printed
+    `demo_cli protect <project>` for an unlocked backing, and protect refused:
+    "<backing> already exists. Refusing to merge two trees." The advice parsed
+    fine and could not work - so parsing is necessary but not sufficient, and
+    this at least catches the flags and subcommands that do not exist at all.
+    """
+    import argparse
+    from demo_cli.cli import build_parser
+
+    parser = build_parser()
+    fixes = [
+        deps.judge_backing_lock(True, False, r"C:\p.real", r"C:\p").fix,
+        deps.judge_external_tool("mitmdump", None, "x",
+                                 "pipx inject --include-apps demo-cli mitmproxy").fix,
+    ]
+    for fix in fixes:
+        # Only our own commands; `pipx ...` is somebody else's parser.
+        if not fix.startswith("demo_cli "):
+            continue
+        argv = fix.split("(")[0].split()[1:]     # drop "demo_cli" and any trailing note
+        try:
+            parser.parse_args(argv)
+        except SystemExit as exc:
+            raise AssertionError(
+                f"doctor prints a command its own parser rejects: {fix!r}") from exc
+
+
+def test_the_backing_lock_fix_names_the_project_not_a_placeholder():
+    d = deps.judge_backing_lock(True, False, r"C:\myproj.real", r"C:\myproj")
+    assert r"C:\myproj" in d.fix
+    assert "<project>" not in d.fix
+    assert "moves nothing" in d.fix, "the reader must know this is not a relocation"

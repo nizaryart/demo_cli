@@ -1845,9 +1845,75 @@ def cmd_register_task(a) -> int:
     return 0 if schedule.register(project, protect_mod.backing_for(project)) else 1
 
 
+def _relock_target(project: str, backing: Optional[str]) -> Optional[str]:
+    """The backing to re-lock, when this project is ALREADY protected.
+
+    `protect` is a move, so on an already-protected project it refuses:
+    "<backing> already exists. Refusing to merge two trees." Correct as far as
+    it goes - but doctor's remediation for an unlocked backing is `demo_cli
+    protect`, so the fix we printed could never apply to the situation we
+    printed it for. Found on real hardware 2026-09-05, and it is the same
+    defect class as the winfspy message: a diagnostic naming a fix that does
+    not fix.
+
+    In that situation there are not two trees. There is ONE tree seen twice -
+    the mount and its backing - so there is nothing to move and the only thing
+    that can be missing is the lock.
+
+    THE EVIDENCE HAS TO BE demo_cli'S OWN RECORD, not a guess. A false
+    negative here just refuses as before, which is harmless. A false positive
+    applies an Administrators-only ACL to an unrelated directory and locks
+    somebody's data away - so this requires a mount record that NAMES this
+    backing. A plain directory that happens to sit beside a plain `X.real`
+    produces no such record and is refused exactly as it is today.
+
+    Not gated on the guard RUNNING: a protected project whose guard is stopped
+    still has a backing that ought to be locked.
+    """
+    if os.name != "nt":
+        return None
+    from . import mountstate as _ms, protect as protect_mod
+    target = os.path.abspath(backing) if backing else protect_mod.backing_for(project)
+    if not os.path.isdir(target):
+        return None
+    try:
+        st = _ms.status(load_config(project))
+    except Exception:
+        return None
+    if not (st.recorded and st.backing):
+        return None
+    same = os.path.normcase(os.path.abspath(st.backing)) == os.path.normcase(target)
+    return target if same else None
+
+
 def cmd_protect(a) -> int:
     """Relocate a project so its own path can become the guarded mount point."""
     from . import protect as protect_mod
+
+    project = os.path.abspath(a.project)
+    relock = _relock_target(project, getattr(a, "backing", None))
+    if relock:
+        print(render.c(f"\ndemo_cli {__version__}  protect  ->  re-apply the lock\n", "dim"))
+        print(f"  {project} is already protected.")
+        print(f"  Nothing to move. Re-applying the lock on {relock}.\n")
+        if not protect_mod.is_elevated():
+            rc = protect_mod.rerun_elevated(["protect", project])
+            if rc is None:
+                print("  " + render.c("could not elevate.", "red"))
+                print(protect_mod.elevated_output())
+                return 1
+            return rc
+        protect_mod.lock_directory(relock)
+        # Believe is_locked, not lock_directory's return value. icacls has
+        # exited 0 on a failed grant before (see protect.lock_directory), and
+        # this project's rule is that a claim of protection needs evidence.
+        if protect_mod.is_locked(relock) is True:
+            print("  " + render.c(f"locked {relock} to Administrators and SYSTEM", "green"))
+            print("  " + render.c("no files were moved.", "dim") + "\n")
+            return 0
+        print("  " + render.c(f"COULD NOT LOCK {relock} - it is still writable, "
+                              f"so the guard can be bypassed", "red") + "\n")
+        return 1
 
     plan = protect_mod.plan_protect(a.project, getattr(a, "backing", None),
                                     lock=not getattr(a, "no_lock", False))
