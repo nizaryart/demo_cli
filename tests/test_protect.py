@@ -483,3 +483,22 @@ def test_relock_refuses_without_a_mount_record_naming_that_backing(tmp_path):
     proj.mkdir()
     (tmp_path / "proj.real").mkdir()          # a stranger's directory
     assert _relock_target(str(proj), None) is None
+
+
+def test_relock_reports_an_outcome_even_when_the_work_happened_elevated():
+    """ShellExecuteExW hands the elevated child its own console, which closes
+    on exit - so anything it printed is unrecoverable. The parent must state
+    the outcome from its own observation, never by relaying the child.
+
+    Structural, because the elevation path cannot run in a test: what is
+    pinned is that the non-elevated branch ends in an is_locked() check rather
+    than a bare `return rc`.
+    """
+    import inspect
+    from demo_cli import cli
+
+    src = inspect.getsource(cli.cmd_protect)
+    branch = src.split("if not protect_mod.is_elevated():", 1)[1]
+    branch = branch.split("protect_mod.lock_directory", 1)[0]
+    assert "is_locked" in branch, \
+        "the parent returns the child's exit code without checking the result"

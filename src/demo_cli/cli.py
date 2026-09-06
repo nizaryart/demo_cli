@@ -1902,7 +1902,22 @@ def cmd_protect(a) -> int:
                 print("  " + render.c("could not elevate.", "red"))
                 print(protect_mod.elevated_output())
                 return 1
-            return rc
+            # THE CHILD'S OUTPUT IS NOT OURS TO REPORT. ShellExecuteExW gives
+            # the elevated process its own console, which closes the moment it
+            # exits - so everything it printed is gone, and this shell would
+            # otherwise end on "Re-applying the lock on ..." with no outcome
+            # at all. Observed on real hardware 2026-09-06: the lock HAD been
+            # applied and the command still looked like it did nothing.
+            #
+            # So do not relay, and do not trust the exit code either: ask the
+            # filesystem. The parent can read an ACL without elevation.
+            if protect_mod.is_locked(relock) is True:
+                print("  " + render.c(f"locked {relock} to Administrators and SYSTEM", "green"))
+                print("  " + render.c("no files were moved.", "dim") + "\n")
+                return 0
+            print("  " + render.c(f"the elevated step exited {rc}, but {relock} is "
+                                  f"still not locked", "red") + "\n")
+            return 1
         protect_mod.lock_directory(relock)
         # Believe is_locked, not lock_directory's return value. icacls has
         # exited 0 on a failed grant before (see protect.lock_directory), and
