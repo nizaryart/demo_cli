@@ -24,6 +24,28 @@ from .version import __version__
 
 _EXIT = {ESCALATE: 2, CONTEXT_MISMATCH: 1}
 
+# WINDOWS PROCESS-CREATION FLAGS, DEFINED ONCE.
+#
+# Every long-lived child demo_cli starts detached - the filesystem guard and
+# the egress proxy - wants the same thing: no visible console, and no tie to
+# the parent's Ctrl+C. The combination is not obvious, and getting it wrong is
+# silent.
+#
+# CREATE_NO_WINDOW *without* DETACHED_PROCESS. Windows documents
+# CREATE_NO_WINDOW as IGNORED when DETACHED_PROCESS or CREATE_NEW_CONSOLE is
+# also set, so stacking them throws away the only flag that suppresses the
+# window and the child runs with a console for its whole life - a window
+# somebody eventually closes, and closing it kills the child. CREATE_NO_WINDOW
+# still gives the child its own invisible console, so Ctrl+C in the parent's
+# console does not reach it.
+#
+# Fixed in the mount path 2026-08-29 and missed in the egress path until a
+# review on 2026-09-07. They are shared constants now because two copies of
+# this reasoning is exactly how they drifted.
+_DETACHED_PROCESS = 0x00000008          # kept for reference; deliberately unused
+_CREATE_NEW_PROCESS_GROUP = 0x00000200
+_CREATE_NO_WINDOW = 0x08000000
+
 _CONFIG_TEMPLATE = """\
 # demo_cli configuration. All fields are optional; defaults are safe.
 # Docs: https://github.com/nizaryart/DEMO_LOADING
@@ -159,6 +181,7 @@ def cmd_undo(a) -> int:
             preserved = None            # never let bookkeeping block a recovery
 
     result = recovery.restore(entry)
+    denied = result.denied              # may be cleared below; see the retry branch
 
     if not result.ok and result.denied:
         rc = _undo_elevated(a, cfg.project_root)
@@ -172,6 +195,18 @@ def cmd_undo(a) -> int:
             _say_preserved(preserved)
             return 0
         if rc is not None:
+            # AND STOP BLAMING PERMISSIONS. This branch is only reachable when
+            # result.denied is True, so the banner underneath used to print
+            # "This recovery point needs Administrator" - after a retry that
+            # HAD Administrator and failed for some other reason. The honest
+            # diagnosis is printed just below and was then contradicted two
+            # lines later.
+            #
+            # The 2026-09-02 fix added the elevated output and left the banner
+            # alone: half of the same incident, and the half that was still
+            # lying. Found by review 2026-09-07 - the first defect in this
+            # project found by reading rather than by running it.
+            denied = False
             print(render.c("The elevated attempt did not restore it either "
                            f"(exit {rc}).", "red"))
             # SHOW WHAT IT SAID. The elevated console closes with the process,
@@ -195,7 +230,7 @@ def cmd_undo(a) -> int:
     render.render_restore(entry, result.ok, __version__,
                           recovery_dir=cfg.recovery_dir,
                           requested_id=getattr(a, "id", None),
-                          denied=result.denied, problem=result.problem)
+                          denied=denied, problem=result.problem)
     if result.ok:
         _say_preserved(preserved)
     return 0 if result.ok else 1
@@ -1052,23 +1087,9 @@ def _mount_detached(a, backing) -> int:
     # with it.
     kwargs = {}
     if os.name == "nt":
-        DETACHED_PROCESS = 0x00000008
-        CREATE_NEW_PROCESS_GROUP = 0x00000200
-        # CREATE_NO_WINDOW as well: DETACHED_PROCESS alone still let Windows
-        # pop an empty console for python.exe, which looks like something went
-        # wrong and shows nothing, because the child's output is redirected to
-        # mount.log.
-        CREATE_NO_WINDOW = 0x08000000
-        # CREATE_NO_WINDOW, *not* combined with DETACHED_PROCESS. Windows
-        # documents CREATE_NO_WINDOW as IGNORED when DETACHED_PROCESS or
-        # CREATE_NEW_CONSOLE is also set - so stacking them threw away the one
-        # flag we added to suppress the window, and the guard ran with a
-        # visible console for its whole life. A window that lives forever is a
-        # window somebody eventually closes, and closing it kills the guard.
-        # CREATE_NO_WINDOW still gives the child its own (invisible) console,
-        # so a Ctrl+C in the parent's console does not reach it.
-        kwargs["creationflags"] = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
-        _ = DETACHED_PROCESS
+        # See _CREATE_NO_WINDOW at the top of this module for why this
+        # combination and not DETACHED_PROCESS.
+        kwargs["creationflags"] = _CREATE_NO_WINDOW | _CREATE_NEW_PROCESS_GROUP
     else:
         kwargs["start_new_session"] = True
 
@@ -2117,6 +2138,12 @@ def cmd_egress(a) -> int:
             return subprocess.run(argv, env=env).returncode
         except KeyboardInterrupt:
             return 0
+    # os.execve REPLACES this process image without flushing Python's stdio
+    # buffers. Redirected to a file or a pipe, stdout is block-buffered, so
+    # every setup instruction printed above is discarded and the user sees
+    # nothing before mitmdump takes over. cmd_guarded already flushes for the
+    # same reason; this path did not.
+    sys.stdout.flush()
     os.execve(mitm, argv, env)
 
 
@@ -2153,8 +2180,20 @@ def cmd_guarded(a) -> int:
             env = dict(os.environ, DEMO_CLI_EGRESS_MODE=cfg.mode,
                        PYTHONPATH=os.path.dirname(here) + os.pathsep
                        + os.environ.get("PYTHONPATH", ""))
-            kwargs = {"creationflags": 0x00000008 | 0x08000000} if os.name == "nt" \
-                else {"start_new_session": True}
+            # SAME FLAGS AS _mount_detached, and for the same reason. This
+            # was DETACHED_PROCESS | CREATE_NO_WINDOW - the exact combination
+            # _mount_detached documents as broken, because Windows IGNORES
+            # CREATE_NO_WINDOW when DETACHED_PROCESS is also set. The guard
+            # was fixed on 2026-08-29; the egress spawn was missed, so the
+            # proxy kept a visible console for its whole life - a window
+            # somebody eventually closes, and closing it kills the proxy
+            # after `guarded` has already reported [+] egress.
+            #
+            # Note the premise is one recorded observation, not a re-test:
+            # CREATE_NO_WINDOW is still on the unverified list. The two call
+            # sites agreeing matters either way, and one check settles both.
+            kwargs = {"creationflags": _CREATE_NO_WINDOW | _CREATE_NEW_PROCESS_GROUP} \
+                if os.name == "nt" else {"start_new_session": True}
             with open(log, "a", encoding="utf-8") as fh:
                 started_egress = subprocess.Popen(
                     [mitm, "-s", os.path.join(here, "egress_addon.py"),
