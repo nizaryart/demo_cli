@@ -680,6 +680,60 @@ def _index_fs_path(recovery_dir: str) -> str:
     return os.path.join(recovery_dir, "index-fs.jsonl")
 
 
+def _pruned_fs_path(recovery_dir: str) -> str:
+    """Ids pruned out of the filesystem guard's index, one per line.
+
+    WHY A SECOND FILE INSTEAD OF EDITING THE FIRST
+    ----------------------------------------------
+    The split exists so each index has exactly ONE writer: the guard writes
+    index-fs.jsonl in the backing, everything else writes index.jsonl through
+    the mount, and WinFsp does not carry byte-range locks between the two. A
+    lock taken on one side is not the lock taken on the other.
+
+    `prune` broke that rule in the worst possible way. It computed doomed
+    entries from the MERGED view, deleted their artefacts - fs ones included -
+    and then rewrote index.jsonl only. So the fs index kept advertising
+    recovery points whose bytes were gone, and fs survivors got a second copy
+    written into the main index. Found by review 2026-09-07.
+
+    The obvious repair - have prune rewrite index-fs.jsonl too - is worse than
+    the bug. It truncates a file the guard may be appending to, across a lock
+    boundary that does not compose: today's failure leaves stale entries in an
+    intact file, that one can lose the file. Prefer a lie you can detect to a
+    loss you cannot.
+
+    So prune never touches the guard's file. It appends the pruned ids here,
+    to a file the CLI side owns outright, and load_entries filters them out.
+    Single writer per file, everywhere, and no truncation of anything another
+    process holds open.
+
+    Both files stay small - a few hundred bytes of ids - and the disk space
+    was never here anyway: prune frees it by deleting the recovery ARTEFACTS,
+    which it already does for both chains. This file only settles what the
+    ledger is allowed to claim.
+
+    A future mount can compact: at startup the guard is the sole writer of its
+    own index and can drop tombstoned lines and clear this file safely. Not
+    built, and not needed until the line count matters.
+    """
+    return os.path.join(recovery_dir, "index-fs.pruned")
+
+
+def _read_pruned_fs(recovery_dir: str) -> set:
+    """Ids tombstoned out of the fs index. Never raises: a missing or damaged
+    tombstone file must not take the whole recovery ledger down with it."""
+    out = set()
+    try:
+        with open(_pruned_fs_path(recovery_dir), encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    out.add(line)
+    except OSError:
+        pass
+    return out
+
+
 def in_backing() -> bool:
     """True when this process writes the backing directly - i.e. it is the
     filesystem guard. Set by fsmount at mount time.
@@ -1004,8 +1058,30 @@ def load_entries(recovery_dir: str) -> List[dict]:
     file's history and then the other's.
     """
     entries = _read_index(_index_path(recovery_dir))[0]
-    entries += _read_index(_index_fs_path(recovery_dir))[0]
-    return sorted(entries, key=lambda e: str(e.get("timestamp") or ""))
+    # Tombstones apply to the fs chain only. The main index is rewritten in
+    # place by prune, so a pruned main entry is simply not there to filter.
+    pruned = _read_pruned_fs(recovery_dir)
+    entries += [e for e in _read_index(_index_fs_path(recovery_dir))[0]
+                if e.get("id") not in pruned]
+    # "ts", not "timestamp". Recovery entries have always used "ts" (see
+    # _record's callers); "timestamp" is the RECEIPT key, and sorting on it
+    # here meant every key was the empty string. Python's sort is stable, so
+    # the merged list kept its concatenation order - every main entry, then
+    # every fs entry - which is precisely the "one file's history and then the
+    # other's" this docstring says it prevents.
+    #
+    # The consequence was not a subtle skew. latest() takes entries[-1], so it
+    # returned the newest FS entry whenever index-fs.jsonl was non-empty, no
+    # matter how much newer a main-chain entry was. `demo_cli undo` with no id
+    # then restored the wrong point and reported RESTORED.
+    #
+    # Invisible on Linux and on Windows before a mount, because an empty fs
+    # index leaves append order intact and the result is correct by accident.
+    # Found by review on 2026-09-07; no test wrote both indexes.
+    #
+    # _ts() is "%Y%m%d-%H%M%S" - fixed width, zero padded - so lexicographic
+    # order is chronological and no parsing is needed.
+    return sorted(entries, key=lambda e: str(e.get("ts") or ""))
 
 
 def latest(recovery_dir: str, target_ref: Optional[str] = None) -> Optional[dict]:
@@ -1084,11 +1160,42 @@ def prune(recovery_dir: str, keep: Optional[int] = None,
             except OSError:
                 pass
 
+    # WHICH FILE EACH ENTRY CAME FROM DECIDES HOW IT IS REMOVED.
+    #
+    # This used to rewrite index.jsonl with every survivor and stop there, so
+    # fs survivors were duplicated into the main index while still present in
+    # their own, and doomed fs entries stayed listed with their artefacts
+    # already deleted - the ledger advertising recovery that is gone. When
+    # index.jsonl did not exist at all (a freshly mounted Windows project,
+    # before any CLI-side snapshot) the rewrite was skipped entirely and
+    # NOTHING was de-listed.
+    #
+    # The guard's index is never rewritten from here; see _pruned_fs_path.
+    from .receipts import _chain_lock          # local: avoids an import cycle
+
+    fs_ids = {e.get("id") for e in _read_index(_index_fs_path(recovery_dir))[0]}
+    doomed_fs = [e for e in doomed if e.get("id") in fs_ids]
+
+    # The main index, rewritten in place - now UNDER THE LOCK. _record has
+    # always locked its appends; this rewrite never did, so a truncate could
+    # land in the middle of one. Two writers, one file, one lock.
     idx = _index_path(recovery_dir)
     if os.path.exists(idx):
-        with open(idx, "w", encoding="utf-8") as f:
-            for e in survivors:
-                f.write(json.dumps(e) + "\n")
+        with _chain_lock(idx):
+            with open(idx, "w", encoding="utf-8") as f:
+                for e in survivors:
+                    if e.get("id") not in fs_ids:
+                        f.write(json.dumps(e) + "\n")
+
+    # The guard's index, tombstoned rather than rewritten.
+    if doomed_fs:
+        os.makedirs(recovery_dir, exist_ok=True)
+        pruned = _pruned_fs_path(recovery_dir)
+        with _chain_lock(pruned):
+            with open(pruned, "a", encoding="utf-8") as f:
+                for e in doomed_fs:
+                    f.write(str(e.get("id", "")) + "\n")
+
     return doomed
 
 

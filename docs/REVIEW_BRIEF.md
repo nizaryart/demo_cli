@@ -220,6 +220,13 @@ reading either.
   ACL — "0 bytes" and "cannot see it" share a rendering
 - `guarded` stops the proxy it started only on a clean exit; `teardown` does
   not check the port
+- **`CREATE_NO_WINDOW` is unverified on Windows.** `_mount_detached` was changed
+  on 2026-08-29 from `DETACHED_PROCESS | CREATE_NO_WINDOW` to
+  `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`, because Windows documents the
+  first flag as ignored when the second is set — so the guard ran with a
+  visible console a user could close, killing it. The reasoning is recorded;
+  the fix has never been re-tested on hardware. Treat the *consequence* as one
+  observation, not as established
 - Directory restore is coarse by design: the whole captured directory reverts
 - Single undo depth per recovery point
 - Databases: SQLite and Postgres only

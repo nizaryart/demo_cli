@@ -411,3 +411,216 @@ def test_a_log_that_exists_but_is_empty_is_not_absent(tmp_path):
     v = verify_chain(str(p))
     assert not v.absent
     assert v.ok and v.entries == 0
+
+
+# --------------------------------------------------------------------------
+# The merged recovery index. Found by review 2026-09-07; the coverage hole is
+# the finding, not the typo.
+#
+# `load_entries` merges index.jsonl and index-fs.jsonl and its docstring says
+# the result is chronological. It sorted on "timestamp", a key recovery
+# entries have never had - they use "ts" - so every sort key was "" and the
+# stable sort preserved concatenation order: all main entries, then all fs
+# entries. latest() takes entries[-1], so `demo_cli undo` with no id restored
+# the newest FS point regardless of how much newer a main point was.
+#
+# NOT ONE TEST IN 826 WROTE BOTH INDEX FILES. On Linux, and on Windows before
+# a mount, index-fs.jsonl is empty, append order is already chronological, and
+# the merge is correct by accident. The split's whole reason for existing had
+# no read-path coverage.
+# --------------------------------------------------------------------------
+
+def _entry(rec_dir, idx_name, rid, ts):
+    import json, os
+    os.makedirs(rec_dir, exist_ok=True)
+    with open(os.path.join(rec_dir, idx_name), "a", encoding="utf-8") as f:
+        f.write(json.dumps({"id": rid, "ts": ts, "target": "/x",
+                            "recovery_point": f"/rp/{rid}", "kind": "file"}) + "\n")
+
+
+def test_a_merged_index_is_ordered_by_time_not_by_file(tmp_path):
+    from demo_cli import recovery
+    d = str(tmp_path / "rec")
+    # Interleaved in time, deliberately written so that file order and time
+    # order disagree: the fs entries are OLDER than the main one.
+    _entry(d, "index-fs.jsonl", "fs-old", "20260101-090000")
+    _entry(d, "index-fs.jsonl", "fs-mid", "20260101-100000")
+    _entry(d, "index.jsonl",    "main-new", "20260101-110000")
+
+    ids = [e["id"] for e in recovery.load_entries(d)]
+    assert ids == ["fs-old", "fs-mid", "main-new"], \
+        "merged order follows the files, not the clock"
+
+
+def test_latest_returns_the_newest_point_across_both_chains(tmp_path):
+    """The failure this actually caused. `demo_cli undo` with no id calls
+    latest(), and latest() takes entries[-1]."""
+    from demo_cli import recovery
+    d = str(tmp_path / "rec")
+    _entry(d, "index-fs.jsonl", "fs-old",   "20260101-090000")
+    _entry(d, "index.jsonl",    "main-new", "20260101-110000")
+    assert recovery.latest(d)["id"] == "main-new", \
+        "undo would restore the older fs point and report RESTORED"
+
+
+def test_the_newest_point_can_also_be_the_fs_one(tmp_path):
+    """The mirror case, so the fix is not just 'prefer main'."""
+    from demo_cli import recovery
+    d = str(tmp_path / "rec")
+    _entry(d, "index.jsonl",    "main-old", "20260101-090000")
+    _entry(d, "index-fs.jsonl", "fs-new",   "20260101-110000")
+    assert recovery.latest(d)["id"] == "fs-new"
+
+
+def test_a_main_only_index_is_unaffected(tmp_path):
+    """Why this was invisible: with no fs index, append order is already
+    chronological and the broken sort preserved it."""
+    from demo_cli import recovery
+    d = str(tmp_path / "rec")
+    _entry(d, "index.jsonl", "a", "20260101-090000")
+    _entry(d, "index.jsonl", "b", "20260101-100000")
+    assert [e["id"] for e in recovery.load_entries(d)] == ["a", "b"]
+    assert recovery.latest(d)["id"] == "b"
+
+
+def test_an_undated_entry_sorts_first_rather_than_crashing(tmp_path):
+    """A torn or hand-edited entry must not take the whole listing down."""
+    import json, os
+    from demo_cli import recovery
+    d = str(tmp_path / "rec")
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "index.jsonl"), "w", encoding="utf-8") as f:
+        f.write(json.dumps({"id": "no-ts", "target": "/x"}) + "\n")
+    _entry(d, "index.jsonl", "dated", "20260101-090000")
+    assert [e["id"] for e in recovery.load_entries(d)] == ["no-ts", "dated"]
+
+
+# --------------------------------------------------------------------------
+# prune across the split. Found by review 2026-09-07, same coverage hole as
+# the ordering bug: no test had ever written both index files.
+#
+# prune computed doomed entries from the MERGED view and deleted their
+# artefacts - fs ones included - then rewrote index.jsonl only. Two failures:
+#   * fs survivors written into the main index while still in their own, so
+#     load_entries returned them twice
+#   * doomed fs entries left listed with their bytes already deleted - the
+#     ledger advertising a recovery that is gone, which is the one failure
+#     this project treats as unacceptable
+# and when index.jsonl did not exist at all, nothing was de-listed.
+# --------------------------------------------------------------------------
+
+def _point(rec_dir, idx_name, rid, ts):
+    """An index entry whose recovery_point is a real file, so prune's delete
+    is observable rather than a no-op."""
+    import json, os
+    os.makedirs(rec_dir, exist_ok=True)
+    rp = os.path.join(rec_dir, rid + ".bak")
+    with open(rp, "w", encoding="utf-8") as f:
+        f.write(rid)
+    with open(os.path.join(rec_dir, idx_name), "a", encoding="utf-8") as f:
+        f.write(json.dumps({"id": rid, "ts": ts, "target": "/x",
+                            "recovery_point": rp, "kind": "file"}) + "\n")
+    return rp
+
+
+def test_pruned_fs_entries_leave_the_ledger(tmp_path):
+    """The headline failure: the artefact is deleted, so the entry must not
+    still be offered."""
+    from demo_cli import recovery
+    d = str(tmp_path / "rec")
+    rp_old = _point(d, "index-fs.jsonl", "fs-old", "20260101-090000")
+    _point(d, "index-fs.jsonl", "fs-new", "20260101-100000")
+
+    recovery.prune(d, keep=1)
+
+    assert not os.path.exists(rp_old), "prune should have deleted the artefact"
+    ids = [e["id"] for e in recovery.load_entries(d)]
+    assert ids == ["fs-new"], "a deleted recovery point is still being offered"
+
+
+def test_prune_never_rewrites_the_guards_index(tmp_path):
+    """The guard is the only writer of index-fs.jsonl. Truncating it from here
+    crosses a lock boundary that does not compose, and can lose the file -
+    worse than the stale entries it would fix."""
+    from demo_cli import recovery
+    d = str(tmp_path / "rec")
+    _point(d, "index-fs.jsonl", "fs-old", "20260101-090000")
+    _point(d, "index-fs.jsonl", "fs-new", "20260101-100000")
+    before = open(os.path.join(d, "index-fs.jsonl"), encoding="utf-8").read()
+
+    recovery.prune(d, keep=1)
+
+    after = open(os.path.join(d, "index-fs.jsonl"), encoding="utf-8").read()
+    assert after == before, "prune must not write the guard's file"
+
+
+def test_fs_survivors_are_not_duplicated_into_the_main_index(tmp_path):
+    from demo_cli import recovery
+    d = str(tmp_path / "rec")
+    _point(d, "index.jsonl",    "main-a", "20260101-090000")
+    _point(d, "index-fs.jsonl", "fs-b",   "20260101-100000")
+    _point(d, "index.jsonl",    "main-c", "20260101-110000")
+
+    recovery.prune(d, keep=2)
+
+    ids = [e["id"] for e in recovery.load_entries(d)]
+    assert ids == ["fs-b", "main-c"]
+    assert len(ids) == len(set(ids)), f"duplicate entries: {ids}"
+    main = open(os.path.join(d, "index.jsonl"), encoding="utf-8").read()
+    assert "fs-b" not in main, "an fs entry was written into the main index"
+
+
+def test_pruning_works_with_no_main_index_at_all(tmp_path):
+    """A freshly mounted Windows project, before any CLI-side snapshot. The
+    old code checked os.path.exists(index.jsonl) and, finding none, de-listed
+    nothing at all while still deleting every doomed artefact."""
+    from demo_cli import recovery
+    d = str(tmp_path / "rec")
+    rp_old = _point(d, "index-fs.jsonl", "fs-old", "20260101-090000")
+    _point(d, "index-fs.jsonl", "fs-new", "20260101-100000")
+    assert not os.path.exists(os.path.join(d, "index.jsonl"))
+
+    recovery.prune(d, keep=1)
+
+    assert not os.path.exists(rp_old)
+    assert [e["id"] for e in recovery.load_entries(d)] == ["fs-new"]
+
+
+def test_pruning_the_main_chain_still_rewrites_in_place(tmp_path):
+    """The tombstone route is for the fs chain only. The main index has one
+    writer on this side, so pruning it stays a rewrite - no tombstone file
+    should appear for a main-only prune."""
+    from demo_cli import recovery
+    d = str(tmp_path / "rec")
+    _point(d, "index.jsonl", "a", "20260101-090000")
+    _point(d, "index.jsonl", "b", "20260101-100000")
+
+    recovery.prune(d, keep=1)
+
+    assert [e["id"] for e in recovery.load_entries(d)] == ["b"]
+    main = open(os.path.join(d, "index.jsonl"), encoding="utf-8").read()
+    assert '"id": "a"' not in main          # the id, not the letter
+    assert not os.path.exists(os.path.join(d, "index-fs.pruned"))
+
+
+def test_a_damaged_tombstone_file_does_not_hide_the_ledger(tmp_path):
+    """Fail toward SHOWING a recovery point. An unreadable tombstone file must
+    not silently remove entries whose artefacts are still on disk."""
+    from demo_cli import recovery
+    d = str(tmp_path / "rec")
+    _point(d, "index-fs.jsonl", "fs-a", "20260101-090000")
+    os.makedirs(os.path.join(d, "index-fs.pruned"))   # a directory, not a file
+    assert [e["id"] for e in recovery.load_entries(d)] == ["fs-a"]
+
+
+def test_find_and_latest_agree_with_the_filtered_view(tmp_path):
+    """undo goes through both. Neither may resurrect a pruned entry."""
+    from demo_cli import recovery
+    d = str(tmp_path / "rec")
+    _point(d, "index-fs.jsonl", "fs-old", "20260101-090000")
+    _point(d, "index-fs.jsonl", "fs-new", "20260101-100000")
+
+    recovery.prune(d, keep=1)
+
+    assert recovery.latest(d)["id"] == "fs-new"
+    assert recovery.find(d, "fs-old") is None
