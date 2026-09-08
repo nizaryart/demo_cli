@@ -896,6 +896,51 @@ def _changes_directory(segments: List[str]) -> bool:
     return any(_CD_RE.match(seg) for seg in segments)
 
 
+def unignorable_dirs(cmd: str, dialect: str = POSIX) -> frozenset:
+    """Ignored directory names this command explicitly reaches into.
+
+    IGNORED_DIRS keeps `.git`, `node_modules` and `__pycache__` out of a
+    directory snapshot, because copying them on every rm is expensive and they
+    are usually reconstructible. That reasoning holds right up until the
+    command NAMES something inside one:
+
+        rm proj/.git/config proj/src/a.py
+
+    collapses to `proj`, snapshots it without `.git`, and reports REVERSIBLE.
+    The snapshot contains src/a.py and nothing else; `undo` restores half the
+    damage and says nothing about the other half. The entry is
+    indistinguishable from a complete capture - no field records the omission -
+    which is what makes it a lie rather than a limitation. Found by review
+    2026-09-08.
+
+    So an ignore is a default, not a rule: a directory the command reaches
+    into is captured after all. If that makes the capture exceed the size cap,
+    snapshot() returns None and the command escalates, which is the honest
+    outcome and needs no extra code.
+
+    `.demo_cli` and `.demo_cli_recovery` are NEVER returned. Un-ignoring the
+    recovery store would copy the backup into the backup, and `rm
+    .demo_cli/something` is a request to delete recovery points, not a reason
+    to duplicate them.
+    """
+    segments = [seg for seg, _ in
+                effective_segments(cmd, dialect, substitute=True)] or [cmd]
+    base = None
+    if _changes_directory(segments):
+        here = effective_cwd(cmd, segments, len(segments))
+        if here is None:
+            return frozenset()          # cannot tell where it points; do not guess
+        if os.path.normpath(here) != os.path.normpath(os.getcwd()):
+            base = here
+
+    hit = set()
+    for seg in segments:
+        for op in _path_operands(seg, base):
+            parts = set(os.path.abspath(op).split(os.sep))
+            hit |= (IGNORED_DIRS & parts)
+    return frozenset(hit - {".demo_cli", ".demo_cli_recovery"})
+
+
 def is_fs_delete(cmd: str) -> bool:
     """True if cmd is a local filesystem delete/move whose target THIS module
     resolves by operand extraction (rm / mv / PowerShell Remove-Item). Used by

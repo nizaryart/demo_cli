@@ -274,7 +274,14 @@ class Guard:
         if remote_pg and not c.nonrecoverable_surface:
             c.nonrecoverable_surface = "managed_database"
 
-        entry = (recovery.snapshot(target, self.config.recovery_dir, strategy, action=command)
+        # An ignored directory the command reaches into must be captured after
+        # all - otherwise the snapshot silently omits part of the damage while
+        # the entry looks complete. See recovery.unignorable_dirs.
+        reached = recovery.unignorable_dirs(command, dialect)
+        keep_out = (None if not reached
+                    else frozenset(recovery.IGNORED_DIRS) - reached)
+        entry = (recovery.snapshot(target, self.config.recovery_dir, strategy,
+                                   action=command, ignore_dirs=keep_out)
                  if (c.needs_recovery and not remote_pg) else None)
 
         # LAST RESORT, never a first choice. Reached only when the command
