@@ -636,6 +636,30 @@ def extract_path_operand(cmd: str, dialect: str = POSIX) -> Optional[str]:
             return target if target and os.path.exists(target) else None
         return run
 
+    # MULTIPLICITY IS COUNTED ACROSS RULES, NOT WITHIN EACH ONE.
+    #
+    # The loop below returns on the first rule that matches, so it could only
+    # ever see its own segments. `rm a.txt; rm b.txt` escalated correctly - two
+    # hits for one rule - while these did not:
+    #
+    #     rm old.txt; mv new.txt keep.txt      snapshot of old.txt, REVERSIBLE
+    #     rm old.txt; echo z > keep.txt        snapshot of old.txt, REVERSIBLE
+    #
+    # keep.txt is clobbered in both, with nothing captured and the receipt
+    # claiming a recovery. That is the partial-recovery lie FIX #5 exists to
+    # prevent, surviving because the two destructive steps used DIFFERENT
+    # verbs. Found by review 2026-09-08.
+    #
+    # A set of indices, so one segment matching two rules still counts once,
+    # and the redirect detector is included because `> file` is a destructive
+    # step even though no rule regex covers it.
+    acting = {i for i, seg in enumerate(segments)
+              if any(rx.search(seg) for rx in (_RM_RE, _MV_RE, _PS_REMOVE_RE,
+                                               _PS_CONTENT_RE, _PS_DEST_RE))
+              or redirect_target(seg)}
+    if len(acting) > 1:
+        return None
+
     for rx, handler in ((_RM_RE, _rm),
                         (_MV_RE, _mv),
                         (_PS_REMOVE_RE, _existing(_ps_remove_item_operand)),
