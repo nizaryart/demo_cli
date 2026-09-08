@@ -588,6 +588,7 @@ def extract_path_operand(cmd: str, dialect: str = POSIX) -> Optional[str]:
     # claiming a recovery - the partial-recovery lie FIX #5 exists to prevent.
     segments = [seg for seg, _ in
                 effective_segments(cmd, dialect, substitute=True)] or [cmd]
+    moved = _changes_directory(segments)
 
     def _rm(seg: str) -> Optional[str]:
         # Collect every operand BEFORE deciding anything. Filtering to
@@ -632,7 +633,14 @@ def extract_path_operand(cmd: str, dialect: str = POSIX) -> Optional[str]:
         matched = [seg for seg in segments if rx.search(seg)]
         if not matched:
             continue
-        return handler(matched[0]) if len(matched) == 1 else None
+        if len(matched) != 1:
+            return None
+        target = handler(matched[0])
+        # A relative operand means nothing once the shell has moved. See
+        # _changes_directory: this snapshotted the wrong directory entirely.
+        if target and moved and not os.path.isabs(target):
+            return None
+        return target
 
     # Truncating output redirection ('> file'): snapshot the file it overwrites.
     # Uses the same quote-aware detector as the classifier, so classify (is it
@@ -642,7 +650,7 @@ def extract_path_operand(cmd: str, dialect: str = POSIX) -> Optional[str]:
     # raw line now, not a normalised whole, and `a > x; b > y` must escalate
     # for the same reason two rm segments do: snapshotting x while y is
     # truncated unrecorded is the partial-recovery lie.
-    tgt, _ = resolve_redirect_target(cmd, dialect)
+    tgt, _ = resolve_redirect_target(cmd, dialect, moved=moved)
     if tgt:
         return tgt if os.path.exists(tgt) else None
     return None
@@ -676,8 +684,9 @@ _UNEXPANDED = re.compile(r"""
 """, re.X)
 
 
-def resolve_redirect_target(cmd: str,
-                            dialect: str = POSIX) -> Tuple[Optional[str], bool]:
+def resolve_redirect_target(cmd: str, dialect: str = POSIX,
+                            moved: Optional[bool] = None
+                            ) -> Tuple[Optional[str], bool]:
     """(absolute target, resolved?) for a truncating output redirection.
 
     THE ONE RESOLVER, because three modules used to answer this differently and
@@ -718,6 +727,14 @@ def resolve_redirect_target(cmd: str,
     if len(hits) != 1:
         return None, False
     tgt = hits[0]
+    # `cd build && echo x > out.log` truncates build/out.log, not <cwd>/out.log.
+    # The redirect path has the same wrong-directory problem as the operand
+    # path, so it takes the same refusal. Callers that already computed it pass
+    # it in; the rest work it out here.
+    if moved is None:
+        moved = _changes_directory(segments)
+    if moved and not os.path.isabs(os.path.expanduser(tgt)):
+        return None, False
     if _UNEXPANDED.search(tgt):
         return None, False
     # `~` IS resolvable, unlike $(cmd), so expand it rather than escalate.
@@ -725,6 +742,36 @@ def resolve_redirect_target(cmd: str,
     # the guard read a real file in the home directory as a creation. The
     # commonest of the unexpanded forms and the one worth resolving properly.
     return os.path.abspath(os.path.expanduser(tgt)), True
+
+
+_CD_RE = re.compile(r"^\s*(?:cd|chdir|pushd|popd|Set-Location|sl)\b", re.I)
+
+
+def _changes_directory(segments: List[str]) -> bool:
+    """Does any segment move the shell somewhere else before the destructive one?
+
+    STEP 1 OF THE FIX FOR A WRONG-FILE SNAPSHOT (2026-09-08).
+
+        cd build && rm -rf ./out
+
+    On 2026-08-25 operand extraction moved from the whole line to per-segment,
+    because an anchored rule applied to a whole line matched nothing here and
+    the command escalated. That fixed the escalation and introduced something
+    worse: `./out` is now resolved against the CURRENT directory, so the guard
+    snapshots <cwd>/out - an unrelated, innocent directory - while build/out is
+    the one deleted. The receipt says REVERSIBLE and `undo` would restore the
+    wrong tree over live data.
+
+    Until the cwd is actually tracked (step 2), a relative operand after a `cd`
+    is UNRESOLVED. That is the same contract as resolve_redirect_target and
+    _common_capture_root: refusing to answer is an answer, guessing is not.
+
+    Absolute operands are unaffected - `cd x && rm /tmp/y` needs no cwd.
+
+    Deliberately broad: pushd/popd and PowerShell's Set-Location/sl count too,
+    since all of them invalidate the assumption in the same way.
+    """
+    return any(_CD_RE.match(seg) for seg in segments)
 
 
 def is_fs_delete(cmd: str) -> bool:

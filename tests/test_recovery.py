@@ -93,7 +93,11 @@ def files(tmp_path, monkeypatch):
 @pytest.mark.parametrize("cmd", [
     "rm a.txt",
     "echo hi; rm a.txt",
-    "cd . && rm a.txt",
+    pytest.param("cd . && rm a.txt", marks=pytest.mark.xfail(
+        strict=True, reason="step 1 of the cd fix (2026-09-08) refuses ANY "
+        "relative operand after a cd, including a no-op `cd .`. Step 2 tracks "
+        "the working directory and restores this. strict=True so it fails "
+        "loudly when step 2 lands rather than passing unnoticed.")),
     "echo one; echo two; rm a.txt",
     "cat a.txt | grep x; rm a.txt",
 ])
@@ -101,6 +105,7 @@ def test_a_chained_rm_still_resolves_its_target(files, cmd):
     assert recovery.extract_path_operand(cmd, POSIX) == "a.txt"
 
 
+@pytest.mark.xfail(strict=True, reason="step 1 of the cd fix; step 2 restores it")
 def test_a_chained_rm_in_a_subdirectory_resolves(files):
     assert recovery.extract_path_operand("cd . && rm build/out.txt", POSIX) \
         == "build/out.txt"
@@ -133,10 +138,22 @@ def test_two_destructive_segments_in_powershell_resolve_to_nothing(files):
 
 
 def test_a_safe_command_before_a_destructive_one_is_not_the_target(files):
-    """`cd /tmp && rm a.txt` must not snapshot /tmp. The words of the leading
-    command used to leak in as operands, which is how the count stopped being
-    one and the whole thing gave up."""
-    assert recovery.extract_path_operand("cd /tmp && rm a.txt", POSIX) == "a.txt"
+    """`cd /tmp && rm a.txt` must not snapshot /tmp - the words of the leading
+    command used to leak in as operands.
+
+    IT MUST ALSO NOT SNAPSHOT THE LOCAL a.txt, and that half was asserted
+    backwards. The old assertion demanded "a.txt", i.e. the file in the CURRENT
+    directory - but the shell deletes /tmp/a.txt. It pinned a wrong-file
+    snapshot as correct behaviour, which is how the defect survived (2026-09-08).
+
+    The honest assertion is about what it must NOT be. Whether it resolves to
+    /tmp/a.txt (step 2, if that file exists) or to nothing (step 1) is a
+    capability question; naming the wrong file is a correctness one.
+    """
+    got = recovery.extract_path_operand("cd /tmp && rm a.txt", POSIX)
+    assert got != "a.txt", "resolved to the local file, not the one being deleted"
+    assert got != os.path.abspath("a.txt")
+    assert got in (None, "/tmp/a.txt", os.path.join("/tmp", "a.txt"))
 
 
 def test_a_command_with_no_destructive_segment_resolves_to_nothing(files):
