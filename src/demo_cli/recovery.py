@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import math
 import os
 import re
 import shlex
@@ -265,6 +266,33 @@ def _expand_braces_bounded(token: str, depth: int = 0) -> Optional[List[str]]:
             return None
     return [pre + opt_x + tail
             for ex in expanded for opt_x in ex for tail in tails]
+
+
+def _mv_target_dir(seg: str) -> Tuple[Optional[str], bool]:
+    """(target directory, ambiguous?) for `mv -t DIR src...`.
+
+    `mv -t bk s1` moves s1 INTO bk, so the file at risk is bk/s1. _mv took
+    ops[-1] as the destination, and _path_operands drops `-t` as a flag while
+    keeping its value - so ops was [bk, s1] and ops[-1] was the SOURCE. The
+    guard snapshotted s1, which is merely being moved away, and reported
+    REVERSIBLE while bk/s1 was overwritten with nothing captured. Found by
+    review 2026-09-08.
+
+    Returns ambiguous=True for a short-flag cluster we cannot split with
+    confidence (`mv -ft bk s1`). Escalating on a spelling we cannot read is
+    the same contract as everywhere else in this module.
+    """
+    toks = _tokenize(seg)
+    for i, tok in enumerate(toks):
+        if tok in ("-t", "--target-directory"):
+            return (toks[i + 1].strip("'\"") if i + 1 < len(toks) else None), False
+        if tok.startswith("--target-directory="):
+            return tok.split("=", 1)[1].strip("'\""), False
+        if tok.startswith("-") and not tok.startswith("--") and "t" in tok[1:]:
+            if tok.startswith("-t"):
+                return tok[2:].strip("'\""), False      # -tbk
+            return None, True                            # -ft bk: do not guess
+    return None, False
 
 
 def _tokenize(cmd: str, windows_paths: Optional[bool] = None) -> List[str]:
@@ -690,6 +718,29 @@ def extract_path_operand(cmd: str, dialect: str = POSIX) -> Optional[str]:
 
     def _mv(seg: str) -> Optional[str]:
         ops = _path_operands(seg, base)
+
+        # `mv -t DIR src...` inverts the operand order: every source lands in
+        # DIR, so the files at risk are DIR/basename(src) - not ops[-1], which
+        # is a source. See _mv_target_dir.
+        tdir, ambiguous = _mv_target_dir(seg)
+        if ambiguous:
+            return None
+        if tdir:
+            root = os.path.abspath(os.path.join(base, tdir)) if (
+                base and not os.path.isabs(tdir)) else os.path.abspath(tdir)
+            srcs = [o for o in ops if os.path.abspath(o) != root]
+            hit = [p for p in (os.path.join(root, os.path.basename(sp))
+                               for sp in srcs) if os.path.exists(p)]
+            if len(hit) == 1:
+                return hit[0]
+            if len(hit) > 1:
+                return _common_capture_root(hit)
+            # Nothing is overwritten: the sources only change place, and the
+            # move is undone by moving them back.
+            if len(srcs) == 1 and os.path.exists(srcs[0]):
+                return srcs[0]
+            return _common_capture_root(srcs) if len(srcs) > 1 else None
+
         if len(ops) >= 2:
             dst, src = ops[-1], ops[-2]
             if os.path.exists(dst):
@@ -1177,11 +1228,38 @@ def _new_id() -> str:
 
 
 def _max_snapshot_bytes() -> int:
+    """The directory-capture cap, in bytes. Never raises, never negative.
+
+    `float()` was guarded and `int()` was not, which is the gap:
+
+        DEMO_CLI_MAX_SNAPSHOT_MB=nan   float() fine, int() -> ValueError
+        DEMO_CLI_MAX_SNAPSHOT_MB=inf   float() fine, int() -> OverflowError
+
+    Neither is an OSError, and this runs BEFORE the try/except around the copy,
+    so both escaped Guard.evaluate. The Claude Code adapter fails open on its
+    own errors, so a typo in one environment variable turned every directory
+    capture into an unguarded delete (2026-09-08).
+
+    A NEGATIVE value was accepted silently and is worse than a crash: every
+    tree exceeds a cap of -5 MB, so directory recovery is switched off with no
+    message at all. Nonsense values fall back to the default rather than to
+    "capture nothing", because silently disabling recovery is the dangerous
+    direction. Zero is left alone - it is a coherent way to say "files only".
+    """
+    default = int(_DEFAULT_MAX_SNAPSHOT_MB * 1024 * 1024)
+    raw = os.environ.get("DEMO_CLI_MAX_SNAPSHOT_MB")
+    if raw is None:
+        return default
     try:
-        mb = float(os.environ.get("DEMO_CLI_MAX_SNAPSHOT_MB", _DEFAULT_MAX_SNAPSHOT_MB))
-    except ValueError:
-        mb = _DEFAULT_MAX_SNAPSHOT_MB
-    return int(mb * 1024 * 1024)
+        mb = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(mb) or mb < 0:
+        return default
+    try:
+        return int(mb * 1024 * 1024)
+    except (ValueError, OverflowError):
+        return default
 
 
 def _contains(outer: str, inner: str) -> bool:
