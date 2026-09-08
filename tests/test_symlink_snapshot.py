@@ -27,11 +27,40 @@ and without a claim.
 """
 import os
 import shutil
+import tempfile
 
 import pytest
 
 from demo_cli import recovery
 from demo_cli.guard import Guard
+
+
+def _symlinks_available() -> bool:
+    """Can this process CREATE a symlink? Not the same as "is this POSIX".
+
+    Windows needs Administrator or Developer Mode for os.symlink and returns
+    WinError 1314 otherwise. Probed rather than assumed from os.name, so these
+    tests still run on a Windows box that has it enabled - the fix matters
+    there as much as anywhere, and gating on the platform would silently give
+    that up.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        try:
+            os.symlink(os.path.join(d, "target"), os.path.join(d, "link"))
+            return True
+        except (OSError, NotImplementedError, AttributeError):
+            return False
+
+
+# NOTE THE HONEST CONSEQUENCE: where this skips, the symlink half of the fix
+# is UNVERIFIED. Encountering a symlink needs no privilege even where creating
+# one does, so the defect is reachable on such a machine and the test simply
+# cannot reach it. The two tests that mock a copy failure are not gated and do
+# run everywhere.
+requires_symlinks = pytest.mark.skipif(
+    not _symlinks_available(),
+    reason="creating a symlink needs Administrator or Developer Mode here "
+           "(WinError 1314); the fix is unverified on this machine")
 
 
 @pytest.fixture()
@@ -49,6 +78,7 @@ def proj(tmp_path, monkeypatch):
 # F8: the guard must not crash, and must not step aside.
 # --------------------------------------------------------------------------
 
+@requires_symlinks
 def test_a_dangling_symlink_does_not_take_the_guard_down(proj):
     os.symlink("/nonexistent/target", proj / "dangling")
     r = Guard(mode="enforce").evaluate('rm proj/a.py proj/b.py')
@@ -56,6 +86,7 @@ def test_a_dangling_symlink_does_not_take_the_guard_down(proj):
     assert r.recovery_entry, "no snapshot: the guard stepped aside"
 
 
+@requires_symlinks
 def test_the_dangling_link_is_captured_as_a_link(proj):
     os.symlink("/nonexistent/target", proj / "dangling")
     r = Guard(mode="enforce").evaluate('rm proj/a.py proj/b.py')
@@ -90,6 +121,7 @@ def test_the_file_branch_is_guarded_too(proj, monkeypatch):
 # F7: what is measured must be what is copied.
 # --------------------------------------------------------------------------
 
+@requires_symlinks
 def test_a_symlinked_tree_is_not_copied_past_the_cap(tmp_path, monkeypatch):
     (tmp_path / ".demo_cli.toml").write_text('mode = "enforce"\n')
     heavy = tmp_path / "heavy"
@@ -118,6 +150,7 @@ def test_a_symlinked_tree_is_not_copied_past_the_cap(tmp_path, monkeypatch):
 # Restore has to speak the same language the snapshot now writes.
 # --------------------------------------------------------------------------
 
+@requires_symlinks
 def test_a_captured_link_is_restored_as_a_link(proj):
     os.symlink("/nonexistent/target", proj / "dangling")
     r = Guard(mode="enforce").evaluate('rm proj/a.py proj/b.py')
