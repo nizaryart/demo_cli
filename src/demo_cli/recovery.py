@@ -272,6 +272,16 @@ def _path_operands(cmd: str) -> List[str]:
         if tok.startswith("-"):
             continue
         tok = tok.strip("'\"")
+        # The shell expands `~` before the command ever sees it, so our view of
+        # the operands has to as well. Left literal, `~/a` became "<cwd>/~/a"
+        # via abspath - a path that cannot exist - and two such operands
+        # collapsed to a common root of the CURRENT DIRECTORY. `rm -f ~/a ~/b`
+        # run from a subdirectory then snapshotted that subdirectory and
+        # reported REVERSIBLE, while the files that died were in $HOME and the
+        # recovery point held none of them (2026-09-08). Expanded, they
+        # collapse to $HOME, which _too_broad refuses, and the command
+        # escalates honestly.
+        tok = os.path.expanduser(tok)
         for piece in _expand_braces(tok):
             if any(ch in piece for ch in "*?["):
                 out.extend(sorted(_glob.glob(piece)))
@@ -465,6 +475,13 @@ def _common_capture_root(paths: List[str]) -> Optional[str]:
     # with ntpath (available on every OS) so it is caught even when the check
     # runs on a POSIX host, where backslash paths would otherwise be treated as
     # literal filenames and collapse to a bogus common root under the cwd.
+    # AN UNEXPANDED OPERAND IS NOT A PATH, and a common root computed from one
+    # is meaningless. `$HOME/a` abspath's to "<cwd>/$HOME/a", so two of them
+    # collapse to the current directory and the capture lands on whatever
+    # happens to be there. Same contract as resolve_redirect_target: refusing
+    # to answer is an answer, guessing is not.
+    if any(_UNEXPANDED.search(p) for p in paths):
+        return None
     import ntpath
     drives = {ntpath.splitdrive(p)[0].upper() for p in paths}
     drives.discard("")
