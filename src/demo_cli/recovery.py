@@ -118,6 +118,16 @@ _PS_REMOVE_RE = re.compile(r"^\s*(?:Remove-Item|ri)\b", re.I)
 # to the literal token (we capture nothing for it -> the honest escalate path),
 # never an unbounded blow-up.
 _BRACE_MAX = 1024
+# One recursion level per brace GROUP, so a token with thousands of them blew
+# the stack once the expansion was made linear (2026-09-08). Before that it was
+# exponential and hung long before it got deep, which is the only reason this
+# never showed. A RecursionError is not an OSError, so it would have escaped
+# Guard.evaluate and the hook would have failed open - the same silent
+# unguarded-delete as the dangling-symlink crash.
+#
+# 64 is far past anything meaningful: _BRACE_MAX caps the product at 1024, so
+# even binary groups stop expanding after ten. Past this the token is literal.
+_BRACE_MAX_DEPTH = 64
 
 
 def _split_top_commas(s: str) -> List[str]:
@@ -177,26 +187,84 @@ def _expand_braces(token: str) -> List[str]:
     (`{a,b}{1,2}` -> a1 a2 b1 b2). A group with no top-level comma and no valid
     range (e.g. `{foo}`) stays literal, exactly as the shell leaves it. Falls
     back to the unexpanded token if the expansion would exceed _BRACE_MAX."""
+    try:
+        out = _expand_braces_bounded(token)
+    except RecursionError:
+        # The depth cap below should make this unreachable. It is caught
+        # anyway: a token shape nobody predicted must degrade to "literal",
+        # never take the guard down. "Degrade, never crash."
+        return [token]
+    return [token] if out is None else out
+
+
+def _expand_braces_bounded(token: str, depth: int = 0) -> Optional[List[str]]:
+    """The recursion behind _expand_braces. None means "too big, give up".
+
+    TWO DEFECTS, ONE SHAPE (found by review 2026-09-08).
+
+    1. EXPONENTIAL IN TIME. The tail was expanded INSIDE the option loop:
+
+           for opt in options:
+               for opt_x in _expand_braces(opt):
+                   for tail in _expand_braces(post):   # recomputed every time
+
+       so T(n) = 2*T(n-1) for `{a,b}` repeated n times - measured at 4x per
+       two groups: 10 groups 0.016s, 18 groups 2.6s, 20 groups 10.6s, 600
+       groups never returned. _BRACE_MAX bounded `result`, but the blowup
+       happens inside the recursive calls, before the first append, so the
+       check was never reached. A hang in the guard's hot path, which runs
+       before every single tool call.
+
+       The tail does not depend on the option, so it is computed once.
+
+    2. THE BAIL PRODUCED GARBAGE, NOT A FALLBACK. The old bail returned
+       `[token]` from an INNER level, and the outer level then combined that
+       literal with its own options - yielding operands like `a{a,b}{a,b}...`
+       that are neither the full expansion nor the original token. Visible in
+       the timings above as absurd result counts (14 groups -> 8 items).
+       Those strings reach _path_operands as candidate paths.
+
+       So "too big" is now a distinct return value that propagates all the way
+       up, and the caller substitutes the whole unexpanded token exactly once.
+       A partial expansion is never a safe answer: the operand list is what
+       decides whether a command is a single-target capture or an escalation.
+    """
+    if depth > _BRACE_MAX_DEPTH:
+        return None
     grp = _first_brace_group(token)
     if grp is None:
         return [token]
     a, b = grp
     pre, inner, post = token[:a], token[a + 1:b], token[b + 1:]
+
+    tails = _expand_braces_bounded(post, depth + 1)  # once, not per option
+    if tails is None:
+        return None
+
     options = _split_top_commas(inner)
     if len(options) <= 1:
         rng = _expand_range(inner)
         if rng is None:
-            # Not expandable: keep this group literal, expand anything after it.
-            return [token[:b + 1] + tail for tail in _expand_braces(post)]
+            # Not expandable: keep this group literal, expand anything after
+            # it. (_expand_range also returns None for a range that is simply
+            # too large, and literal is the right answer for that too.)
+            return [token[:b + 1] + tail for tail in tails]
         options = rng
-    result: List[str] = []
+
+    expanded: List[List[str]] = []
+    total = 0
     for opt in options:
-        for opt_x in _expand_braces(opt):          # options may nest
-            for tail in _expand_braces(post):
-                result.append(pre + opt_x + tail)
-                if len(result) > _BRACE_MAX:
-                    return [token]                 # pathological -> literal
-    return result
+        ex = _expand_braces_bounded(opt, depth + 1)  # options may nest
+        if ex is None:
+            return None
+        expanded.append(ex)
+        total += len(ex)
+        # Bounded BEFORE building the product, so the cost of refusing is not
+        # itself the thing that hangs.
+        if total * len(tails) > _BRACE_MAX:
+            return None
+    return [pre + opt_x + tail
+            for ex in expanded for opt_x in ex for tail in tails]
 
 
 def _tokenize(cmd: str, windows_paths: Optional[bool] = None) -> List[str]:
