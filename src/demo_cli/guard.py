@@ -176,6 +176,11 @@ class Guard:
         # actually asking for (claude-code#76626). Empty for non rm / mv.
         affected_paths = recovery.expanded_operands(command)
 
+        # Whether the USER named a target, captured before the block below
+        # overwrites target_path with whatever extraction found. The two mean
+        # very different things and sharing one name has already cost a fix.
+        user_named_target = target_path is not None
+
         # Trou 2: when no target was supplied explicitly, resolve the real
         # filesystem operand of an rm / mv so the snapshot actually fires on the
         # auto-fire path (the flagship "rm -> undo" moment). Bounded to the
@@ -221,11 +226,30 @@ class Guard:
         # resolve_redirect_target already computes exactly the right answer
         # here: (None, False) for two redirecting segments. It was simply
         # being discarded by a path that never asked.
+        # MORE THAN ONE SEGMENT DESTROYS SOMETHING, and a snapshot covers one.
+        #
+        # F2 closed the file-verb half of this in recovery.py - `rm a; mv b c`
+        # no longer resolves a target. This is the half recovery.py cannot see:
+        # a git or SQL destruction paired with a file delete. The operand
+        # extractor resolves old.txt quite correctly, and the receipt then
+        # claims a recovery point for a command that also dropped a table.
+        #
+        #     DROP TABLE users; rm old.txt      -> was REVERSIBLE
+        #     git reset --hard; rm old.txt      -> was REVERSIBLE
+        #
+        # An explicit --target is left alone: the user named what they wanted
+        # captured, and overriding that would be its own kind of dishonesty.
+        multi_destructive = (c.destructive_segments > 1
+                             and not user_named_target
+                             and not explicit_db and not db_url)
+
         unresolved_redirect = (
             c.matched_rule == "fs_redirect_truncate"
             and not recovery.resolve_redirect_target(command, dialect)[1])
-        if target_path is None and target is not None and (
-                recovery.is_fs_delete(command) or unresolved_redirect):
+        if target is not None and (
+                (target_path is None
+                 and (recovery.is_fs_delete(command) or unresolved_redirect))
+                or multi_destructive):
             target = None
 
         label = target.label if target else None

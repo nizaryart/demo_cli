@@ -879,6 +879,20 @@ class Classification:
     action_type: str = "shell"
     nonrecoverable_surface: Optional[str] = None
     segments: List[str] = field(default_factory=list)
+    # HOW MANY SEGMENTS DESTROY SOMETHING, not just whether any does.
+    #
+    # A single snapshot can only stand behind ONE of them. The guard used to
+    # see `is_destructive=True` for the whole line, resolve a target from
+    # whichever segment the operand extractor understood, and report
+    # REVERSIBLE - while the other destructive step went unrecorded:
+    #
+    #     DROP TABLE users; rm old.txt      snapshot of old.txt, REVERSIBLE
+    #     git reset --hard; rm old.txt      snapshot of old.txt, REVERSIBLE
+    #
+    # recovery.py cannot see this, because it only knows rm / mv / Remove-Item
+    # / redirects and has no idea a DROP or a hard reset destroyed anything.
+    # The classifier does know, so it is the one that has to say (2026-09-08).
+    destructive_segments: int = 0
 
     @property
     def needs_recovery(self) -> bool:
@@ -981,6 +995,7 @@ def classify_pipeline(cmd: str, dialect: str = POSIX) -> Classification:
                        seg_results[0]["action_type"])
 
     return Classification(
+        destructive_segments=sum(1 for s in seg_results if s["is_destructive"]),
         is_destructive=any_of("is_destructive"),
         is_mutating=any_of("is_mutating"),
         is_sql_read=any_of("is_sql_read"),

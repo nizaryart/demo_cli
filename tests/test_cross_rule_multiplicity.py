@@ -75,3 +75,64 @@ def test_one_segment_matching_two_rules_counts_once(lab):
            if any(rx.search(seg) for rx in (recovery._RM_RE, recovery._MV_RE))}
     assert len(idx) <= 1
     assert recovery.extract_path_operand('mv new.txt keep.txt') is not None
+
+
+# --------------------------------------------------------------------------
+# The half recovery.py cannot see: a destruction it has no verb for.
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("cmd", [
+    'DROP TABLE users; rm old.txt',
+    'git reset --hard; rm old.txt',
+    'git checkout . ; rm old.txt',
+    'rm old.txt; git stash drop',
+    'git clean -fd; rm old.txt',
+])
+def test_a_destruction_with_no_operand_still_blocks_the_snapshot(lab, cmd):
+    """recovery.py knows rm / mv / Remove-Item / redirects. It has no idea a
+    DROP or a hard reset destroyed anything, so it resolves old.txt quite
+    correctly and the receipt claims a recovery for a command that also
+    dropped a table.
+
+    The classifier DOES know, so it is the one that reports how many segments
+    destroy something. One snapshot can stand behind one of them.
+    """
+    r = Guard(mode="enforce").evaluate(cmd)
+    assert r.classification.destructive_segments > 1, cmd
+    assert r.decision.decision == "ESCALATE", cmd
+    assert not r.recovery_entry, "claimed a recovery for half the damage"
+
+
+@pytest.mark.parametrize("cmd", [
+    'git status; rm old.txt',
+    'git log --oneline; rm old.txt',
+    'echo hi; rm old.txt',
+    'cat old.txt | grep x; rm old.txt',
+])
+def test_a_harmless_command_alongside_a_delete_is_still_recoverable(lab, cmd):
+    """The count is of DESTRUCTIVE segments, not of segments. A read-only git
+    command must not cost the user their snapshot."""
+    r = Guard(mode="enforce").evaluate(cmd)
+    assert r.classification.destructive_segments == 1, cmd
+    assert r.decision.decision == "REVERSIBLE", cmd
+    assert r.recovery_entry
+
+
+def test_an_explicit_target_is_still_honoured(lab):
+    """Dropping the target is a refusal to GUESS. When the user names what
+    they want captured, overriding them would be its own dishonesty - and
+    'the user asked for this one' is a different claim from 'we worked out
+    what this command touches'."""
+    r = Guard(mode="enforce").evaluate('DROP TABLE users; rm old.txt',
+                                       target_path=str(lab / "old.txt"))
+    assert r.recovery_entry, "an explicitly named target was discarded"
+
+
+def test_the_count_is_per_segment_not_per_line(lab):
+    """Pinned because the whole fix rests on it: classify_pipeline used to
+    collapse everything into one is_destructive flag for the line."""
+    from demo_cli.classify import classify_pipeline
+    assert classify_pipeline('rm a.txt').destructive_segments == 1
+    assert classify_pipeline('rm a.txt; rm b.txt').destructive_segments == 2
+    assert classify_pipeline('echo hi; ls').destructive_segments == 0
+    assert classify_pipeline('git status; git log').destructive_segments == 0
