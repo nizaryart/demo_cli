@@ -1186,7 +1186,10 @@ def snapshot(target: Optional[Target], recovery_dir: str, strategy: str = "snaps
         if not os.path.exists(ref):
             return None
         bak = os.path.join(recovery_dir, f"{os.path.basename(ref)}.{ts}.{rid}.bak")
-        shutil.copy2(ref, bak)
+        try:
+            shutil.copy2(ref, bak)
+        except OSError:
+            return None         # no snapshot -> the caller escalates. See below.
         return _entry(bak)
 
     if kind == "dir":
@@ -1229,7 +1232,36 @@ def snapshot(target: Optional[Target], recovery_dir: str, strategy: str = "snaps
         if _dir_size(ref, cap, ignore_dirs, skip_path=skip) > cap:
             return None
         snap = os.path.join(recovery_dir, f"{os.path.basename(ref.rstrip('/'))}.{ts}.{rid}.snapdir")
-        shutil.copytree(ref, snap, dirs_exist_ok=True, ignore=ignore)
+        # symlinks=True, AND NOT ONLY TO AVOID A CRASH.
+        #
+        # The default is False, which FOLLOWS every symlink and copies what it
+        # points at. Two consequences, both found by review 2026-09-08:
+        #
+        #   * a DANGLING link raised shutil.Error straight out of
+        #     Guard.evaluate. The Claude Code adapter fails open on its own
+        #     errors, so the hook printed "internal error, stepping aside" and
+        #     let the delete run UNGUARDED. One broken symlink anywhere in a
+        #     project silently disabled recovery for every directory capture -
+        #     and build trees and node_modules are full of them.
+        #
+        #   * the size cap stopped bounding anything. _dir_size walks with
+        #     os.walk, which does NOT descend symlinked directories, so a link
+        #     to a 2 MB tree measured as nothing and copied as 2 MB. Measured
+        #     at 4x a 0.5 MB cap. Exactly what _dir_size's own docstring warns
+        #     about, arriving from the copy side instead of the ignore list.
+        #
+        # Preserving the link is also the more faithful capture: `rm link`
+        # destroys the link, not its target, so restoring a link is right and
+        # restoring a regular file full of the target's bytes was wrong.
+        #
+        # The try/except stays regardless. "Degrade, never crash" is the
+        # contract, and returning None here means no recovery point, which
+        # makes the caller escalate - loudly, and without a claim.
+        try:
+            shutil.copytree(ref, snap, dirs_exist_ok=True, ignore=ignore,
+                            symlinks=True)
+        except OSError:         # shutil.Error is an OSError
+            return None
         return _entry(snap)
 
     if kind == "postgres":
@@ -1633,7 +1665,10 @@ def restore_entry(entry: dict) -> bool:
         # a provable superset - and also why an edit made to an unrelated file in
         # that directory after the snapshot would be rolled back here.
         try:
-            shutil.copytree(rp, target, dirs_exist_ok=True)
+            # symlinks=True to match the snapshot: a captured link is restored
+            # as a link. Without it, restore would follow the link, write a
+            # regular file over it, and fail outright on a dangling one.
+            shutil.copytree(rp, target, dirs_exist_ok=True, symlinks=True)
         except OSError:
             return False        # same reasoning as the file branch above
         return True
