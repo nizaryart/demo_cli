@@ -93,11 +93,7 @@ def files(tmp_path, monkeypatch):
 @pytest.mark.parametrize("cmd", [
     "rm a.txt",
     "echo hi; rm a.txt",
-    pytest.param("cd . && rm a.txt", marks=pytest.mark.xfail(
-        strict=True, reason="step 1 of the cd fix (2026-09-08) refuses ANY "
-        "relative operand after a cd, including a no-op `cd .`. Step 2 tracks "
-        "the working directory and restores this. strict=True so it fails "
-        "loudly when step 2 lands rather than passing unnoticed.")),
+    "cd . && rm a.txt",          # restored by step 2 of the cd fix
     "echo one; echo two; rm a.txt",
     "cat a.txt | grep x; rm a.txt",
 ])
@@ -105,7 +101,6 @@ def test_a_chained_rm_still_resolves_its_target(files, cmd):
     assert recovery.extract_path_operand(cmd, POSIX) == "a.txt"
 
 
-@pytest.mark.xfail(strict=True, reason="step 1 of the cd fix; step 2 restores it")
 def test_a_chained_rm_in_a_subdirectory_resolves(files):
     assert recovery.extract_path_operand("cd . && rm build/out.txt", POSIX) \
         == "build/out.txt"

@@ -245,7 +245,7 @@ def _tokenize(cmd: str, windows_paths: Optional[bool] = None) -> List[str]:
         return cmd.strip().split()
 
 
-def _path_operands(cmd: str) -> List[str]:
+def _path_operands(cmd: str, base: Optional[str] = None) -> List[str]:
     """Crude operand extraction: drop the leading command word(s) and any flags,
     keep the rest as candidate paths. Not a shell parser - good enough to find
     the target of a simple rm / mv.
@@ -282,6 +282,12 @@ def _path_operands(cmd: str) -> List[str]:
         # collapse to $HOME, which _too_broad refuses, and the command
         # escalates honestly.
         tok = os.path.expanduser(tok)
+        # `base` is the working directory the shell will actually be in when
+        # this runs - set only when a `cd` moved it somewhere other than here.
+        # Without it, globbing and os.path.exists resolve against OUR cwd and
+        # the answer describes a different directory's contents.
+        if base and not os.path.isabs(tok):
+            tok = os.path.normpath(os.path.join(base, tok))
         for piece in _expand_braces(tok):
             if any(ch in piece for ch in "*?["):
                 out.extend(sorted(_glob.glob(piece)))
@@ -589,6 +595,11 @@ def extract_path_operand(cmd: str, dialect: str = POSIX) -> Optional[str]:
     segments = [seg for seg, _ in
                 effective_segments(cmd, dialect, substitute=True)] or [cmd]
     moved = _changes_directory(segments)
+    # `base` stays None whenever the shell has not actually moved, so every
+    # command without a `cd` - the overwhelming majority - takes exactly the
+    # path it took before, returning relative operands relative. Only a real
+    # relocation changes anything, and then absolute is the only honest answer.
+    base: Optional[str] = None
 
     def _rm(seg: str) -> Optional[str]:
         # Collect every operand BEFORE deciding anything. Filtering to
@@ -602,7 +613,7 @@ def extract_path_operand(cmd: str, dialect: str = POSIX) -> Optional[str]:
         # wildcard operands are existence-filtered (by the glob expansion
         # inside _path_operands itself, since a glob that matches nothing
         # touches nothing).
-        ops = _path_operands(seg)
+        ops = _path_operands(seg, base)
         if len(ops) == 1:
             return ops[0] if os.path.exists(ops[0]) else None
         if len(ops) > 1:
@@ -610,7 +621,7 @@ def extract_path_operand(cmd: str, dialect: str = POSIX) -> Optional[str]:
         return None
 
     def _mv(seg: str) -> Optional[str]:
-        ops = _path_operands(seg)
+        ops = _path_operands(seg, base)
         if len(ops) >= 2:
             dst, src = ops[-1], ops[-2]
             if os.path.exists(dst):
@@ -630,15 +641,22 @@ def extract_path_operand(cmd: str, dialect: str = POSIX) -> Optional[str]:
                         (_PS_REMOVE_RE, _existing(_ps_remove_item_operand)),
                         (_PS_CONTENT_RE, _existing(_ps_write_target)),
                         (_PS_DEST_RE, _existing(_ps_dest_target))):
-        matched = [seg for seg in segments if rx.search(seg)]
-        if not matched:
+        hits = [(i, seg) for i, seg in enumerate(segments) if rx.search(seg)]
+        if not hits:
             continue
-        if len(matched) != 1:
+        if len(hits) != 1:
             return None
-        target = handler(matched[0])
-        # A relative operand means nothing once the shell has moved. See
-        # _changes_directory: this snapshotted the wrong directory entirely.
-        if target and moved and not os.path.isabs(target):
+        idx, seg = hits[0]
+        if moved:
+            here = effective_cwd(cmd, segments, idx)
+            if here is None:
+                return None                     # cannot model it: do not guess
+            if os.path.normpath(here) != os.path.normpath(os.getcwd()):
+                base = here
+        target = handler(seg)
+        # Belt and braces: a relative answer after a move would describe the
+        # wrong directory, and there is no honest way to interpret it.
+        if target and moved and base and not os.path.isabs(target):
             return None
         return target
 
@@ -734,7 +752,13 @@ def resolve_redirect_target(cmd: str, dialect: str = POSIX,
     if moved is None:
         moved = _changes_directory(segments)
     if moved and not os.path.isabs(os.path.expanduser(tgt)):
-        return None, False
+        # Which segment redirects? Its cwd is the one that matters.
+        idx = next((i for i, seg in enumerate(segments) if redirect_target(seg)), 0)
+        here = effective_cwd(cmd, segments, idx)
+        if here is None:
+            return None, False                  # unmodellable: refuse
+        return os.path.normpath(
+            os.path.join(here, os.path.expanduser(tgt))), True
     if _UNEXPANDED.search(tgt):
         return None, False
     # `~` IS resolvable, unlike $(cmd), so expand it rather than escalate.
@@ -745,6 +769,80 @@ def resolve_redirect_target(cmd: str, dialect: str = POSIX,
 
 
 _CD_RE = re.compile(r"^\s*(?:cd|chdir|pushd|popd|Set-Location|sl)\b", re.I)
+
+
+_CD_ARGS = re.compile(r"^\s*(?:cd|chdir|Set-Location|sl)\s*(?P<arg>.*?)\s*$", re.I)
+_UNMODELLED = re.compile(r"^\s*(?:pushd|popd)\b", re.I)
+
+
+def effective_cwd(cmd: str, segments: List[str], upto: int) -> Optional[str]:
+    """The working directory in effect when segments[upto] runs, or None.
+
+    STEP 2 OF THE cd FIX. Step 1 refused every relative operand after a `cd`,
+    which closed the wrong-file snapshot and escalated a pattern agents write
+    constantly. This folds the `cd`s instead, so the common case resolves to
+    the RIGHT file rather than to nothing.
+
+    Folding is one line per hop - normpath(join(cwd, arg)) - and it composes,
+    so any number of `cd`s in a row works, and `..`, `.` and absolute paths
+    all fall out for free. It also matches bash: bash's default `cd` is
+    LOGICAL (-L), so `cd link` then `cd ..` returns to the link's parent,
+    which is exactly what normpath does. (`cd -P` would differ; it is refused
+    below along with everything else we cannot model.)
+
+    RETURNS None RATHER THAN A GUESS, for:
+
+      * `pushd` / `popd`         a directory stack we do not model
+      * a `(` or `)` anywhere    `(cd x && rm y); rm z` puts z back at the
+                                 original cwd, and we do not track subshells
+      * a `|` anywhere           each side of a pipeline runs in its own
+                                 subshell, so a `cd` on the left never reaches
+                                 the right. split_segments discards the
+                                 separator, so we cannot tell `cd x | rm y`
+                                 from `cd x && rm y` - refuse both rather than
+                                 get one of them wrong
+      * CDPATH set               `cd foo` can then land somewhere else entirely
+      * an unexpanded argument   `cd $VAR`, `cd $(...)`, a backtick
+      * more than one argument   `cd a b` is an error in bash, not a hop
+      * a target that is not a directory NOW
+
+    THE ONE CASE THIS CANNOT DECIDE, stated plainly: with `;` rather than
+    `&&`, whether the `cd` succeeded is a runtime fact.
+
+        cd build && rm -rf ./out    cd fails -> rm never runs. Safe.
+        cd build ;  rm -rf ./out    cd fails -> rm runs at the OLD cwd.
+
+    Requiring the target to be a real directory reduces that to a race - the
+    directory would have to vanish between this check and the command - rather
+    than a guess. It is the residual risk, and it is smaller than either
+    alternative: escalating every chained rm, or resolving against the wrong
+    directory.
+    """
+    if os.environ.get("CDPATH"):
+        return None
+    if "(" in cmd or ")" in cmd or "|" in cmd:
+        return None
+
+    cwd = os.getcwd()
+    previous = cwd
+    for seg in segments[:upto]:
+        if _UNMODELLED.match(seg):
+            return None
+        m = _CD_ARGS.match(seg)
+        if not m:
+            continue
+        arg = (m.group("arg") or "").strip().strip("'\"")
+        if not arg:                              # bare `cd` goes home
+            arg = os.path.expanduser("~")
+        elif arg == "-":                         # back where we came from
+            arg = previous
+        if _UNEXPANDED.search(arg) or len(arg.split()) > 1:
+            return None
+        nxt = os.path.normpath(os.path.join(cwd, os.path.expanduser(arg)))
+        if not os.path.isdir(nxt):
+            return None
+        previous, cwd = cwd, nxt
+    return cwd
 
 
 def _changes_directory(segments: List[str]) -> bool:
