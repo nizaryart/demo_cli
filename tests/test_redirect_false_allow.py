@@ -139,3 +139,63 @@ def test_resolver_and_classifier_cannot_disagree(lab):
         assert classify_pipeline(cmd).matched_rule == "fs_redirect_truncate", cmd
         tgt, resolved = recovery.resolve_redirect_target(cmd)
         assert resolved and os.path.exists(tgt), cmd
+
+
+# --------------------------------------------------------------------------
+# Round two, 2026-09-08. The first fix left two doors open, both of them the
+# same mistake in different spellings.
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("cmd", [
+    'echo x > $(cat name.txt)',
+    'echo x > `cat name.txt`',
+    'echo x > $(date +%F).log',
+    'echo x > !TGT!',
+    'echo x > %PATH:~0,3%f.db',
+])
+def test_command_substitution_is_unresolved_not_absent(lab, cmd):
+    """redirect_target reads the target token up to whitespace, so
+    `$(cat name.txt)` arrives as the partial token `$(cat`. The first version
+    of _UNEXPANDED looked for `$\\w` and `${` and matched neither, so the
+    resolver reported RESOLVED for a string that can never name a file - the
+    guard stat'd it, found it absent, and read absent as creation.
+
+    The exact inference the resolver was written to remove, arriving through a
+    different door. `> $(date +%F).log` and `> $(hostname).sql` are ordinary
+    idioms, not evasion, so this is the RESOLUTION gap and belongs on the
+    escalate path.
+    """
+    (lab / "name.txt").write_text("app.db")
+    assert recovery.resolve_redirect_target(cmd) == (None, False), cmd
+    assert _decide(cmd) == "ESCALATE", cmd
+
+
+def test_a_tilde_is_expanded_rather_than_escalated(lab):
+    """`~` is the commonest of the unexpanded forms and, unlike $(cmd), it IS
+    resolvable - so resolve it instead of refusing. Left alone it became
+    '<cwd>/~/notes.db', a path that cannot exist, and a real file in the home
+    directory read as a creation."""
+    tgt, resolved = recovery.resolve_redirect_target('echo x > ~/notes.db')
+    assert resolved is True
+    assert tgt == os.path.join(os.path.expanduser("~"), "notes.db")
+    assert "~" not in tgt
+
+
+def test_two_redirects_do_not_snapshot_only_one(lab):
+    """THE PARTIAL-RECOVERY LIE, and the one finding on §1's own axis: an
+    unearned REVERSIBLE.
+
+    guard.py's Trou #004 refusal drops a stray target when an rm/mv could not
+    be fully resolved. is_fs_delete() matches only those verbs, so a redirect
+    walked past it - and the sqlite name heuristic resolved app.db all by
+    itself. The tool snapshotted app.db, reported REVERSIBLE, and o2.db was
+    truncated with nothing captured.
+
+    Deliberately uses .db names: with .txt files the same shape already
+    escalated, which is why this went unnoticed.
+    """
+    (lab / "app.db").write_text("real")
+    (lab / "o2.db").write_text("real")
+    r = Guard(mode="enforce").evaluate('echo a > app.db; echo b > o2.db')
+    assert r.decision.decision == "ESCALATE"
+    assert not r.recovery_entry, "a half-capture reported as a recovery"

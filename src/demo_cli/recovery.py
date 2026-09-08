@@ -631,7 +631,32 @@ def extract_path_operand(cmd: str, dialect: str = POSIX) -> Optional[str]:
     return None
 
 
-_UNEXPANDED = re.compile(r"\$\w|\$\{|%\w+%")
+# A target token that is not a filename yet. Three families, and the third is
+# the one that bit us: a token CUT AT WHITESPACE inside an unclosed construct.
+#
+#   $VAR ${VAR} %VAR%      a variable we could not substitute
+#   $( ` )                 command substitution - the value does not exist
+#                          until the shell runs the inner command
+#   !VAR!                  cmd.exe delayed expansion
+#
+# `echo x > $(cat name.txt)` reaches redirect_target as the partial token
+# `$(cat`, because the target is read up to whitespace. The first version of
+# this regex looked for `$\w` and `${` and matched neither, so the resolver
+# reported RESOLVED for a string that can never name a file - the guard then
+# stat'd it, found it absent, and read absent as creation. Same false ALLOW
+# the resolver exists to prevent, through a different door (2026-09-08).
+#
+# This is not evasion and does not sit behind the §2 frontier: `> $(date
+# +%F).log` and `> $(hostname).sql` are ordinary idioms. They belong in the
+# RESOLUTION gap - known-dangerous, unresolvable before it runs - which is
+# answered by escalate, not by a guess.
+_UNEXPANDED = re.compile(r"""
+      \$\w | \$\{ | \$\(          # $VAR  ${VAR}  $(cmd
+    | `                            # `cmd`
+    | %\w+% | %\w+:               # %VAR%  %VAR:~0,3%
+    | ![\w]+!                      # !VAR!  (cmd.exe delayed expansion)
+    | [()]                         # a stray bracket means the token was cut
+""", re.X)
 
 
 def resolve_redirect_target(cmd: str,
@@ -678,7 +703,11 @@ def resolve_redirect_target(cmd: str,
     tgt = hits[0]
     if _UNEXPANDED.search(tgt):
         return None, False
-    return os.path.abspath(tgt), True
+    # `~` IS resolvable, unlike $(cmd), so expand it rather than escalate.
+    # Left alone it became "<cwd>/~/notes.db" - a path that cannot exist, so
+    # the guard read a real file in the home directory as a creation. The
+    # commonest of the unexpanded forms and the one worth resolving properly.
+    return os.path.abspath(os.path.expanduser(tgt)), True
 
 
 def is_fs_delete(cmd: str) -> bool:

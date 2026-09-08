@@ -208,7 +208,24 @@ class Guard:
         # partial snapshot dressed up as REVERSIBLE is the exact lie this tool
         # exists to prevent, so drop the target and let the mutation escalate
         # honestly instead of claiming a recovery we did not fully take.
-        if target_path is None and target is not None and recovery.is_fs_delete(command):
+        #
+        # THE SAME REFUSAL, FOR REDIRECTS. is_fs_delete covers rm / mv /
+        # Remove-Item only, so a truncating redirect whose target set could
+        # not be resolved walked straight past this and kept whatever stray
+        # target resolve_target had found. `echo a > app.db; echo b > o2.db`
+        # snapshotted app.db - picked up independently by the sqlite name
+        # heuristic - and reported REVERSIBLE while o2.db was truncated with
+        # nothing captured. An unearned REVERSIBLE, which is the one failure
+        # this tool treats as unacceptable (2026-09-08).
+        #
+        # resolve_redirect_target already computes exactly the right answer
+        # here: (None, False) for two redirecting segments. It was simply
+        # being discarded by a path that never asked.
+        unresolved_redirect = (
+            c.matched_rule == "fs_redirect_truncate"
+            and not recovery.resolve_redirect_target(command, dialect)[1])
+        if target_path is None and target is not None and (
+                recovery.is_fs_delete(command) or unresolved_redirect):
             target = None
 
         label = target.label if target else None
