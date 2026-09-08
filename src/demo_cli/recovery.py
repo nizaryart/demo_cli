@@ -625,12 +625,60 @@ def extract_path_operand(cmd: str, dialect: str = POSIX) -> Optional[str]:
     # raw line now, not a normalised whole, and `a > x; b > y` must escalate
     # for the same reason two rm segments do: snapshotting x while y is
     # truncated unrecorded is the partial-recovery lie.
-    redirects = [t for t in (redirect_target(seg) for seg in segments) if t]
-    tgt = redirects[0] if len(redirects) == 1 else None
+    tgt, _ = resolve_redirect_target(cmd, dialect)
     if tgt:
-        ap = os.path.abspath(tgt)
-        return ap if os.path.exists(ap) else None
+        return tgt if os.path.exists(tgt) else None
     return None
+
+
+_UNEXPANDED = re.compile(r"\$\w|\$\{|%\w+%")
+
+
+def resolve_redirect_target(cmd: str,
+                            dialect: str = POSIX) -> Tuple[Optional[str], bool]:
+    """(absolute target, resolved?) for a truncating output redirection.
+
+    THE ONE RESOLVER, because three modules used to answer this differently and
+    the disagreement cost a silent data loss (2026-09-08).
+
+        classify_pipeline           effective segments  (since 2026-09-02)
+        extract_path_operand        effective segments + substitution
+        Guard.evaluate              THE RAW LINE
+
+    The classifier was widened on 2026-09-02 to judge unwrapped segments, so it
+    began flagging `bash -c "echo x > app.db"`. The guard's creates-if-missing
+    correction still read the raw line, could not find a target there (the `>`
+    is inside quotes), and cleared the flag - reading "I cannot find it" as
+    "there is nothing there to destroy". An existing file was truncated with no
+    snapshot, no receipt and no escalation. Five spellings did this; only the
+    bare `echo x > app.db` was ever handled correctly.
+
+    RESOLVED IS NOT THE SAME AS FOUND, and that distinction is the whole point:
+
+        (path, True)   a single, fully expanded target. The caller stats it:
+                       present means overwrite, absent means creation.
+        (None, False)  nothing resolved, MORE than one segment redirects, or
+                       the target still carries an unexpanded variable. The
+                       caller must keep its classification and escalate.
+
+    Two redirects are unresolved on purpose. `a > x; b > y` snapshotting x
+    while y is truncated unrecorded is the partial-recovery lie, the same
+    reason a multi-target rm returns None.
+
+    An unexpanded `$HOME/data.db` is unresolved for the same reason: it does
+    not exist under that literal name, so treating it as "found and absent"
+    reads a real file as a new one. Substitution handles in-line assignments;
+    anything from the environment is beyond us and must say so.
+    """
+    segments = [seg for seg, _ in
+                effective_segments(cmd, dialect, substitute=True)] or [cmd]
+    hits = [t for t in (redirect_target(seg) for seg in segments) if t]
+    if len(hits) != 1:
+        return None, False
+    tgt = hits[0]
+    if _UNEXPANDED.search(tgt):
+        return None, False
+    return os.path.abspath(tgt), True
 
 
 def is_fs_delete(cmd: str) -> bool:

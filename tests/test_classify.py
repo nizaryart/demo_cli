@@ -138,7 +138,31 @@ def test_redirect_quote_and_escape_aware():
 def test_redirect_append_and_sinks_not_destructive():
     assert classify_pipeline("echo x >> app.db").matched_rule is None   # append
     assert classify_pipeline("cmd > /dev/null").matched_rule is None    # sink
-    assert classify_pipeline("cmd 2> err.log").matched_rule is None     # fd-prefixed
+    assert classify_pipeline("cmd 2> /dev/null").matched_rule is None   # sink, fd-prefixed
+    assert classify_pipeline("cmd 2>&1").matched_rule is None           # duplication
+
+
+def test_an_fd_prefixed_redirect_still_truncates(tmp_path):
+    """`cmd 2> err.log` USED TO BE ASSERTED HERE AS NOT DESTRUCTIVE, grouped
+    with append and /dev/null under "fd-prefixed - out of scope".
+
+    Append really is non-destructive and a sink really is. `2> err.log` is
+    neither: it truncates err.log from byte zero exactly as `>` does. The test
+    pinned an assumption about scope, not an observation about behaviour, and
+    the assumption is what was wrong.
+
+    `1>` is the sharper case - it is `>` written with its default descriptor,
+    byte-identical in effect - and `&>` redirects both streams into the same
+    truncation. All three reached ALLOW against an existing file with no
+    snapshot and no receipt until 2026-09-08.
+
+    The common idiom survives because the /dev/ sink filter handles it, which
+    is asserted above rather than assumed.
+    """
+    for cmd in ("cmd 2> err.log", "cmd 1> out.log", "cmd &> both.log"):
+        c = classify_pipeline(cmd)
+        assert c.matched_rule == "fs_redirect_truncate", cmd
+        assert c.is_destructive, cmd
 
 
 def test_redirect_hidden_in_chain_is_caught():

@@ -809,8 +809,24 @@ def redirect_target(cmd: str) -> Optional[str]:
             if nxt == ">":                   # '>>' append - not destructive
                 i += 2
                 continue
-            if prev.isdigit() or prev == "&":  # 2> / &> fd-prefixed - out of scope
-                i += 1
+            # `1>`, `2>` and `&>` ALL TRUNCATE FROM BYTE ZERO, exactly like
+            # a bare `>`. They were skipped as "fd-prefixed, out of scope",
+            # and the scope argument does not survive the behaviour: `echo x
+            # 1> app.db` destroys app.db just as thoroughly. `1>` is `>`
+            # spelled with its default descriptor; `&>` redirects both
+            # streams. Silently allowed against an existing file until
+            # 2026-09-08.
+            #
+            # `2> /dev/null` and friends stay quiet because the /dev/ sink
+            # filter below already drops them. That filter, not this skip, is
+            # what protects the common idiom - checked before widening.
+            #
+            # What DOES still have to be skipped is fd DUPLICATION: `2>&1` and
+            # `>&2` point one descriptor at another and truncate nothing. The
+            # old digit/& test caught those only as a side effect of skipping
+            # every fd-prefixed form; now they are excluded on their own terms.
+            if nxt == "&":                   # 2>&1, >&2 - duplication, not truncation
+                i += 2
                 continue
             # Read the target token, quote-aware, skipping spaces and a leading
             # '|' (the '>|' noclobber-override form).

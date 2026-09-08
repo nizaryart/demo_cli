@@ -21,7 +21,7 @@ import os
 
 from . import approval, checkpoint, preview as preview_mod, recovery
 from .classify import (POSIX, Classification, classify_pipeline,
-                       is_sql_preview_candidate, redirect_target)
+                       is_sql_preview_candidate)
 from .config import Config, config_error_message, load_config
 from .context import Context, Intent, build_context, compare_intent
 from .decide import (ALLOW, ASK, BLOCKING, CONTEXT_MISMATCH, DRY_RUN, ESCALATE,
@@ -149,8 +149,18 @@ class Guard:
         # resolve at all is AMBIGUOUS and keeps its classification, so it still
         # escalates - never quietly waved through.
         if c.matched_rule == "fs_redirect_truncate":
-            rt = redirect_target(command)
-            if not rt or not os.path.exists(os.path.abspath(rt)):
+            # RESOLVED-AND-ABSENT IS THE ONLY CASE THAT CLEARS. This used to be
+            # `redirect_target(command)` on the raw line, and `if not rt or
+            # not exists(rt)` - so "I could not find the target" cleared the
+            # flag exactly like "the target is new". The comment above has
+            # always said the opposite, and the code was the thing that was
+            # wrong: five spellings of a truncating redirect reached ALLOW
+            # against an existing file with no snapshot and no receipt
+            # (2026-09-08). recovery.resolve_redirect_target reads the same
+            # effective, substituted segments the classifier judged, so the
+            # two can no longer disagree about what the command touches.
+            rt, resolved = recovery.resolve_redirect_target(command, dialect)
+            if resolved and not os.path.exists(rt):
                 c.is_destructive = False
                 c.is_mutating = False
                 c.matched_rule = None
