@@ -72,8 +72,42 @@ def _label(decision: str) -> str:
     return c(decision, _DECISION_COLOR.get(decision, "gray"))
 
 
+# Glyphs this module uses that a legacy Windows console cannot encode, and
+# the plainest thing each can degrade to.
+_ASCII_FALLBACK = {
+    "\u2192": "->", "\u00b7": "-", "\u00bb": ">", "\u2022": "*",
+    "\u2014": "-", "\u2013": "-", "\u2018": "'", "\u2019": "'",
+    "\u201c": '"', "\u201d": '"', "\u02cb": "`",
+}
+
+
 def _print(lines: List[str]) -> None:
-    print("\n".join(lines))
+    """Print, and NEVER raise because of the console's encoding.
+
+    `demo_cli check` crashed outright on Windows: the feedback prompt contains
+    a right-arrow, PowerShell's default code page is cp1252, and print()
+    raised UnicodeEncodeError from inside the renderer. A primary command,
+    unusable on a primary platform, for a decoration (observed 2026-09-09).
+    It went unnoticed because doctor's self-test drives the hook path, which
+    renders elsewhere.
+
+    Degrading beats crashing, and a named fallback beats a row of question
+    marks - so the glyphs we actually use get an ASCII spelling, and anything
+    unforeseen still falls through to errors="replace" rather than escaping.
+    """
+    text = "\n".join(lines)
+    try:
+        print(text)
+        return
+    except UnicodeEncodeError:
+        pass
+    for glyph, plain in _ASCII_FALLBACK.items():
+        text = text.replace(glyph, plain)
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        enc = getattr(sys.stdout, "encoding", None) or "ascii"
+        print(text.encode(enc, errors="replace").decode(enc, errors="replace"))
 
 
 _ISSUE_BASE = "https://github.com/nizaryart/DEMO_LOADING/issues/new"
@@ -234,8 +268,14 @@ def _verify_block(name: str, v: VerifyResult) -> List[str]:
                      f"{len(v.damaged_lines)} unreadable", "yellow"),
             f"             {v.segments} intact segment{'s' if v.segments != 1 else ''}; "
             f"malformed at line {where}{more}",
-            "             " + c("a torn write, not an alteration - nothing was "
-                                 "edited", "dim"),
+            # THE SAME CLAIM LIVED IN TWO PLACES, and only one was corrected.
+            # receipts.py stopped saying "not an alteration" because it cannot
+            # know that - an unreadable line is an interrupted write or a
+            # removed entry with something typed over it, and the bytes are
+            # identical. This copy kept saying it, so the honest verdict
+            # printed the dishonest sentence underneath (2026-09-09).
+            "             " + c("what those lines held cannot be established "
+                                 "from this file", "dim"),
         ]
     return ["  " + c(f"{name:<12} {v.entries} entries    INTACT", "green")]
 
