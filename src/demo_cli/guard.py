@@ -178,7 +178,7 @@ class Guard:
         # The concrete file list an rm / mv will touch (brace/glob-expanded),
         # surfaced so the preview can PRINT it - the file count the agent was
         # actually asking for (claude-code#76626). Empty for non rm / mv.
-        affected_paths = recovery.expanded_operands(command)
+        affected_paths = recovery.expanded_operands(command, dialect)
 
         # Whether the USER named a target, captured before the block below
         # overwrites target_path with whatever extraction found. The two mean

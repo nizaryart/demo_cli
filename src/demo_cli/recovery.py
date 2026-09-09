@@ -721,7 +721,7 @@ def _common_capture_root(paths: List[str]) -> Optional[str]:
     return root
 
 
-def expanded_operands(cmd: str) -> List[str]:
+def expanded_operands(cmd: str, dialect: str = POSIX) -> List[str]:
     """The concrete list of existing paths an rm / mv will touch.
 
     Exposed so the preview can PRINT it. claude-code#76626: an agent ran
@@ -733,10 +733,50 @@ def expanded_operands(cmd: str) -> List[str]:
 
     Returns [] for anything that is not an rm / mv, so callers can invoke it
     unconditionally: the crude operand split is only meaningful for those two.
+
+    PER SEGMENT, AGAINST THE EFFECTIVE DIRECTORY. _RM_RE is anchored at the
+    start of the string, so matched against a whole LINE it saw nothing in
+
+        cd x && rm -rf a b
+        echo hi; rm -rf a b
+        bash -c "rm -rf a b"
+
+    and the preview printed "no files affected" for deletions that were about
+    to happen. The snapshot was correct throughout - only the display lied,
+    which is why no test caught it and why it is worse than it sounds: this is
+    the surface built FOR claude-code#76626, where the agent's stated goal was
+    to COUNT the files. A preview that answers "none" is the wrong answer to
+    the exact question that incident was about. Found by review 2026-09-08.
+
+    Every rm/mv segment contributes, not just one. The snapshot decision has
+    its own multiplicity rule and escalates; the preview's job is to show what
+    the line touches, and showing half of it would be the display telling a
+    smaller version of the same lie.
     """
-    if not (_RM_RE.search(cmd) or _MV_RE.search(cmd)):
-        return []
-    return [p for p in _path_operands(cmd) if os.path.exists(p)]
+    segments, moved = _operand_context(cmd, dialect)
+    seen, out = set(), []
+    for index, seg in enumerate(segments):
+        if not (_RM_RE.search(seg) or _MV_RE.search(seg)):
+            continue
+        # This segment's view, not the line's. See _base_at.
+        base, ok = _base_at(cmd, segments, index, moved)
+        if not ok:
+            return []                   # unmodellable cd: nothing honest to show
+        for path in _path_operands(seg, base):
+            # ABSOLUTE AND DEDUPED BY IDENTITY, not by spelling. `rm a.txt; rm
+            # ./a.txt` is one file, and a string dedupe reported "files
+            # matched: 2" - inflating the very count that #76626 was about.
+            # Mixing relative and absolute in one list also made render's
+            # redact() show the same file two ways depending on whether a cd
+            # appeared earlier in the line.
+            real = os.path.normpath(os.path.abspath(path))
+            if real not in seen and os.path.exists(real):
+                seen.add(real)
+                out.append(real)
+    # Sorted because glob order is os.scandir order: stable on one filesystem,
+    # not guaranteed across them. An unsorted preview is a test that passes
+    # here and fails on somebody else's machine.
+    return sorted(out)
 
 
 def extract_path_operand(cmd: str, dialect: str = POSIX) -> Optional[str]:
@@ -809,9 +849,7 @@ def extract_path_operand(cmd: str, dialect: str = POSIX) -> Optional[str]:
     # Several destructive segments (`rm a.txt; rm b.txt`) return None. Picking
     # one would snapshot a.txt while b.txt died unrecorded, with the receipt
     # claiming a recovery - the partial-recovery lie FIX #5 exists to prevent.
-    segments = [seg for seg, _ in
-                effective_segments(cmd, dialect, substitute=True)] or [cmd]
-    moved = _changes_directory(segments)
+    segments, moved = _operand_context(cmd, dialect)
     # `base` stays None whenever the shell has not actually moved, so every
     # command without a `cd` - the overwhelming majority - takes exactly the
     # path it took before, returning relative operands relative. Only a real
@@ -911,12 +949,9 @@ def extract_path_operand(cmd: str, dialect: str = POSIX) -> Optional[str]:
         if len(hits) != 1:
             return None
         idx, seg = hits[0]
-        if moved:
-            here = effective_cwd(cmd, segments, idx)
-            if here is None:
-                return None                     # cannot model it: do not guess
-            if os.path.normpath(here) != os.path.normpath(os.getcwd()):
-                base = here
+        base, ok = _base_at(cmd, segments, idx, moved)
+        if not ok:
+            return None                         # cannot model it: do not guess
         target = handler(seg)
         # Belt and braces: a relative answer after a move would describe the
         # wrong directory, and there is no honest way to interpret it.
@@ -1136,6 +1171,53 @@ def _changes_directory(segments: List[str]) -> bool:
     return any(_CD_RE.match(seg) for seg in segments)
 
 
+def _operand_context(cmd: str, dialect: str = POSIX) -> Tuple[List[str], bool]:
+    """(effective segments, does anything move the working directory?).
+
+    The segment/substitute preamble was copied into three functions and was
+    already a drift risk.
+    """
+    segments = [seg for seg, _ in
+                effective_segments(cmd, dialect, substitute=True)] or [cmd]
+    return segments, _changes_directory(segments)
+
+
+def _base_at(cmd: str, segments: List[str], index: int,
+             moved: bool) -> Tuple[Optional[str], bool]:
+    """(base directory, could we tell?) for the segment at `index`.
+
+    ONE STRATEGY, RESOLVED PER INDEX, and the index is the caller's choice.
+
+    The first version of this shared helper resolved the cwd once, as of the
+    END of the line - and handed that to expanded_operands, which needs the
+    directory in force AT ITS SEGMENT. So
+
+        cd build && rm -rf ./out            preview: build/out   correct
+        cd build && rm -rf ./out && cd ..   preview: (nothing)   WRONG
+
+    The trailing `cd` moved the end-of-line cwd, `./out` resolved against the
+    wrong directory, the exists() filter dropped it, and the preview said "no
+    files affected" for a deletion that was about to happen - the exact lie
+    F12 was written to remove, reintroduced by its own fix (2026-09-09).
+
+    Note the shape of that failure: because the operand list is filtered by
+    exists(), a WRONG BASE can never surface as a wrong path. It can only
+    surface as a missing one. Silence is the only symptom this bug has.
+
+    `base` is None when nothing moved - the overwhelming majority - so callers
+    take exactly the path they took before. `ok` is False only when a `cd`
+    exists and cannot be modelled.
+    """
+    if not moved:
+        return None, True
+    here = effective_cwd(cmd, segments, index)
+    if here is None:
+        return None, False
+    if os.path.normpath(here) == os.path.normpath(os.getcwd()):
+        return None, True
+    return here, True
+
+
 def unignorable_dirs(cmd: str, dialect: str = POSIX) -> frozenset:
     """Ignored directory names this command explicitly reaches into.
 
@@ -1163,15 +1245,13 @@ def unignorable_dirs(cmd: str, dialect: str = POSIX) -> frozenset:
     .demo_cli/something` is a request to delete recovery points, not a reason
     to duplicate them.
     """
-    segments = [seg for seg, _ in
-                effective_segments(cmd, dialect, substitute=True)] or [cmd]
-    base = None
-    if _changes_directory(segments):
-        here = effective_cwd(cmd, segments, len(segments))
-        if here is None:
-            return frozenset()          # cannot tell where it points; do not guess
-        if os.path.normpath(here) != os.path.normpath(os.getcwd()):
-            base = here
+    segments, moved = _operand_context(cmd, dialect)
+    # End of the line on purpose: "does this command reach into an ignored
+    # directory ANYWHERE" is a whole-line question, unlike the two callers
+    # below which care about one segment's view.
+    base, ok = _base_at(cmd, segments, len(segments), moved)
+    if not ok:
+        return frozenset()              # cannot tell where it points; do not guess
 
     hit = set()
     for seg in segments:
