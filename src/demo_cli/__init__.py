@@ -1,7 +1,7 @@
 """demo_cli - a pre-execution safety layer for AI coding agents.
 
 Preview before execution, capture a recovery point first, make it undoable,
-and write a tamper-evident receipt of every decision. The library is built
+and write a hash-chained receipt of every decision. The library is built
 around one invariant:
 
     a mutating action must be recoverable AND match its declared context,

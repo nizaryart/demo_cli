@@ -114,9 +114,43 @@ receipt records `peer_head`: the other chain's head hash at write time. That
 closes truncation, which a lone chain cannot detect — cut the tail and what
 remains verifies perfectly.
 
-Known and stated: someone who controls **both** files can rewrite both
-consistently. The chain is tamper-**evident**, not tamper-proof. Off-machine
-anchoring of the head hashes is the intended answer and is not implemented.
+**This section said the wrong thing until 2026-09-09, and the correction is
+the most useful part of it.** It claimed you needed control of *both* files. A
+review found **three independent one-file paths** to a clean verdict over a
+modified ledger, all reproduced:
+
+1. **Truncate to the last cross-anchored point.** `peer_head` records the
+   peer's head *at write time*, so nothing appended afterwards is referenced
+   by anything. Cut back to that point and both verifiers passed, with no
+   damage note at all. No trick, no crafted input.
+2. **One junk line over a removal.** A removal is contiguous, and the
+   forgiving branch for "the first readable entry after damage" was exactly
+   one removal wide. Reordering and forged insertion went the same way — the
+   hash is unkeyed.
+3. **A >64 KB receipt.** `_tail_hash` read a fixed window, missed the whole
+   final line, and returned GENESIS — which means *"the peer chain was
+   empty"* — so the anchor was skipped. No attacker required.
+
+And a fourth that is not a bypass but is worse in practice: **two bytes of
+invalid UTF-8 stopped the ledger recording permanently**, because `last_hash`
+runs inside `append_receipt`.
+
+All four are fixed. What remains true, and is now in the README rather than
+only here:
+
+* **A whole-file rewrite is not detected by the chain alone.** Recording the
+  head hash off-machine is the answer, and it is a step the operator has to
+  take. Not automatic.
+* **Cross-links reach backwards only.** Entries written after the other
+  chain's last receipt are vouched for by nothing. `verify` now reports that
+  count instead of letting the green line imply full coverage. On Linux there
+  is one chain, so it applies to all of it.
+* **The hash is unkeyed**, so the chain proves entries are consistent with
+  each other — not that this tool wrote them.
+
+Treat the boundary as: **strong against casual editing and against an agent
+covering its tracks; not proof against someone with write access and patience,
+unless a head hash was recorded elsewhere.**
 
 ---
 

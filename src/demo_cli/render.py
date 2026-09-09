@@ -274,6 +274,17 @@ def render_verify(v: VerifyResult, version: str, fs: Optional[VerifyResult] = No
             lines.append("             " + c(
                 "a receipt references a hash absent from the other chain - "
                 "entries were removed", "red"))
+    # HOW MUCH THE CROSS-CHECK ACTUALLY COVERS. peer_head anchors backwards
+    # only, so entries written after the last peer write are referenced by
+    # nothing and truncating back to that point leaves both chains verifying
+    # cleanly. Reported rather than left for the reader to infer, because the
+    # green line above otherwise reads as coverage of the whole ledger.
+    if links is not None and links.unanchored:
+        n = links.unanchored
+        lines.append("             " + c(
+            f"{n} recent entr{'y' if n == 1 else 'ies'} not covered by a "
+            f"cross-link - written after the other chain's last receipt, so "
+            f"nothing vouches for them yet", "yellow"))
     if v.absent and (fs is None or fs.absent):
         # SAY WHAT THIS IS NOT. "verify" exiting 0 on an empty ledger could be
         # read as "the guard is working" - it means only that nothing has been

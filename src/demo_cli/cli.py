@@ -300,7 +300,16 @@ def cmd_verify(a) -> int:
     # AN UNRESOLVED CROSS-LINK DOES FAIL IT. That is not damage: it means a
     # receipt referenced a hash that is no longer in the other chain, which is
     # what removing entries looks like.
-    ok = v.ok and (fs.ok if fs else True) and (links.ok if links else True)
+    #
+    # AN UNPERFORMED CHECK IS NOT A COMMAND FAILURE, and that decision is made
+    # HERE rather than inside CrossLinkResult.ok. The property now returns
+    # False when checked is False, because a caller writing `if links.ok`
+    # must not get a pass for a check that never ran. Whether the ABSENCE of
+    # a second chain should fail `demo_cli verify` is a different question,
+    # and the answer is no: a project whose filesystem guard has never written
+    # is an ordinary state, not evidence of anything.
+    cross_ok = links.ok if (links and links.checked) else True
+    ok = v.ok and (fs.ok if fs else True) and cross_ok
     return 0 if ok else 1
 
 
@@ -723,7 +732,7 @@ def cmd_prune(a) -> int:
     print(render.c(f"\ndemo_cli {__version__}  prune\n", "dim"))
     print(render.kv("removed", f"{len(removed)} recovery point(s)"))
     print(render.kv("freed", render._size(freed)))
-    print(render.kv("note", "receipts untouched (tamper-evident audit trail)"))
+    print(render.kv("note", "receipts untouched (hash-chained audit trail)"))
     print()
     return 0
 
@@ -2266,7 +2275,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="demo_cli",
         description="A pre-execution safety layer for AI coding agents: "
-                    "preview, snapshot, undo, and a tamper-evident receipt of every decision.",
+                    "preview, snapshot, undo, and a hash-chained receipt of every decision.",
     )
     p.add_argument("--version", action="version", version=f"demo_cli {__version__}")
     common = argparse.ArgumentParser(add_help=False)

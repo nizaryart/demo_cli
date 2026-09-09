@@ -4,7 +4,7 @@
 
 demo_cli snapshots the real target **before** a destructive command runs, so a wrong call is reversible with one command. **Confirming ≠ recovering.**
 
-Before `rm -rf`, `rmdir /s /q`, `Remove-Item -Recurse -Force`, `git reset --hard`, or `DROP TABLE` executes, demo_cli captures what's about to be destroyed and writes a tamper-evident receipt of the decision. If the agent gets it wrong, `demo_cli undo` brings it back. When it *can't* prove recovery (`terraform destroy`, `git push --force`, remote/cloud resources, or a recursive-force delete with no recoverable target), it hard-blocks instead of faking safety.
+Before `rm -rf`, `rmdir /s /q`, `Remove-Item -Recurse -Force`, `git reset --hard`, or `DROP TABLE` executes, demo_cli captures what's about to be destroyed and writes a hash-chained receipt of the decision. If the agent gets it wrong, `demo_cli undo` brings it back. When it *can't* prove recovery (`terraform destroy`, `git push --force`, remote/cloud resources, or a recursive-force delete with no recoverable target), it hard-blocks instead of faking safety.
 
 The whole design in one line: **recovery is the default; blocking is the fallback for the truly unrecoverable, not the default for everything.**
 
@@ -53,7 +53,11 @@ it by hand? See [Install](#install) below.
   prefilled GitHub issue link, and reading the hostname out of a DB connection
   string to tell local from remote. Neither opens a connection.)
 - **One small, readable, MIT-licensed codebase**, read exactly what it does before you run it.
-- **Tamper-evident receipts**, every decision is hash-chained and independently verifiable (`demo_cli verify`).
+- **Hash-chained receipts**, every decision linked to the one before it and
+  independently verifiable (`demo_cli verify`). What that does and does not
+  buy you is set out under [What the receipt chain proves](#what-the-receipt-chain-proves)
+  — the honest summary is that it detects an *edit*, and detecting a *rewrite*
+  needs a head hash you have recorded somewhere else.
 
 When it captures a recovery point, the hook prints it where you can see it — the
 snapshot id, the one-line undo, and (on a wrong call) a prefilled report link.
@@ -484,7 +488,7 @@ A production database is reached via a connection string, not by a file called
 | `diff [id]` | show what changed since a recovery point |
 | `verify` | walk both receipt chains and their cross-links → VERIFIED, DAMAGED, OUT OF ORDER, TAMPERED, or NO RECEIPTS |
 | `report` | summarise recorded decisions |
-| `receipt [id]` | print a copy-pasteable, tamper-evident proof card for a receipt (latest, or by id); `--list` shows recent receipt ids |
+| `receipt [id]` | print a copy-pasteable proof card for a receipt (latest, or by id); `--list` shows recent receipt ids |
 | `status` | mode, hook state, receipts, chain integrity, recovery count |
 | `doctor` | every prerequisite with the command that fixes it (git, pg tools, mitmdump, the WinFsp driver and the winfspy binding *separately*), config, workspace, hook registration per host, PATH, an end-to-end hook self-test, the backing ACL, and whether an agent has ever actually been gated here |
 | `prune` | delete old recovery artefacts (`--keep N`, `--older-than DAYS`); receipts are never pruned |
@@ -582,6 +586,42 @@ parses are treated as unrecoverable, not waved through.
 **Database coverage is SQLite and Postgres only.** MySQL, MongoDB, and other
 engines are not yet snapshotted; a destructive command against them has no local
 recovery point and escalates rather than being captured.
+
+---
+
+## What the receipt chain proves
+
+Every receipt carries the hash of the one before it, so **editing any entry
+breaks the chain from that point on** and `demo_cli verify` says so. On
+Windows there are two chains — the hook writes one, the filesystem guard the
+other — and each receipt records the other chain's head at the moment it was
+written, which is how a truncated tail gets caught.
+
+Being precise about the limits, because a proof card invites a stranger to
+check and they deserve to know what they are checking:
+
+- **A whole-file rewrite is not detected by the chain alone.** Someone who can
+  write the ledger can rebuild it consistently. The answer is the chain head
+  `verify` prints: record it somewhere the machine does not control — a commit
+  message, a CI log, a message to yourself — and compare later. That is the
+  only thing that detects a rewrite, and it is a step you have to take.
+- **Cross-links only reach backwards.** A receipt anchors to the other chain's
+  head *as it was when it was written*, so entries added after the other
+  chain's last write are not yet vouched for by anything. `verify` now reports
+  that count rather than leaving you to infer coverage. On Linux there is one
+  chain, so this applies to all of it.
+- **Damage and deletion can look alike.** A line that will not parse might be
+  an interrupted write or might be a removed entry with something typed over
+  it. `verify` reports what it can read and refuses to guess which — it will
+  not tell you "nothing was edited" when it cannot know that.
+- **The hash is unkeyed.** Anyone can compute a valid receipt hash. The chain
+  proves entries are *consistent with each other*, not that they were written
+  by this tool.
+
+Read plainly: the ledger is strong evidence against casual editing and against
+an agent covering its tracks. It is not proof against someone with write access
+to the file and a reason to be careful — unless you have that head hash
+recorded elsewhere.
 
 ---
 

@@ -90,7 +90,12 @@ def test_a_torn_line_is_damage_not_tampering(tmp_path):
     assert v.ok, "a torn write must not be reported as tampering"
     assert v.damaged
     assert v.damaged_lines == [2]
-    assert "torn write" in v.detail
+    # The detail no longer says "a torn write, not an alteration". It could
+    # not know that: the same bytes are produced by an interrupted append and
+    # by someone replacing a record. It now reports what is observable - the
+    # line could not be read - and volunteers no explanation for it.
+    assert "could not be read" in v.detail
+    assert "not an alteration" not in v.detail
     # STILL ONE SEGMENT, and that is the writer working as intended: last_hash
     # skips unreadable lines, so the next append links to the last READABLE
     # hash rather than to the wreckage. The chain closes over the damage
@@ -98,11 +103,33 @@ def test_a_torn_line_is_damage_not_tampering(tmp_path):
     assert v.segments == 1
 
 
-def test_a_torn_line_that_severs_the_chain_is_reported_as_a_segment(tmp_path):
-    """When the damage does break the link - the torn line ate a receipt whose
-    hash the next entry had already chained onto - verification resumes as a
-    new segment rather than declaring tampering. The entries are unverifiable
-    against their predecessor, which is not the same as inconsistent with it."""
+def test_replacing_a_record_with_garbage_is_not_forgiven(tmp_path):
+    """THIS TEST PREVIOUSLY ASSERTED THE VULNERABILITY, and is kept, inverted,
+    as the record of it.
+
+    It used to be called ...is_reported_as_a_segment and assert v.ok, on the
+    theory that "the torn line ate a receipt whose hash the next entry had
+    already chained onto" is an accident to be forgiven. Two things were wrong
+    with that.
+
+    First, the scenario is not reachable by accident. last_hash SKIPS
+    unparseable lines, so a receipt appended after a tear links to the last
+    READABLE entry - the chain closes over the damage (the test above pins
+    exactly that). For a link to point INTO a torn line, the line must have
+    been intact when the link was written and unreadable afterwards, which
+    without editing requires two writers interleaving across lock domains -
+    the labubu shape, which the chain split exists to prevent.
+
+    Second, the construction here IS the attack. Rewriting the file to replace
+    a record with garbage is what deleting an entry looks like, and a removal
+    is contiguous by construction, so one junk line covers it exactly. Five
+    receipts with entries 3 and 4 replaced by one bad line returned ok=True
+    and printed "a torn write, not an alteration - nothing was edited" over a
+    deliberate removal (2026-09-09).
+
+    So the forgiving branch was deleted, not narrowed. What the suite had been
+    calling correct behaviour was the hole.
+    """
     main = str(tmp_path / "receipts.jsonl")
     append_receipt(main, _r("first"))
     append_receipt(main, _r("second"))
@@ -114,9 +141,76 @@ def test_a_torn_line_that_severs_the_chain_is_reported_as_a_segment(tmp_path):
         f.write(rows[2] + "\n")
 
     v = verify_chain(main)
-    assert v.ok
+    assert not v.ok, "a replaced record must not be waved through as damage"
     assert v.damaged_lines == [2]
-    assert v.segments == 2
+    assert v.detail and "not an alteration" not in v.detail
+
+
+def test_planting_the_victims_hash_in_the_junk_does_not_buy_a_pass(tmp_path):
+    """The obvious follow-up move, and why `readable` and `salvaged` are two
+    sets rather than one.
+
+    Salvaged hashes are 64-hex tokens scraped off lines that would not parse.
+    Merged into `present`, a link resolved against a token the attacker typed
+    into their own junk line, and the report said "every referenced receipt is
+    present, so nothing was removed". Now it resolves to INCONCLUSIVE, which
+    is not a pass - otherwise the hole would have moved rather than closed.
+    """
+    main = str(tmp_path / "receipts.jsonl")
+    for i in range(4):
+        append_receipt(main, _r(f"entry {i}"))
+    rows = open(main).read().splitlines()
+    victim = json.loads(rows[2])["receipt_hash"]
+    with open(main, "w") as f:
+        f.write(rows[0] + "\n")
+        f.write(rows[1] + "\n")
+        f.write("}}garbage{{ " + victim + "\n")     # the deleted entry's hash
+        f.write(rows[3] + "\n")
+
+    v = verify_chain(main)
+    assert not v.ok
+    assert v.inconclusive, "the planted hash was treated as proof of presence"
+    assert "not decidable" in (v.detail or "").lower()
+
+
+def test_a_row_in_the_wrong_chain_is_reported(tmp_path):
+    """ONE WRITER PER FILE is what makes deleting the forgiving branch safe,
+    and nothing checked it. It has been violated once - the guard writing to
+    the wrong ledger, 2026-09-02 - and if it recurs the labubu shape returns
+    as a flat TAMPERED verdict against an honest project. Reported as its own
+    state so the residual risk is a diagnosis rather than an accusation."""
+    main = str(tmp_path / "receipts.jsonl")
+    append_receipt(main, _r("first"))
+
+    # A GENUINE fs receipt, not a hand-edited one. `chain` sits inside the
+    # hashed body, so editing the field breaks receipt_hash and is caught as
+    # tampering long before this check - correctly. The violation this guards
+    # against is a real fs-chain receipt landing in the main file, which is
+    # what the guard did on 2026-09-02: valid hash, wrong ledger.
+    fs_receipt = _r("written by the filesystem guard")
+    fs_receipt.chain = "fs"
+    append_receipt(main, fs_receipt)               # routes itself to -fs
+    stray = open(chain_path(main, "fs")).read().splitlines()[0]
+    with open(main, "a") as f:
+        f.write(stray + "\n")                      # ...but lands here
+
+    v = verify_chain(main)
+    assert v.chain_conflict, "two writers in one ledger went unreported"
+    assert not v.ok
+    assert "two writers" in (v.detail or "")
+
+
+def test_a_legacy_receipt_without_a_chain_field_is_not_a_conflict(tmp_path):
+    """Receipts written before the split carry no `chain`. Absent is fine;
+    only a DISAGREEING value is a conflict."""
+    main = str(tmp_path / "receipts.jsonl")
+    append_receipt(main, _r("first"))
+    rows = [json.loads(l) for l in open(main)]
+    rows[0].pop("chain", None)
+    with open(main, "w") as f:
+        f.write(json.dumps(rows[0]) + "\n")
+
+    assert verify_chain(main).chain_conflict == []
 
 
 def test_an_edited_field_is_still_tampering(tmp_path):
@@ -309,7 +403,15 @@ def test_no_second_chain_means_not_checked_rather_than_passed(tmp_path):
     append_receipt(main, _r("only chain"))
     links = verify_cross_links(main, chain_path(main, CHAIN_FS))
     assert not links.checked
-    assert links.ok          # nothing unresolved, but nothing verified either
+    # THIS TEST ASSERTED THE OPPOSITE OF ITS OWN NAME. It was called
+    # ..._means_not_checked_rather_than_passed and then asserted links.ok -
+    # i.e. that an unperformed check passes. The docstring on CrossLinkResult
+    # already said the two must differ; `ok` collapsed them anyway, and the
+    # test pinned the collapse (2026-09-09).
+    assert not links.ok, "an unperformed check is not a pass"
+    # And with one chain, nothing anchors anything: every entry sits outside
+    # the cross-check. Saying so is the whole point of the count.
+    assert links.unanchored == 1
     assert links.verified == 0
 
 
