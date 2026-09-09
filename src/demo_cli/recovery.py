@@ -480,7 +480,19 @@ def _ps_remove_item_operand(cmd: str) -> Optional[str]:
 _PS_CONTENT_RE = re.compile(r"^\s*(?:Clear-Content|clc|Set-Content|Out-File|New-Item)\b", re.I)
 _PS_DEST_RE = re.compile(r"^\s*(?:Move-Item|Copy-Item|Rename-Item)\b", re.I)
 
-_PS_DEST_FLAGS = {"-destination", "-newname"}
+_PS_DEST_FLAGS = {"-destination"}
+# -NewName IS NOT A PATH. `Rename-Item -Path C:\proj\a.txt -NewName b.txt`
+# clobbers C:\proj\b.txt - the name is relative to the SOURCE's directory,
+# not to the working directory. Taken literally it resolved against the cwd,
+# found nothing there, and the guard read that as "creates" and cleared the
+# destructive flag: a false ALLOW while the real file was overwritten
+# (2026-09-09).
+#
+# Its own set rather than a cmdlet check, because the semantics belong to the
+# FLAG: -NewName exists only on Rename-Item, so matching the cmdlet would only
+# ever be a proxy for matching the flag - and a less precise one.
+_PS_NEWNAME_FLAGS = {"-newname"}
+_PS_RENAME_RE = re.compile(r"^\s*Rename-Item\b", re.I)
 # Flags whose NEXT token is a value, not a path. Without this list
 # `Set-Content -Path x -Value "hello"` yields two candidate targets and looks
 # ambiguous, so a perfectly ordinary overwrite would escalate instead of being
@@ -489,23 +501,28 @@ _PS_VALUE_FLAGS = {"-value", "-encoding", "-erroraction", "-itemtype", "-filter"
                    "-include", "-exclude", "-stream", "-width", "-name"}
 
 
-def _ps_named_operands(cmd: str) -> List[str]:
-    """Candidate target paths from a PowerShell cmdlet call, in order.
+def _ps_flagged_operands(cmd: str) -> List[Tuple[Optional[str], str]]:
+    """Candidate targets with the flag that named each one, in order.
 
-    -Path / -LiteralPath / -Destination / -NewName name a target explicitly;
-    value-carrying flags are skipped WITH their value; anything else that does
-    not start with '-' is a positional target.
+    The loop already TOLD path flags from destination flags and then appended
+    both to one flat list, throwing the distinction away a line later - which
+    is why `Copy-Item -Destination keep\b.txt -Path a.txt` resolved to the
+    source: _ps_dest_target could only take the last element and hope the
+    author wrote the flags in the usual order. PowerShell named parameters are
+    order-free (2026-09-09).
+
+    A positional operand carries None as its flag.
     """
     toks = _tokenize(cmd, windows_paths=True)[1:]     # drop the cmdlet itself
-    out: List[str] = []
+    out: List[Tuple[Optional[str], str]] = []
     i = 0
     while i < len(toks):
         tok = toks[i]
         low = tok.lower()
-        if low in _PS_PATH_FLAGS or low in _PS_DEST_FLAGS:
+        if low in _PS_PATH_FLAGS or low in _PS_DEST_FLAGS or low in _PS_NEWNAME_FLAGS:
             i += 1
             if i < len(toks):
-                out.append(toks[i].strip("'\""))
+                out.append((low, toks[i].strip("'\"")))
             i += 1
             continue
         if low in _PS_VALUE_FLAGS:
@@ -514,9 +531,41 @@ def _ps_named_operands(cmd: str) -> List[str]:
         if tok.startswith("-"):
             i += 1                                     # switch with no value
             continue
-        out.append(tok.strip("'\""))
+        out.append((None, tok.strip("'\"")))
         i += 1
     return out
+
+
+def _ps_named_operands(cmd: str) -> List[str]:
+    """The values only, in order - the shape every existing caller expects."""
+    return [value for _, value in _ps_flagged_operands(cmd)]
+
+
+def _win_aware_dirname(path: str) -> str:
+    r"""dirname() that works for a Windows path on a POSIX host.
+
+    os.path.dirname(r"proj\old.txt") is "" on Linux, because a backslash is an
+    ordinary character there - so a join against it silently does nothing and a
+    fix built on it looks correct while achieving nothing. The suite runs on
+    both platforms with literal `C:\...` fixtures, so this cannot be left to
+    os.path.
+    """
+    import ntpath
+    return ntpath.dirname(path) if "\\" in path else os.path.dirname(path)
+
+
+def _win_aware_join(head: str, tail: str, flavour_of: str = "") -> str:
+    r"""join(), choosing the separator from `flavour_of` rather than from head.
+
+    The head of "proj\old.txt" is "proj", which carries no backslash - so
+    deciding on the head produced "proj/b.txt" for a Windows command. The
+    original operand is the thing that knows which flavour of path this is.
+    """
+    import ntpath
+    if not head:
+        return tail
+    windows = "\\" in (flavour_of or head)
+    return ntpath.join(head, tail) if windows else os.path.join(head, tail)
 
 
 def _ps_write_target(cmd: str) -> Optional[str]:
@@ -535,27 +584,99 @@ def _ps_write_target(cmd: str) -> Optional[str]:
 
 
 def _ps_dest_target(cmd: str) -> Optional[str]:
-    """What a Move/Copy/Rename -Force will CLOBBER: the destination, not the
-    source. Mirrors the mv branch of extract_path_operand."""
-    ops = _ps_named_operands(cmd)
-    if len(ops) < 2:
+    r"""What a Move/Copy/Rename -Force will CLOBBER: the destination, not the
+    source. Mirrors the mv branch of extract_path_operand.
+
+    RESOLVED BY FLAG, NOT BY POSITION. `ops[-1]` assumed the author wrote
+    -Path before -Destination; PowerShell named parameters are order-free, so
+    `Copy-Item -Destination keep.txt -Path a.txt` resolved to the SOURCE.
+
+    -NewName is joined to the source's directory, because it names a file
+    beside the source rather than a path from here. A -NewName containing a
+    separator is refused: PowerShell's behaviour there is something neither I
+    nor the reviewer could confirm without a Windows box, and refusing is
+    correct under both readings - unreachable if PowerShell errors, and the
+    honest answer if it does not. Choosing the branch that is right either way
+    is cheaper than being sure.
+
+    ONE CMDLET CHECK, and only in the positional fallback. `Rename-Item a b`
+    means -NewName b while `Move-Item a b` means -Destination b, and no flag
+    separates them, so nothing else can. It is not new coupling: ps_named_target
+    already reaches this function through _PS_DEST_RE, which is literally
+    Move-Item|Copy-Item|Rename-Item.
+    """
+    pairs = _ps_flagged_operands(cmd)
+    values = [v for _, v in pairs]
+    if len(values) < 2:
         return None
-    dst = ops[-1]
-    if any(ch in dst for ch in "*?[]"):
+
+    def _flagged(names):
+        return next((v for f, v in pairs if f in names), None)
+
+    src = _flagged(_PS_PATH_FLAGS)
+    newname = _flagged(_PS_NEWNAME_FLAGS)
+
+    if newname is not None:
+        if "/" in newname or "\\" in newname:
+            return None                     # a path, not a name: ambiguous
+        base = src if src is not None else next(
+            (v for f, v in pairs if f is None), None)
+        if base is None:
+            return None
+        dst = _win_aware_join(_win_aware_dirname(base), newname, base)
+    else:
+        dst = _flagged(_PS_DEST_FLAGS)
+        if dst is None:
+            dst = values[-1]                # positional
+            if _PS_RENAME_RE.search(cmd):
+                dst = _win_aware_join(_win_aware_dirname(values[0]), dst,
+                                      values[0])
+
+    if not dst or any(ch in dst for ch in "*?[]"):
         return None
     return dst
 
 
-def ps_named_target(cmd: str) -> Optional[str]:
-    """The path a PowerShell write/clobber names, WITHOUT checking that it
-    exists. The guard needs the distinction: a name that resolves but is not on
-    disk means the command CREATES rather than destroys, while a name that does
-    not resolve at all is ambiguous and must still escalate."""
+def ps_named_target(cmd: str) -> Tuple[Optional[str], bool]:
+    r"""(absolute path, resolved?) for a PowerShell write or clobber.
+
+    Same contract and same shape as resolve_redirect_target, deliberately: two
+    functions answering "what does this command touch" with two conventions is
+    how three modules came to disagree and cost a silent data loss.
+
+    The docstring here already said the rule - "a name that does not resolve at
+    all is ambiguous and must still escalate" - and the code returned a bare
+    string, so the guard could not tell an unresolvable name from a resolvable
+    one that is merely absent. `Set-Content -Path $env:APPDATA
+otes.txt` came
+    back as that literal, os.path.exists said no, and the guard read it as
+    creation and cleared the flag. The third comment/code contradiction found
+    in this review, and the last place the contract was missing.
+
+    Existence is still NOT checked here: resolved-and-absent means "creates"
+    and only the caller can act on that. Resolved means "we know which file",
+    nothing more.
+    """
     if _PS_CONTENT_RE.search(cmd):
-        return _ps_write_target(cmd)
-    if _PS_DEST_RE.search(cmd):
-        return _ps_dest_target(cmd)
-    return None
+        named = _ps_write_target(cmd)
+    elif _PS_DEST_RE.search(cmd):
+        named = _ps_dest_target(cmd)
+    else:
+        return None, False
+    if not named:
+        return None, False
+    named = _expanduser_any(named)
+    if _UNEXPANDED.search(named):
+        return None, False
+    return os.path.abspath(named), True
+
+
+def _expanduser_any(path: str) -> str:
+    r"""expanduser that also handles `~\x`, which os.path.expanduser leaves
+    alone on POSIX because a backslash is not a separator there."""
+    if path.startswith("~\\"):
+        return os.path.join(os.path.expanduser("~"), path[2:])
+    return os.path.expanduser(path)
 
 
 def _too_broad(path: str) -> bool:

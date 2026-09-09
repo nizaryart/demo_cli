@@ -165,8 +165,12 @@ class Guard:
                 c.is_mutating = False
                 c.matched_rule = None
         elif c.matched_rule in _CREATES_IF_MISSING:
-            named = recovery.ps_named_target(command)
-            if named and not os.path.exists(os.path.abspath(named)):
+            # Same three-way split as the redirect branch above: only
+            # RESOLVED-AND-ABSENT means "creates". An unresolvable name -
+            # $env:APPDATA\notes.txt, $(Get-Date).txt - used to come back as a
+            # literal that os.path.exists denied, and was read as creation.
+            named, resolved = recovery.ps_named_target(command)
+            if resolved and not os.path.exists(named):
                 c.is_destructive = False
                 c.is_mutating = False
                 c.matched_rule = None
