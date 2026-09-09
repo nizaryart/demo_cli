@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 # demo_cli installer (Linux / macOS).
 #
-#   curl -fsSL https://raw.githubusercontent.com/nizaryart/DEMO_LOADING/v1.0.6/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/nizaryart/DEMO_LOADING/v1.0.7/install.sh | sh
 #
 # Yes, this is curl-pipe-sh - the exact opaque fetch-and-run pattern demo_cli
 # itself escalates. Read it first. It is not long.
@@ -15,7 +15,7 @@
 # you run yourself, per project, after reading what they change.
 set -eu
 
-TAG="v1.0.6"
+TAG="v1.0.7"
 REPO_BASE="git+https://github.com/nizaryart/DEMO_LOADING.git@${TAG}"
 
 say()  { printf '%s\n' "$*"; }

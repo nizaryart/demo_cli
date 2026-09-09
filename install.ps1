@@ -1,6 +1,6 @@
 # demo_cli installer (Windows / PowerShell).
 #
-#   irm https://raw.githubusercontent.com/nizaryart/DEMO_LOADING/v1.0.6/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/nizaryart/DEMO_LOADING/v1.0.7/install.ps1 | iex
 #
 # Yes, this is irm-pipe-iex - the exact opaque fetch-and-run pattern demo_cli
 # itself escalates. Read it first. It is not long.
@@ -16,7 +16,7 @@
 # Windows PowerShell 5.1 and PowerShell 7+.
 
 $ErrorActionPreference = "Stop"
-$TAG = "v1.0.6"
+$TAG = "v1.0.7"
 
 function Say  ($m){ Write-Host $m }
 function OK   ($m){ Write-Host $m -ForegroundColor Green }
