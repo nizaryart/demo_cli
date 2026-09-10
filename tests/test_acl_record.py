@@ -156,6 +156,7 @@ def test_what_is_applied_is_what_was_recorded(tmp_path, monkeypatch):
     applied = []
     monkeypatch.setattr(P, "_apply_sddl",
                         lambda p, s: applied.append((p, s)) or True)
+    monkeypatch.setattr(P, "_sddl_of", lambda p: applied[-1][1])
     (tmp_path / "a.txt").write_text("x")
     done, failed = P.restore_custom_acls(str(tmp_path), {"a.txt": "D:P(A;;FA;;;BA)"})
     assert done == 1 and failed == []
@@ -190,6 +191,51 @@ def test_an_entry_that_became_a_link_is_refused(tmp_path, monkeypatch):
     done, failed = P.restore_custom_acls(str(tmp_path), {"a.txt": "D:"})
     assert applied == [] and done == 0
     assert failed and "became a link" in failed[0]
+
+
+def test_a_result_that_does_not_match_the_record_is_a_failure(tmp_path, monkeypatch):
+    """SetNamedSecurityInfoW returning success is not evidence that this
+    file's permissions are the ones it had. Finding #14, pointed the other
+    way: a claim of restoration needs the same evidence as a claim of
+    protection."""
+    monkeypatch.setattr(P, "_apply_sddl", lambda p, s: True)
+    monkeypatch.setattr(P, "_sddl_of", lambda p: "D:P(A;;FA;;;WD)")   # Everyone
+    (tmp_path / "a.txt").write_text("x")
+    done, failed = P.restore_custom_acls(str(tmp_path), {"a.txt": "D:P(A;;FA;;;BA)"})
+    assert done == 0
+    assert failed and "does not match" in failed[0]
+
+
+def test_a_result_that_cannot_be_read_back_is_not_counted_as_restored(tmp_path, monkeypatch):
+    monkeypatch.setattr(P, "_apply_sddl", lambda p, s: True)
+    monkeypatch.setattr(P, "_sddl_of", lambda p: None)
+    (tmp_path / "a.txt").write_text("x")
+    done, failed = P.restore_custom_acls(str(tmp_path), {"a.txt": "D:P(A;;FA;;;BA)"})
+    assert done == 0
+    assert failed and "could not be read back" in failed[0]
+
+
+def test_the_auto_inherited_bit_does_not_count_as_a_mismatch(tmp_path, monkeypatch):
+    """Windows sets AI when it re-runs auto-inheritance and offers no way to
+    decline (measured on hardware 2026-09-10). It records that the ACL went
+    through the inheritance machinery and changes nobody's access, so it must
+    not be reported as a failed restore."""
+    monkeypatch.setattr(P, "_apply_sddl", lambda p, s: True)
+    monkeypatch.setattr(P, "_sddl_of",
+                        lambda p: "D:AI(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)")
+    (tmp_path / "a.txt").write_text("x")
+    done, failed = P.restore_custom_acls(
+        str(tmp_path), {"a.txt": "D:(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)"})
+    assert done == 1 and failed == []
+
+
+def test_shape_ignores_the_auto_inherited_bit_and_nothing_else():
+    same = ("D:(A;OICIID;FA;;;SY)", "D:AI(A;OICIID;FA;;;SY)")
+    assert P.dacl_shape(same[0]) == P.dacl_shape(same[1])
+    # but a changed principal, mask or protection is a different shape
+    assert P.dacl_shape("D:(A;;FA;;;SY)") != P.dacl_shape("D:(A;;FA;;;BA)")
+    assert P.dacl_shape("D:(A;;FA;;;SY)") != P.dacl_shape("D:(A;;FR;;;SY)")
+    assert P.dacl_shape("D:P(A;;FA;;;SY)") != P.dacl_shape("D:(A;;FA;;;SY)")
 
 
 def test_a_failed_apply_is_counted_not_swallowed(tmp_path, monkeypatch):
@@ -243,7 +289,11 @@ def test_a_recorded_descriptor_goes_back_exactly(tmp_path):
         assert P._sddl_of(str(d)) != original
     finally:
         assert P._apply_sddl(str(d), original) is True
-    assert P._sddl_of(str(d)) == original
+    # Compared at the level the round trip is actually true: the entries, and
+    # whether inheritance is blocked. Windows sets the AI control bit when it
+    # re-runs auto-inheritance and offers no way to decline - see dacl_shape.
+    # Everything that decides access is compared exactly.
+    assert P.dacl_shape(P._sddl_of(str(d))) == P.dacl_shape(original)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="needs a real security descriptor")

@@ -1125,16 +1125,40 @@ def _sddl_of(path: str) -> Optional[str]:
         return None
 
 
-def _sddl_is_protected(sddl: str) -> bool:
-    """Does this SDDL disable inheritance? The flags sit between "D:" and the
-    first ACE, and "P" among them is what icacls calls /inheritance:r.
+def dacl_shape(sddl: str) -> Tuple[bool, str]:
+    """(protected, the ACEs) - everything in a DACL that decides access.
 
-    Read here rather than assumed, because restoring a protected ACL as
-    unprotected would let the parent's ACEs back in - which is the exact loss
-    this whole record exists to prevent.
+    WHAT IS DELIBERATELY NOT IN HERE: the AI control bit. SetNamedSecurityInfoW
+    with UNPROTECTED runs Windows' auto-inheritance, which SETS that bit - so
+    a descriptor captured as
+
+        D:(A;OICIID;FA;;;SY)(A;OICIID;FA;;;BA)(A;OICIID;FA;;;OW)
+
+    comes back as D:AI(...same three ACEs...). Measured 2026-09-10; there is
+    no way to ask that API not to. The bit records that the ACL has been
+    through the inheritance machinery, and it changes no principal's access.
+
+    So the round-trip claim is stated at the level it is actually true: the
+    entries and whether inheritance is blocked. Both of those DO decide who
+    gets in, and both are compared exactly.
+
+    P is what icacls calls /inheritance:r. AI and AR are stripped first
+    because both contain no P but would otherwise have to be reasoned about.
     """
-    head = sddl.split("D:", 1)[-1].split("(", 1)[0] if "D:" in sddl else ""
-    return "P" in head.replace("AI", "").replace("AR", "")
+    body = sddl.split("D:", 1)[-1] if "D:" in sddl else sddl
+    cut = body.find("(")
+    flags, aces = (body[:cut], body[cut:]) if cut >= 0 else (body, "")
+    return ("P" in flags.replace("AI", "").replace("AR", ""), aces)
+
+
+def _sddl_is_protected(sddl: str) -> bool:
+    """Does this SDDL disable inheritance?
+
+    Read rather than assumed, because restoring a protected ACL as unprotected
+    would let the parent's ACEs back in - which is the exact loss this whole
+    record exists to prevent.
+    """
+    return dacl_shape(sddl)[0]
 
 
 def _apply_sddl(path: str, sddl: str) -> bool:
@@ -1292,10 +1316,20 @@ def restore_custom_acls(root: str, record: Dict[str, str]) -> Tuple[int, List[st
         if _is_reparse_point(full):
             failed.append(f"{rel} (refused: became a link)")
             continue
-        if _apply_sddl(full, sddl):
-            done += 1
-        else:
+        if not _apply_sddl(full, sddl):
             failed.append(rel)
+            continue
+        # READ IT BACK. Finding #14 said a claim of protection must not rest
+        # on a tool's self-report; a claim of RESTORATION is the same claim
+        # pointed the other way. SetNamedSecurityInfoW returning success is
+        # not evidence that this file's permissions are the ones it had.
+        back = _sddl_of(full)
+        if back is None:
+            failed.append(f"{rel} (applied, but could not be read back to check)")
+        elif dacl_shape(back) != dacl_shape(sddl):
+            failed.append(f"{rel} (applied, but the result does not match)")
+        else:
+            done += 1
     return done, failed
 
 
