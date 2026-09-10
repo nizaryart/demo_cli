@@ -265,17 +265,40 @@ class Receipt:
 
 
 def last_hash(path: str) -> str:
-    last = GENESIS
-    if os.path.exists(path):
-        with open(path, **_READ) as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    try:
-                        last = json.loads(line)["receipt_hash"]
-                    except Exception:
-                        pass
-    return last
+    r"""The hash every new receipt chains onto: the last parseable one, or
+    GENESIS when the file holds none.
+
+    READ FROM THE TAIL. This scanned the WHOLE FILE, line by line, once per
+    append - so appending n receipts cost O(n^2) in total, and the cost landed
+    in the pre-execution path where the user waits for it. Measured on a real
+    receipt line of 888 bytes (2026-09-10):
+
+        entries      file    last_hash    append_receipt
+            100    0.1 MB      0.62 ms           5.66 ms
+         10,000    8.6 MB        83 ms             86 ms
+         50,000     43 MB       459 ms            541 ms
+        100,000     86 MB      1145 ms            955 ms
+
+    Half a second of latency, before the command runs, on every command,
+    because the ledger got long. Nothing was wrong with any receipt - this was
+    never a correctness fault - but a guard that gets slower the longer you
+    have trusted it is a guard people turn off.
+
+    _tail_hash has the identical contract and is flat at ~0.15 ms at every one
+    of those sizes: it walks backwards, skips torn lines the same way, widens
+    its window until it finds a parseable receipt, and returns GENESIS only
+    after it has read the whole file. It was written for the PEER chain during
+    the 2026-09-09 review, for this exact reason - its own docstring says a
+    full scan per append turns a 200-file delete into 200 full reads - and
+    nobody pointed the main chain at it.
+
+        THE FIX WAS ALREADY IN THE FILE, APPLIED TO THE OTHER CALLER.
+
+    Kept as a named function rather than inlined: it is what the rest of this
+    module and its tests call the operation, and the two contracts are worth
+    stating separately even when one delegates to the other.
+    """
+    return _tail_hash(path)
 
 
 # --------------------------------------------------------------------------
