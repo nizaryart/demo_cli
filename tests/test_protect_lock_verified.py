@@ -11,6 +11,7 @@ two ends of it: the icacls call that creates the ACL, and every caller that
 decides what to tell the user about it.
 """
 import inspect
+import os
 
 import pytest
 
@@ -177,6 +178,63 @@ def test_the_acl_is_read_through_the_api_and_not_by_parsing_output():
     assert "_ICACLS" not in inspect.getsource(P.is_locked)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="there is a real DACL to read here")
 def test_reading_an_acl_off_windows_is_unknown(tmp_path):
     assert P._read_dacl(str(tmp_path)) is None
     assert P.is_locked(str(tmp_path)) is None
+
+
+# --------------------------------------------------------------------------
+# The probe itself, against a real DACL.
+#
+# THESE DID NOT EXIST WHEN _read_dacl WAS FIRST WRITTEN, and the suite was
+# green on Windows anyway: every other test in this file feeds judge_lock a
+# hand-built list, and the only test that touched the probe asserted it
+# returns None - which it does off Windows, where none of this code runs.
+# A probe returning garbage would have passed 1058 tests (2026-09-10).
+
+@pytest.mark.skipif(os.name != "nt", reason="needs a Windows ACL")
+def test_the_probe_returns_real_entries_for_a_real_directory(tmp_path):
+    aces = P._read_dacl(str(tmp_path))
+    assert aces, "no entries for a directory that certainly has some"
+    for a in aces:
+        assert a.sid.startswith("S-1-"), a
+        assert a.mask, a
+        assert isinstance(a.allow, bool)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="needs a Windows ACL")
+def test_an_ordinary_directory_does_not_read_as_locked(tmp_path):
+    """The failure that would matter most: a probe whose output happens to
+    satisfy judge_lock would report every directory on the machine as
+    protected."""
+    assert P.is_locked(str(tmp_path)) is False
+
+
+@pytest.mark.skipif(os.name != "nt", reason="needs icacls")
+def test_the_probe_agrees_with_icacls_on_the_same_directory(tmp_path):
+    """Cross-check against the thing this replaced.
+
+    The masks and offsets in _read_dacl are hand-written struct arithmetic:
+    ACE_HEADER is four bytes, the mask is the next four, the SID starts at
+    eight. Every one of those is a number I could have got wrong, and a wrong
+    one still yields plausible-looking output. icacls is an independent
+    reading of the same ACL, so if the two agree on how many entries there
+    are and which are inherited, the arithmetic is right.
+    """
+    import subprocess
+    r = subprocess.run([P._ICACLS, str(tmp_path)], capture_output=True,
+                       text=True, timeout=30)
+    assert r.returncode == 0, r.stderr
+
+    lines = [l for l in (r.stdout or "").splitlines()
+             if ":" in l and not l.startswith(("Successfully", "Failed"))]
+    aces = P._read_dacl(str(tmp_path))
+    assert aces is not None
+    assert len(aces) == len(lines), f"{aces}\n{r.stdout}"
+
+    # (I) is how icacls prints an inherited entry.
+    assert sum(1 for a in aces if a.inherited) == sum(1 for l in lines if "(I)" in l)
+    # (F) is full control - the mask judge_lock's rule 2 tests for.
+    assert sum(1 for a in aces if a.mask & P._FULL_CONTROL == P._FULL_CONTROL) \
+        == sum(1 for l in lines if "(F)" in l)
