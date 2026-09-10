@@ -91,7 +91,7 @@ def _plan(tmp_path):
 def _stub(monkeypatch, locked, lock_returns=True):
     monkeypatch.setattr(P, "is_elevated", lambda: True)
     monkeypatch.setattr(P.Backing, "relocate", staticmethod(lambda a, b: None))
-    monkeypatch.setattr(P, "lock_directory", lambda p: lock_returns)
+    monkeypatch.setattr(P, "lock_directory", lambda p: P.ResetOutcome(lock_returns))
     monkeypatch.setattr(P, "is_locked", lambda p: locked)
 
 
@@ -257,9 +257,9 @@ def _order(monkeypatch, *, locked=True, relocate_fails=False):
     calls = []
     monkeypatch.setattr(P, "is_elevated", lambda: True)
     monkeypatch.setattr(P, "lock_directory",
-                        lambda p: calls.append(("lock", p)) or True)
+                        lambda p: calls.append(("lock", p)) or P.ResetOutcome(True))
     monkeypatch.setattr(P, "unlock_directory",
-                        lambda p: calls.append(("unlock", p)) or True)
+                        lambda p: calls.append(("unlock", p)) or P.ResetOutcome(True))
     monkeypatch.setattr(P, "is_locked", lambda p: locked)
 
     def _move(a, b):
@@ -305,8 +305,8 @@ def test_the_lock_is_verified_at_the_destination_not_the_source(tmp_path, monkey
     ordering rests on: that the rename carried the DACL with it."""
     seen = []
     monkeypatch.setattr(P, "is_elevated", lambda: True)
-    monkeypatch.setattr(P, "lock_directory", lambda p: True)
-    monkeypatch.setattr(P, "unlock_directory", lambda p: True)
+    monkeypatch.setattr(P, "lock_directory", lambda p: P.ResetOutcome(True))
+    monkeypatch.setattr(P, "unlock_directory", lambda p: P.ResetOutcome(True))
     monkeypatch.setattr(P, "is_locked", lambda p: seen.append(p) or True)
     monkeypatch.setattr(P.Backing, "relocate", staticmethod(lambda a, b: None))
     plan = _plan(tmp_path)
@@ -342,9 +342,9 @@ def test_unprotect_falls_back_to_the_exit_code_when_it_cannot_check(tmp_path, mo
     plan = P.Plan(source=str(tmp_path / "proj"), backing=str(tmp_path / "proj.real"),
                   mountpoint=str(tmp_path / "proj"), will_lock=True)
 
-    monkeypatch.setattr(P, "unlock_directory", lambda p: False)
+    monkeypatch.setattr(P, "unlock_directory", lambda p: P.ResetOutcome(False))
     assert any("COULD NOT UNLOCK" in d for d in P.unprotect(plan))
-    monkeypatch.setattr(P, "unlock_directory", lambda p: True)
+    monkeypatch.setattr(P, "unlock_directory", lambda p: P.ResetOutcome(True))
     assert any(d.startswith("unlocked") for d in P.unprotect(plan))
 
 
@@ -359,3 +359,76 @@ def test_no_test_runs_with_real_elevation():
     """
     assert P.is_elevated.__name__ == "<lambda>", \
         "conftest's autouse guard is not in effect: a test could write a real ACL"
+
+
+# --------------------------------------------------------------------------
+# What protect and unprotect say about entries the reset did not cover
+#
+# Finding #3's payoff. A count and up to five names, because the entries a
+# lock does not cover are the bypass routes and "COULD NOT LOCK" said neither
+# which nor how many.
+
+def test_a_partly_covered_lock_names_what_it_missed(tmp_path, monkeypatch):
+    monkeypatch.setattr(P, "is_elevated", lambda: True)
+    monkeypatch.setattr(P, "is_locked", lambda p: True)
+    monkeypatch.setattr(P.Backing, "relocate", staticmethod(lambda a, b: None))
+    monkeypatch.setattr(P, "lock_directory", lambda p: P.ResetOutcome(
+        False, failed=[os.path.join(p, "keep.txt")]))
+    done = P.protect(_plan(tmp_path))
+    assert any("locked" in d for d in done)
+    assert any("1 entry" in d and "keep.txt" in d and "NOT covered" in d
+               for d in done), done
+
+
+def test_links_are_named_as_not_covered_rather_than_as_failures(tmp_path, monkeypatch):
+    monkeypatch.setattr(P, "is_elevated", lambda: True)
+    monkeypatch.setattr(P, "is_locked", lambda p: True)
+    monkeypatch.setattr(P.Backing, "relocate", staticmethod(lambda a, b: None))
+    monkeypatch.setattr(P, "lock_directory", lambda p: P.ResetOutcome(
+        True, links=[os.path.join(p, "node_modules")]))
+    done = P.protect(_plan(tmp_path))
+    assert any("point outside the project" in d and "node_modules" in d
+               for d in done), done
+    assert not any("NOT covered" in d for d in done), done
+
+
+def test_a_fully_covered_lock_says_nothing_extra(tmp_path, monkeypatch):
+    """The ordinary case must not gain a line of noise."""
+    monkeypatch.setattr(P, "is_elevated", lambda: True)
+    monkeypatch.setattr(P, "is_locked", lambda p: True)
+    monkeypatch.setattr(P.Backing, "relocate", staticmethod(lambda a, b: None))
+    monkeypatch.setattr(P, "lock_directory", lambda p: P.ResetOutcome(True))
+    done = P.protect(_plan(tmp_path))
+    # Matched on the exact phrases, not on "covered": tmp_path contains the
+    # test's own name, and this test's name contains that word.
+    assert not any("NOT covered by the lock" in d
+                   or "point outside the project" in d for d in done), done
+    assert len(done) == 2, done
+
+
+def test_only_five_names_are_shown(tmp_path, monkeypatch):
+    """Enough to recognise the pattern without burying the rest of the
+    output. The COUNT is always exact."""
+    monkeypatch.setattr(P, "is_elevated", lambda: True)
+    monkeypatch.setattr(P, "is_locked", lambda p: True)
+    monkeypatch.setattr(P.Backing, "relocate", staticmethod(lambda a, b: None))
+    monkeypatch.setattr(P, "lock_directory", lambda p: P.ResetOutcome(
+        False, failed=[os.path.join(p, f"f{i}.txt") for i in range(9)]))
+    done = P.protect(_plan(tmp_path))
+    line = [d for d in done if "NOT covered" in d][0]
+    assert "9 entries" in line
+    assert line.count(".txt") == 5
+    assert line.endswith("...")
+
+
+def test_unprotect_names_what_it_could_not_give_back(tmp_path, monkeypatch):
+    """The mirror: files whose ACL was not restored are files the owner may
+    not be able to open."""
+    monkeypatch.setattr(P, "is_elevated", lambda: True)
+    monkeypatch.setattr(P, "is_locked", lambda p: False)
+    monkeypatch.setattr(P.os, "rename", lambda a, b: None)
+    monkeypatch.setattr(P, "unlock_directory", lambda p: P.ResetOutcome(
+        False, failed=[os.path.join(p, "stuck.txt")]))
+    done = P.unprotect(_plan(tmp_path))
+    assert any("could not be given back" in d and "stuck.txt" in d
+               for d in done), done

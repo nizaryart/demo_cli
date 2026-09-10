@@ -489,7 +489,7 @@ def protect(plan: Plan) -> List[str]:
     # from that moment the project's own permissions are gone (finding #12).
     record = capture_custom_acls(plan.source) if plan.will_lock and is_elevated() else {}
     if plan.will_lock and is_elevated():
-        lock_directory(plan.source)
+        reset = lock_directory(plan.source)
         if is_locked(plan.source) is True:
             locked_before_move = True
         else:
@@ -520,6 +520,7 @@ def protect(plan: Plan) -> List[str]:
         state = is_locked(plan.backing)
         if state is True:
             done.append(f"locked {plan.backing} to Administrators and SYSTEM")
+            done += _coverage_notes(reset, plan.source, plan.backing)
             # Stored only now, into a directory that is already locked - so
             # the file an elevated unprotect will act on never sits anywhere
             # an ordinary process could rewrite it.
@@ -540,6 +541,38 @@ def protect(plan: Plan) -> List[str]:
                         f"ACL could not be read, so whether the guard can be "
                         f"bypassed is unknown")
     return done
+
+
+def _coverage_notes(reset: "ResetOutcome", walked: str, shown: str,
+                    verb: str = "are NOT covered by the lock") -> List[str]:
+    """Turn an entry-by-entry outcome into lines a person can act on.
+
+    A count and up to five names. The count is the fact; the names are what
+    makes it actionable, and five is enough to recognise the pattern without
+    burying the rest of the output. Paths are rewritten to where the entries
+    ended up, because naming them at a path that no longer exists is only
+    half an answer.
+    """
+    def _show(paths: List[str]) -> str:
+        rel = []
+        for pth in paths[:5]:
+            try:
+                rel.append(os.path.relpath(pth, walked))
+            except ValueError:
+                rel.append(pth)
+        return ", ".join(rel) + (" ..." if len(paths) > 5 else "")
+
+    notes = []
+    if reset.failed:
+        notes.append(f"{len(reset.failed)} entr"
+                     f"{'y' if len(reset.failed) == 1 else 'ies'} under {shown} "
+                     f"{verb}: {_show(reset.failed)}")
+    if reset.links:
+        notes.append(f"{len(reset.links)} link"
+                     f"{'' if len(reset.links) == 1 else 's'} were left alone "
+                     f"because they point outside the project: "
+                     f"{_show(reset.links)}")
+    return notes
 
 
 def plan_unprotect(project: str, backing: Optional[str] = None) -> Plan:
@@ -613,7 +646,8 @@ def unprotect(plan: Plan) -> List[str]:
         # Read it before the unlock: /reset is about to overwrite the ACL of
         # every entry the record names, including the record's own.
         record, problem = read_acl_record(plan.source)
-        ok = unlock_directory(plan.source)
+        reset = unlock_directory(plan.source)
+        ok = reset.ok
         state = is_locked(plan.source)
         freed = (state is False) if state is not None else ok
         if freed:
@@ -622,6 +656,8 @@ def unprotect(plan: Plan) -> List[str]:
             done.append(f"COULD NOT UNLOCK {plan.source} - the restored "
                         f"project is still Administrators-only. Fix with: "
                         f"icacls <path> /inheritance:e ; icacls <path> /reset /T")
+        done += _coverage_notes(reset, plan.source, plan.source,
+                                verb="could not be given back")
         if problem:
             done.append(problem)
         elif record:
@@ -655,7 +691,7 @@ def unprotect(plan: Plan) -> List[str]:
 # nobody can open, including the person who owns it.
 # --------------------------------------------------------------------------
 
-def lock_directory(path: str) -> bool:
+def lock_directory(path: str) -> ResetOutcome:
     """Grant the directory to SYSTEM and Administrators only.
 
     TWO PASSES, and the reason is a defect found live on 2026-08-25.
@@ -681,16 +717,16 @@ def lock_directory(path: str) -> bool:
     can repair a file whose DACL is already empty.
     """
     if os.name != "nt" or not _icacls_present():
-        return False
+        return ResetOutcome(False)
     args = [_ICACLS, path, "/inheritance:r"]
     for sid, rights in _LOCK_ACL:
         args += ["/grant:r", f"*{sid}:{rights}"]
     if not _run(args):
-        return False
+        return ResetOutcome(False, failed=[path])
     return _reset_children(path)
 
 
-def unlock_directory(path: str) -> bool:
+def unlock_directory(path: str) -> ResetOutcome:
     """Give the directory back to its owner and restore inheritance.
 
     THREE separate icacls calls, because combining them does not work and
@@ -709,12 +745,35 @@ def unlock_directory(path: str) -> bool:
     completely normal until the owner tried to change its permissions.
     """
     if os.name != "nt" or not _icacls_present():
-        return False
+        return ResetOutcome(False)
     if not _run([_ICACLS, path, "/inheritance:e"]):
-        return False
+        return ResetOutcome(False, failed=[path])
     if not _run([_ICACLS, path, "/reset"]):
-        return False
+        return ResetOutcome(False, failed=[path])
     return _reset_children(path)
+
+
+@dataclass
+class ResetOutcome:
+    """What the ACL reset actually did, entry by entry.
+
+    IT USED TO BE ONE BOOL (finding #3). icacls without /C stops at the first
+    error, so a tree could come back with some children reset and some not -
+    and every one of those outcomes reported the same word: False. The caller
+    then said "COULD NOT LOCK", which is wrong in both directions. It is not
+    true that nothing was locked, and it hides the only part that matters:
+    WHICH entries are not covered, because those are the bypass routes.
+
+    `links` are not failures. They are reparse points the walk refused to
+    follow (finding #11) and they are listed for the same reason: an entry
+    the lock does not cover is worth naming even when skipping it was right.
+    """
+    ok: bool
+    failed: List[str] = field(default_factory=list)
+    links: List[str] = field(default_factory=list)
+
+    def __bool__(self) -> bool:
+        return self.ok
 
 
 def _is_reparse_point(path: str) -> bool:
@@ -737,7 +796,7 @@ def _is_reparse_point(path: str) -> bool:
     return os.path.islink(path)         # POSIX, and the tests
 
 
-def _reset_children(path: str) -> bool:
+def _reset_children(path: str) -> ResetOutcome:
     r"""Make every existing child inherit the directory's ACL.
 
     NEVER LEAVES THE TREE. This used to be one call:
@@ -778,39 +837,55 @@ def _reset_children(path: str) -> bool:
     """
     try:
         if not os.listdir(path):
-            return True
+            return ResetOutcome(True)
     except OSError:
-        return False
+        return ResetOutcome(False, failed=[path])
 
-    if not _reparse_points_under(path):
-        return _run([_ICACLS, os.path.join(path, "*"), "/reset", "/T", "/Q"])
+    links = _reparse_points_under(path)
+    if not links:
+        if _run([_ICACLS, os.path.join(path, "*"), "/reset", "/T", "/Q"]):
+            return ResetOutcome(True)
+        # /T STOPPED SOMEWHERE AND WILL NOT SAY WHERE. One bool for a walk of
+        # a whole tree is exactly finding #3, so pay for the careful walk now
+        # that something is already wrong - the only cost is on the path that
+        # is about to tell the user bad news, and it can now say which files.
+    return _reset_one_by_one(path)
 
-    ok = True
+
+def _reset_one_by_one(path: str) -> ResetOutcome:
+    """Walk it here rather than letting icacls recurse, and name every entry
+    that did not take. Never crosses a reparse point (finding #11)."""
+    failed: List[str] = []
+    skipped: List[str] = []
     stack = [path]
     while stack:
         here = stack.pop()
         try:
             names = os.listdir(here)
         except OSError:
-            ok = False
+            failed.append(here)
             continue
-        safe, links = [], []
-        for name in names:
+        safe: List[str] = []
+        for name in sorted(names):
             child = os.path.join(here, name)
-            (links if _is_reparse_point(child) else safe).append(child)
+            (skipped if _is_reparse_point(child) else safe).append(child)
         if not safe:
             continue
-        if links:
+        if any(_is_reparse_point(os.path.join(here, n)) for n in names):
             # The wildcard would match the links. Name the rest one by one.
             for child in safe:
                 if not _run([_ICACLS, child, "/reset", "/Q"]):
-                    ok = False
+                    failed.append(child)
         elif not _run([_ICACLS, os.path.join(here, "*"), "/reset", "/Q"]):
-            ok = False
+            # The wildcard covered them all and the wildcard failed, so fall
+            # to naming them: which ones failed is the whole point.
+            for child in safe:
+                if not _run([_ICACLS, child, "/reset", "/Q"]):
+                    failed.append(child)
         for child in safe:
             if os.path.isdir(child):
                 stack.append(child)
-    return ok
+    return ResetOutcome(not failed, failed=failed, links=skipped)
 
 
 def _reparse_points_under(path: str) -> List[str]:

@@ -165,8 +165,8 @@ def test_a_failed_unlock_is_reported_not_swallowed(project, monkeypatch):
     alarming the user about.
     """
     monkeypatch.setattr(P, "is_elevated", lambda: True)
-    monkeypatch.setattr(P, "unlock_directory", lambda _: False)
-    monkeypatch.setattr(P, "lock_directory", lambda _: True)
+    monkeypatch.setattr(P, "unlock_directory", lambda _: P.ResetOutcome(False))
+    monkeypatch.setattr(P, "lock_directory", lambda _: P.ResetOutcome(True))
     monkeypatch.setattr(P, "is_locked", lambda _: True)      # it really is
     original = str(project)
     P.protect(P.plan_protect(original))
@@ -185,8 +185,8 @@ def test_an_unlock_command_that_failed_on_an_unlocked_directory_is_not_an_alarm(
     way round, and it is why the exit code is only a FALLBACK.
     """
     monkeypatch.setattr(P, "is_elevated", lambda: True)
-    monkeypatch.setattr(P, "unlock_directory", lambda _: False)
-    monkeypatch.setattr(P, "lock_directory", lambda _: True)
+    monkeypatch.setattr(P, "unlock_directory", lambda _: P.ResetOutcome(False))
+    monkeypatch.setattr(P, "lock_directory", lambda _: P.ResetOutcome(True))
     monkeypatch.setattr(P, "is_locked", lambda _: False)     # it is not
     original = str(project)
     P.protect(P.plan_protect(original))
@@ -245,8 +245,8 @@ def test_locking_is_a_no_op_off_windows(tmp_path):
     directory and asserting the result was False. It passed there, for a
     reason I have not established; the point is that a test named
     off_windows should not have been running on Windows to find out."""
-    assert P.lock_directory(str(tmp_path)) is False
-    assert P.unlock_directory(str(tmp_path)) is False
+    assert P.lock_directory(str(tmp_path)).ok is False
+    assert P.unlock_directory(str(tmp_path)).ok is False
 
 
 @pytest.mark.skipif(os.name == "nt", reason="checks the non-Windows path")

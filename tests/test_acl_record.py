@@ -326,9 +326,9 @@ def _seq(monkeypatch, *, record=None, locked=True):
     monkeypatch.setattr(P, "is_elevated", lambda: True)
     monkeypatch.setattr(P, "is_locked", lambda p: locked)
     monkeypatch.setattr(P, "lock_directory",
-                        lambda p: calls.append("lock") or True)
+                        lambda p: calls.append("lock") or P.ResetOutcome(True))
     monkeypatch.setattr(P, "unlock_directory",
-                        lambda p: calls.append("unlock") or True)
+                        lambda p: calls.append("unlock") or P.ResetOutcome(True))
     monkeypatch.setattr(P, "capture_custom_acls",
                         lambda p: calls.append("capture") or dict(record or {}))
     monkeypatch.setattr(P, "write_acl_record",

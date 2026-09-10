@@ -59,7 +59,7 @@ def test_a_tree_with_no_links_still_takes_one_call(tmp_path, icacls):
     """Correctness must not cost every user a slow protect. With nothing in
     the tree to follow, /T is provably safe and stays."""
     proj = _tree(tmp_path)
-    assert P._reset_children(str(proj)) is True
+    assert P._reset_children(str(proj)).ok is True
     assert len(icacls) == 1
     assert "/T" in icacls[0]
 
@@ -67,7 +67,7 @@ def test_a_tree_with_no_links_still_takes_one_call(tmp_path, icacls):
 def test_an_empty_directory_asks_for_nothing(tmp_path, icacls):
     d = tmp_path / "empty"
     d.mkdir()
-    assert P._reset_children(str(d)) is True
+    assert P._reset_children(str(d)).ok is True
     assert icacls == []
 
 
@@ -162,7 +162,7 @@ def test_a_child_that_fails_makes_the_whole_thing_false(tmp_path, monkeypatch):
     proj = _tree(tmp_path)
     (proj / "link").symlink_to(tmp_path / "outside", target_is_directory=True)
     monkeypatch.setattr(P, "_run", lambda args: False)
-    assert P._reset_children(str(proj)) is False
+    assert P._reset_children(str(proj)).ok is False
 
 
 def test_an_unreadable_subtree_is_not_handed_to_icacls_recursion(tmp_path, monkeypatch, icacls):
@@ -248,3 +248,121 @@ def test_the_scan_uses_the_attribute_too(tmp_path, monkeypatch):
         return orig(p)
     monkeypatch.setattr(P.os, "lstat", _fake)
     assert str(proj / "sub") in P._reparse_points_under(str(proj))
+
+
+# --------------------------------------------------------------------------
+# What the reset REPORTS
+#
+# Finding #3. icacls without /C stops at the first error, so a tree could come
+# back with some children reset and some not - and every one of those outcomes
+# reported the same word: False. The caller said "COULD NOT LOCK", which is
+# wrong in both directions. It is not true that nothing was locked, and it
+# hides the only part that matters: which entries are not covered, because
+# those are the bypass routes.
+
+def _fail_on(monkeypatch, needle):
+    r"""A fake icacls that refuses any entry whose path contains `needle`.
+
+    IT HAS TO MODEL THE RECURSION. The first version just looked at the
+    arguments, so `icacls <dir>\* /reset /T` - which never names the file it
+    is about to choke on - came back SUCCESS, and three tests about partial
+    failure passed against an outcome that had no failures in it. The point
+    of /T is that it walks; a fake that does not walk is testing nothing.
+    """
+    seen = []
+
+    def _under(d):
+        for base, dirs, files in os.walk(d):
+            for n in dirs + files:
+                yield os.path.join(base, n)
+
+    def _run(args):
+        seen.append(list(args))
+        target = args[1]
+        if target.endswith(os.sep + "*"):
+            d = target[:-2]
+            if "/T" in args:
+                return not any(needle in p for p in _under(d))
+            try:
+                return not any(needle in n for n in os.listdir(d))
+            except OSError:
+                return False
+        return needle not in target
+
+    monkeypatch.setattr(P, "_run", _run)
+    return seen
+
+
+def test_a_partial_failure_is_not_reported_as_a_total_one(tmp_path, monkeypatch):
+    proj = _tree(tmp_path)
+    _fail_on(monkeypatch, "b.txt")
+    out = P._reset_children(str(proj))
+    assert out.ok is False
+    assert len(out.failed) == 1
+    assert out.failed[0].endswith("b.txt"), out.failed
+
+
+def test_the_entries_that_failed_are_named(tmp_path, monkeypatch):
+    """A count says something is wrong. The names say what to go and look at."""
+    proj = _tree(tmp_path)
+    (proj / "c.txt").write_text("c")
+    _fail_on(monkeypatch, ".txt")
+    out = P._reset_children(str(proj))
+    assert {os.path.basename(f) for f in out.failed} == {"a.txt", "b.txt", "c.txt"}
+
+
+def test_a_wildcard_that_fails_is_retried_one_by_one_to_find_out_which(tmp_path, monkeypatch):
+    """/T stops somewhere and will not say where. One bool for a whole tree
+    IS the finding, so the careful walk is paid for once something is already
+    wrong - and the user gets names instead of a shrug."""
+    proj = _tree(tmp_path)
+    seen = _fail_on(monkeypatch, "b.txt")
+    out = P._reset_children(str(proj))
+    assert any("/T" in args for args in seen), "the fast path should be tried first"
+    assert out.failed and all("/T" not in f for f in out.failed)
+    assert out.failed[0].endswith("b.txt")
+
+
+def test_a_tree_that_resets_cleanly_reports_nothing_to_look_at(tmp_path, icacls):
+    proj = _tree(tmp_path)
+    out = P._reset_children(str(proj))
+    assert out.ok is True
+    assert out.failed == [] and out.links == []
+
+
+def test_links_are_reported_without_being_called_failures(tmp_path, icacls):
+    """Skipping them was right (finding #11). An entry the lock does not
+    cover is still worth naming."""
+    proj = _tree(tmp_path)
+    (proj / "link").symlink_to(tmp_path / "outside", target_is_directory=True)
+    out = P._reset_children(str(proj))
+    assert out.ok is True
+    assert out.failed == []
+    assert [os.path.basename(l) for l in out.links] == ["link"]
+
+
+def test_an_unreadable_directory_is_named_rather_than_counted(tmp_path, monkeypatch, icacls):
+    proj = _tree(tmp_path)
+    real = os.listdir
+    monkeypatch.setattr(P.os, "listdir",
+                        lambda p: (_ for _ in ()).throw(PermissionError())
+                        if str(p).endswith("sub") else real(p))
+    out = P._reset_children(str(proj))
+    assert out.ok is False
+    assert any(f.endswith("sub") for f in out.failed), out.failed
+
+
+def test_the_outcome_is_still_usable_as_a_yes_or_no(tmp_path, icacls):
+    """Callers that only want to know whether it worked keep working."""
+    proj = _tree(tmp_path)
+    assert bool(P._reset_children(str(proj))) is True
+    assert bool(P.ResetOutcome(False)) is False
+
+
+def test_a_lock_whose_grant_failed_names_the_directory(tmp_path, monkeypatch):
+    monkeypatch.setattr(P.os, "name", "nt")
+    monkeypatch.setattr(P, "_icacls_present", lambda: True)
+    monkeypatch.setattr(P, "_run", lambda args: False)
+    out = P.lock_directory(str(tmp_path))
+    assert out.ok is False
+    assert out.failed == [str(tmp_path)]
