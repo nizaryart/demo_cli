@@ -267,13 +267,38 @@ your real files live in    C:\project.real     <- passes it through
 **The project directory keeps its path.** `setup` moves your files to
 `<project>.real` and mounts the guard at the original location, so nothing in
 your tooling has to change and there is no unguarded path to write through.
-The backing directory is locked to Administrators and SYSTEM — which is what
-makes the separation real rather than advisory.
+The backing directory is locked to three entries: Administrators and SYSTEM
+at full control, and **OWNER RIGHTS (`S-1-3-4`) at `(RC)`** — read the ACL and
+nothing else.
+
+That third entry is the one that makes the lock work, and it is not obvious.
+Granting a directory to Administrators does not stop *its owner*, and moving a
+project preserves ownership — so the user still owns the backing afterwards,
+and an owner holds `READ_CONTROL` and `WRITE_DAC` **implicitly**, not through
+any ACE. There is nothing in the ACL to remove. An explicit OWNER RIGHTS entry
+replaces those implicit rights with whatever it says. Verified on Windows 10,
+unelevated, with the lock applied: reading the files is denied, granting
+yourself access is denied, moving the directory is denied, and reading the ACL
+still works — which is what lets `doctor` tell you the lock is there without
+asking for a password.
 
 **Which is why you launch the agent unelevated.** The guard holds exactly as
 long as the agent has fewer privileges than it does. `setup` arranges that,
 `guarded` keeps it, and `doctor` warns you if the shell you are standing in
 would break it.
+
+Two things this does **not** cover, stated because a lock you misjudge is
+worse than one you know the edges of:
+
+* **A handle opened before `protect` ran stays valid.** Windows checks
+  permissions when a file is opened, not on every read and write. Start the
+  guard before the agent, not after.
+* **The lock is shaped by who owns the project.** If you created it in an
+  elevated shell, Windows made *Administrators* the owner — the OWNER RIGHTS
+  entry then caps a principal you are not, you are denied everything including
+  the ACL, and `demo_cli` reports the lock state as *unknown* rather than
+  guessing. Stronger, but noisier. A project you made normally is the case
+  described above.
 
 ### Prerequisites
 
