@@ -59,6 +59,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import stat
 import sys
 import subprocess
 import tempfile
@@ -678,10 +679,63 @@ def unlock_directory(path: str) -> bool:
     return _reset_children(path)
 
 
-def _reset_children(path: str) -> bool:
-    """Make every existing child inherit the directory's ACL.
+def _is_reparse_point(path: str) -> bool:
+    """Is this entry a junction, a symlink, or anything else that redirects?
 
-    Skipped for an empty directory: `icacls <dir>\\*` matches nothing there and
+    Junctions are the ones that matter here and they are easy to miss:
+    os.path.islink has historically answered False for them on Windows, and
+    os.path.isdir answers True, so a junction looks exactly like a directory
+    to everything except the reparse attribute. Read the attribute.
+
+    A path that cannot be stat'ed answers True - unknown means do not touch.
+    """
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return True
+    attrs = getattr(st, "st_file_attributes", None)
+    if attrs is not None:
+        return bool(attrs & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+    return os.path.islink(path)         # POSIX, and the tests
+
+
+def _reset_children(path: str) -> bool:
+    r"""Make every existing child inherit the directory's ACL.
+
+    NEVER LEAVES THE TREE. This used to be one call:
+
+        icacls <dir>\* /reset /T /Q
+
+    /T is icacls's own recursion, and it follows reparse points. One junction
+    inside the project - a node_modules linked to a shared cache, a symlink
+    into Program Files, anything an agent could create while unelevated - and
+    an ELEVATED icacls resets ACLs on files that were never part of the
+    project. It runs during unprotect too, which is the moment a user is least
+    expecting anything to be damaged (finding #11, 2026-09-09).
+
+    A wildcard cannot exclude the link either: `<dir>\*` matches it, and icacls
+    follows it to the target. So the recursion is done here, where an entry can
+    be looked at before it is named to anything.
+
+    Two paths, because correctness must not cost every user a slow protect:
+
+      no reparse points anywhere   one icacls /T call, exactly as before, and
+                                   provably safe because there is nothing in
+                                   the tree for it to follow.
+
+      any reparse point            per directory, and inside a directory that
+                                   contains one, per entry - the only way to
+                                   name the children without naming the link.
+
+    Residual, stated rather than hidden: the scan and the icacls call are not
+    atomic. Closing that needs ACLs set through handles opened with
+    FILE_FLAG_OPEN_REPARSE_POINT, which is the hand-built-security-descriptor
+    route this module deliberately avoids. During protect the directory is
+    already locked before this runs, so the window is reachable only by a
+    process that is already Administrator. During unprotect it is not - by
+    then the project is being handed back, and the lock is going away anyway.
+
+    Skipped for an empty directory: `icacls <dir>\*` matches nothing there and
     reports a failure that means nothing went wrong.
     """
     try:
@@ -689,7 +743,62 @@ def _reset_children(path: str) -> bool:
             return True
     except OSError:
         return False
-    return _run([_ICACLS, os.path.join(path, "*"), "/reset", "/T", "/Q"])
+
+    if not _reparse_points_under(path):
+        return _run([_ICACLS, os.path.join(path, "*"), "/reset", "/T", "/Q"])
+
+    ok = True
+    stack = [path]
+    while stack:
+        here = stack.pop()
+        try:
+            names = os.listdir(here)
+        except OSError:
+            ok = False
+            continue
+        safe, links = [], []
+        for name in names:
+            child = os.path.join(here, name)
+            (links if _is_reparse_point(child) else safe).append(child)
+        if not safe:
+            continue
+        if links:
+            # The wildcard would match the links. Name the rest one by one.
+            for child in safe:
+                if not _run([_ICACLS, child, "/reset", "/Q"]):
+                    ok = False
+        elif not _run([_ICACLS, os.path.join(here, "*"), "/reset", "/Q"]):
+            ok = False
+        for child in safe:
+            if os.path.isdir(child):
+                stack.append(child)
+    return ok
+
+
+def _reparse_points_under(path: str) -> List[str]:
+    """Every junction or symlink in the tree, without following any of them.
+
+    Used to decide whether icacls's own /T can be trusted with this tree. It
+    is a full walk, which is far cheaper than one subprocess per directory -
+    and it is the walk the careful path would have to do anyway.
+    """
+    found: List[str] = []
+    stack = [path]
+    while stack:
+        here = stack.pop()
+        try:
+            names = os.listdir(here)
+        except OSError:
+            # Unreadable subtree: assume the worst rather than trust /T with it
+            found.append(here)
+            continue
+        for name in names:
+            child = os.path.join(here, name)
+            if _is_reparse_point(child):
+                found.append(child)
+            elif os.path.isdir(child):
+                stack.append(child)
+    return found
 
 
 def _run(args: List[str]) -> bool:
