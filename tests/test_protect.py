@@ -154,14 +154,45 @@ def test_a_failed_unlock_is_reported_not_swallowed(project, monkeypatch):
     """unprotect appended the "unlocked" line only on success and carried on
     otherwise, so a project came home still Administrators-only with its owner
     shut out and nothing in the output to explain it. Observed live on the
-    round-trip test 2026-08-25."""
+    round-trip test 2026-08-25.
+
+    is_locked IS STUBBED HERE, and it has to be. Without that this test read
+    the real ACL of a real temp directory, which answers None on Linux and
+    False on Windows - so it passed on Linux through the exit-code fallback
+    and failed on Windows, where the honest answer is that the directory is
+    not locked (2026-09-10). "The unlock command failed" and "the directory
+    is still locked" are different facts, and only the second one is worth
+    alarming the user about.
+    """
     monkeypatch.setattr(P, "is_elevated", lambda: True)
     monkeypatch.setattr(P, "unlock_directory", lambda _: False)
     monkeypatch.setattr(P, "lock_directory", lambda _: True)
+    monkeypatch.setattr(P, "is_locked", lambda _: True)      # it really is
     original = str(project)
     P.protect(P.plan_protect(original))
     steps = P.unprotect(P.plan_unprotect(original))
     assert any("COULD NOT UNLOCK" in s for s in steps)
+
+
+def test_an_unlock_command_that_failed_on_an_unlocked_directory_is_not_an_alarm(
+        project, monkeypatch):
+    """The other half. icacls can exit non-zero having had nothing to do -
+    unlocking a directory that was never locked, most obviously. Telling the
+    user their project is Administrators-only when the ACL says otherwise is
+    a false alarm about the one subject this tool must be exact on.
+
+    The filesystem is the authority. That is finding #14 pointed the other
+    way round, and it is why the exit code is only a FALLBACK.
+    """
+    monkeypatch.setattr(P, "is_elevated", lambda: True)
+    monkeypatch.setattr(P, "unlock_directory", lambda _: False)
+    monkeypatch.setattr(P, "lock_directory", lambda _: True)
+    monkeypatch.setattr(P, "is_locked", lambda _: False)     # it is not
+    original = str(project)
+    P.protect(P.plan_protect(original))
+    steps = P.unprotect(P.plan_unprotect(original))
+    assert not any("COULD NOT UNLOCK" in s for s in steps), steps
+    assert any(s.startswith("unlocked") for s in steps), steps
 
 
 def test_an_unelevated_unprotect_says_the_acl_was_left_alone(project, monkeypatch):
@@ -206,7 +237,14 @@ def test_unprotect_refuses_when_there_is_nothing_to_restore(tmp_path):
 # --------------------------------------------------------------------------
 
 @pytest.mark.skipif(os.name == "nt", reason="checks the non-Windows path")
+@pytest.mark.skipif(os.name == "nt", reason="these two WRITE an ACL on Windows")
 def test_locking_is_a_no_op_off_windows(tmp_path):
+    """The skipif is not tidiness. lock_directory and unlock_directory MUTATE
+    the directory they are given, and this one has no stub in front of it - so
+    on an elevated Windows run it was handing a real icacls a real temp
+    directory and asserting the result was False. It passed there, for a
+    reason I have not established; the point is that a test named
+    off_windows should not have been running on Windows to find out."""
     assert P.lock_directory(str(tmp_path)) is False
     assert P.unlock_directory(str(tmp_path)) is False
 
