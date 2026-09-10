@@ -230,6 +230,14 @@ def test_lock_state_is_read_by_counting_entries_not_by_naming_principals(monkeyp
     and would have called this UNLOCKED. Rights strings like (OI)(CI)(F) are
     not localised, so counting entries and checking their rights works in any
     language.
+
+    The name half of that is still true. The COUNTING half was proven wrong on
+    2026-09-10: the correct lock now carries a third ACE (OWNER RIGHTS,
+    *S-1-3-4) and an inherited ACE can push an unlocked directory to three, so
+    is_locked moves to naming SIDs - not principals, SIDs, which are not
+    localised either. This assertion survives that move: Administrateurs and
+    SYSTEM are present, the user is not, so the directory is locked under
+    either rule. Only the docstring's reason is superseded.
     """
     import subprocess
     path = r"C:\Users\pc\Desktop\lab\myproj.real"
@@ -238,7 +246,7 @@ def test_lock_state_is_read_by_counting_entries_not_by_naming_principals(monkeyp
            "\nSuccessfully processed 1 files; Failed processing 0 files\n")
 
     monkeypatch.setattr(P.os, "name", "nt")
-    monkeypatch.setattr(P.shutil, "which", lambda _: "icacls")
+    monkeypatch.setattr(P, "_icacls_present", lambda: True)
     monkeypatch.setattr(subprocess, "run",
                         lambda *a, **k: subprocess.CompletedProcess(a, 0, out, ""))
     assert P.is_locked(path) is True
@@ -252,7 +260,7 @@ def test_a_directory_the_user_can_still_reach_is_not_locked(monkeypatch):
            "                                    DESKTOP-1\\pc:(OI)(CI)(F)\n"
            "\nSuccessfully processed 1 files; Failed processing 0 files\n")
     monkeypatch.setattr(P.os, "name", "nt")
-    monkeypatch.setattr(P.shutil, "which", lambda _: "icacls")
+    monkeypatch.setattr(P, "_icacls_present", lambda: True)
     monkeypatch.setattr(subprocess, "run",
                         lambda *a, **k: subprocess.CompletedProcess(a, 0, out, ""))
     assert P.is_locked(path) is False

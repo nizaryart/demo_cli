@@ -59,6 +59,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import sys
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
@@ -70,6 +71,25 @@ from .fspassthrough import Backing
 # a hidden sibling elsewhere: whoever finds it should be able to tell instantly
 # what it belongs to, including a year from now with the tool uninstalled.
 BACKING_SUFFIX = ".real"
+
+# ABSOLUTE, NEVER A BARE NAME. CreateProcess resolves a bare image name with
+# the CURRENT DIRECTORY FIRST on Windows, and the elevated child starts in the
+# directory the user invoked from - which plan_protect's own refusal steers
+# them to, and which the unelevated agent can write. A planted icacls.exe
+# would then run as Administrator. shutil.which does not help: it finds the
+# planted copy too (2026-09-09).
+_ICACLS = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                       "System32", "icacls.exe")
+
+
+def _icacls_present() -> bool:
+    """Is the real icacls there? A named seam, not a bare isfile call.
+
+    Every gate used to be `shutil.which("icacls")`, which is exactly the
+    lookup this module must not do. One function so all four gates agree, and
+    so a test can say what it is simulating instead of patching os.path.
+    """
+    return os.path.isfile(_ICACLS)
 
 # Only these may touch the backing directory once it is locked. The guard runs
 # elevated and therefore qualifies; an ordinary agent process does not.
@@ -164,30 +184,53 @@ def rerun_elevated(args: List[str]) -> Optional[int]:
     kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE,
                                             ctypes.POINTER(wintypes.DWORD)]
 
-    exe = shutil.which("demo_cli")
+    # NO cmd.exe, AND NO PATH LOOKUP. Both were privilege escalations.
+    #
+    # It used to be `shutil.which("demo_cli")` launched through
+    # `cmd /c "<that> ... > log 2>&1"` under the runas verb. Three defects in
+    # those two lines, found by review 2026-09-09:
+    #
+    #   * shutil.which SEARCHES THE CURRENT DIRECTORY FIRST on Windows
+    #     (CPython: _win_path_needs_curdir -> path.insert(0, os.curdir)), and
+    #     plan_protect REFUSES to run from inside the project - so the user is
+    #     steered to the parent directory, which the unelevated agent can
+    #     write. Drop a demo_cli.exe there and it wins, then gets handed to
+    #     UAC. The tool's own refusal created the exposure.
+    #
+    #   * lpFile = "cmd.exe" is a bare image name, resolved against
+    #     lpDirectory - the same agent-writable directory - before PATH.
+    #
+    #   * list2cmdline IS NOT cmd QUOTING. It quotes for space and tab and
+    #     nothing else, so `&`, `|`, `%` and `<>` reached an elevated shell
+    #     live. _undo_argv forwards an agent-supplied id verbatim, so
+    #     `demo_cli undo "x&whatever"` turned a UAC prompt the user is trained
+    #     to approve into arbitrary elevated execution.
+    #
+    # sys.executable is absolute and comes from the running interpreter, not
+    # from a search path, so there is nothing to plant. Launching the child
+    # DIRECTLY means list2cmdline is used for what it is actually correct for
+    # - the CRT argv parsing the child itself will do - with no shell in
+    # between to reinterpret it.
+    exe, argv = _elevation_target(args)
     if not exe:
         return None
 
-    # RUN IT THROUGH cmd.exe WITH THE OUTPUT REDIRECTED.
-    #
-    # ShellExecute cannot redirect handles, and the elevated console closes the
-    # instant the process exits - so a failure produced nothing but "the
-    # elevated step failed", with the actual error already gone. Wrapping in
-    # `cmd /c "... > log 2>&1"` is the only way to keep it, and it is the same
-    # move the detached mount already needed for its [fs] lines.
-    log = os.path.join(tempfile.gettempdir(), "demo_cli-elevated.log")
-    try:
-        os.unlink(log)
-    except OSError:
-        pass
-    inner = subprocess.list2cmdline([exe] + list(args))
-    params = f'/c "{inner} > "{log}" 2>&1"'
+    # The child redirects its own output, because ShellExecute cannot. The
+    # file is created HERE with O_EXCL, so the elevated child opens something
+    # that already exists and is ours - a fixed, predictable, agent-writable
+    # path was a symlink-redirection target for arbitrary elevated file
+    # creation, and elevated_output() prints it back as if it were our own.
+    global _LAST_ELEVATED_LOG
+    fd, log = tempfile.mkstemp(prefix="demo_cli-elevated-", suffix=".log")
+    os.close(fd)
+    _LAST_ELEVATED_LOG = log
+    params = subprocess.list2cmdline(argv + ["--elevated-log", log])
 
     info = SHELLEXECUTEINFOW()
     info.cbSize = ctypes.sizeof(info)
     info.fMask = 0x00000040                      # SEE_MASK_NOCLOSEPROCESS
     info.lpVerb = "runas"                        # this is what prompts UAC
-    info.lpFile = "cmd.exe"
+    info.lpFile = exe
     info.lpParameters = params
     # THE CHILD DOES NOT INHERIT OUR WORKING DIRECTORY. With lpDirectory left
     # NULL an elevated process starts in C:\Windows\system32, so any argument
@@ -212,8 +255,38 @@ def rerun_elevated(args: List[str]) -> Optional[int]:
 
     kernel32.WaitForSingleObject(info.hProcess, 0xFFFFFFFF)
     code = wintypes.DWORD()
-    kernel32.GetExitCodeProcess(info.hProcess, ctypes.byref(code))
-    return int(code.value)
+    # CHECK THE RETURN VALUE. GetExitCodeProcess failing leaves the DWORD
+    # zero-initialised, and 0 is success - so a call that told us nothing
+    # reported that the elevated step worked. None means "we do not know",
+    # which every caller already handles.
+    ok = kernel32.GetExitCodeProcess(info.hProcess, ctypes.byref(code))
+    try:
+        kernel32.CloseHandle(info.hProcess)      # SEE_MASK_NOCLOSEPROCESS gave it to us
+    except Exception:
+        pass
+    return int(code.value) if ok else None
+
+
+# The log of the most recent elevated run. A per-run temp file rather than a
+# fixed name, so nothing can pre-create or symlink the path we are about to
+# write as Administrator.
+_LAST_ELEVATED_LOG: Optional[str] = None
+
+
+def _elevation_target(args: List[str]):
+    """(absolute image to launch, argv for it) - never resolved through PATH.
+
+    sys.executable is where this interpreter actually lives. Running the child
+    as `<python> -m demo_cli ...` means the elevated image is one we are
+    already executing, not one a search path chose for us.
+    """
+    exe = os.path.abspath(sys.executable)
+    if not os.path.isfile(exe):
+        return None, []
+    base = os.path.basename(exe).lower()
+    if base.startswith("demo_cli"):
+        return exe, list(args)          # a console-script shim: already us
+    return exe, ["-m", "demo_cli"] + list(args)
 
 
 def elevated_output() -> str:
@@ -222,12 +295,39 @@ def elevated_output() -> str:
     Without this a failure in the elevated half is completely opaque to the
     half that asked for it.
     """
-    log = os.path.join(tempfile.gettempdir(), "demo_cli-elevated.log")
+    log = _LAST_ELEVATED_LOG
+    if not log:
+        return ""
     try:
         with open(log, encoding="utf-8", errors="replace") as f:
             return f.read().strip()
     except OSError:
         return ""
+
+
+def _resolved(path: str) -> str:
+    r"""A path with links, 8.3 names and relative parts resolved away.
+
+    THE CONTAINMENT GUARDS COMPARED TEXT. os.path.commonpath normalises case
+    and separators and nothing else, so
+
+        commonpath(['C:\lab\MYPROJ~1\backing', 'C:\lab\myproject'])  ->  C:\lab
+
+    and `--backing C:\lab\MYPROJ~1\backing` sailed past "dest is inside
+    source; they must be separate" - leaving the mount storing its own
+    contents through itself. The same trick, or a junction, defeats the "you
+    are standing inside" check, which brings back the WinError 32 of
+    2026-08-28 from an ELEVATED process, after the UAC prompt (2026-09-09).
+
+    realpath resolves symlinks, junctions and 8.3 components on Windows; it is
+    the one call that makes two spellings of one directory compare equal.
+    Never raises - a path that cannot be resolved is compared as it was given,
+    which is no worse than before.
+    """
+    try:
+        return os.path.normcase(os.path.realpath(os.path.abspath(path)))
+    except OSError:
+        return os.path.normcase(os.path.abspath(path))
 
 
 def plan_protect(project: str, backing: Optional[str] = None,
@@ -256,7 +356,7 @@ def plan_protect(project: str, backing: Optional[str] = None,
     try:
         # The backing directory cannot live inside the project, or the mount
         # would be storing its own contents through itself.
-        if os.path.commonpath([dest, source]) == source:
+        if os.path.commonpath([_resolved(dest), _resolved(source)]) == _resolved(source):
             p.problems.append(f"{dest} is inside {source}; they must be separate.")
     except ValueError:
         pass                                    # different drives: fine
@@ -268,8 +368,9 @@ def plan_protect(project: str, backing: Optional[str] = None,
     # first the user knew of it was a traceback from an elevated process.
     # Observed 2026-08-28. Checked here so it costs a message, not a password.
     try:
-        here = os.path.abspath(os.getcwd())
-        if here == source or os.path.commonpath([here, source]) == source:
+        here = _resolved(os.getcwd())
+        if here == _resolved(source) or os.path.commonpath(
+                [here, _resolved(source)]) == _resolved(source):
             p.problems.append(
                 f"You are standing inside {source}. A process's current "
                 f"directory holds it open, so it cannot be moved. "
@@ -403,9 +504,9 @@ def lock_directory(path: str) -> bool:
     it. /reset is what restores an inherited ACL, and it is the only thing that
     can repair a file whose DACL is already empty.
     """
-    if os.name != "nt" or not shutil.which("icacls"):
+    if os.name != "nt" or not _icacls_present():
         return False
-    args = ["icacls", path, "/inheritance:r"]
+    args = [_ICACLS, path, "/inheritance:r"]
     for sid in _ACL_PRINCIPALS:
         args += ["/grant:r", f"{sid}:(OI)(CI)F"]
     if not _run(args):
@@ -425,11 +526,11 @@ def unlock_directory(path: str) -> bool:
     Order matters: re-enable inheritance first, so the /reset that follows has
     a parent ACL to inherit; then push the same down to the children.
     """
-    if os.name != "nt" or not shutil.which("icacls"):
+    if os.name != "nt" or not _icacls_present():
         return False
-    if not _run(["icacls", path, "/inheritance:e"]):
+    if not _run([_ICACLS, path, "/inheritance:e"]):
         return False
-    if not _run(["icacls", path, "/reset"]):
+    if not _run([_ICACLS, path, "/reset"]):
         return False
     return _reset_children(path)
 
@@ -445,7 +546,7 @@ def _reset_children(path: str) -> bool:
             return True
     except OSError:
         return False
-    return _run(["icacls", os.path.join(path, "*"), "/reset", "/T", "/Q"])
+    return _run([_ICACLS, os.path.join(path, "*"), "/reset", "/T", "/Q"])
 
 
 def _run(args: List[str]) -> bool:
@@ -479,10 +580,10 @@ def is_locked(path: str) -> Optional[bool]:
     know" and "it is open" are different answers, and doctor must not report
     the second when it means the first.
     """
-    if os.name != "nt" or not shutil.which("icacls"):
+    if os.name != "nt" or not _icacls_present():
         return None
     try:
-        r = subprocess.run(["icacls", path], capture_output=True, text=True, timeout=30)
+        r = subprocess.run([_ICACLS, path], capture_output=True, text=True, timeout=30)
         if r.returncode != 0:
             return None
     except Exception:

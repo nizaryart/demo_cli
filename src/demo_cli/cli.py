@@ -2280,6 +2280,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--version", action="version", version=f"demo_cli {__version__}")
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--no-color", action="store_true", help="disable coloured output")
+    # The elevated child writes its own output here. Not for users: it is how
+    # the parent recovers what happened on the other side of a UAC prompt,
+    # now that the elevation path no longer routes through `cmd /c ... > log`.
+    # See protect.rerun_elevated for why that shell wrapper had to go.
+    common.add_argument("--elevated-log", metavar="PATH", help=argparse.SUPPRESS)
     common.add_argument("--root", metavar="DIR",
                         help="project whose ledger to use, instead of resolving one "
                              "from the current directory. A filesystem guard mounted "
@@ -2503,6 +2508,20 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    # REDIRECT BEFORE ANYTHING PRINTS. ShellExecute cannot redirect handles,
+    # and the elevated console is launched hidden and closes with the process,
+    # so without this a failure on the far side of the UAC prompt arrives as a
+    # bare exit code with the actual error already gone. The parent used to
+    # get this by wrapping the child in `cmd /c "... > log 2>&1"`, which is
+    # what let shell metacharacters in an argument reach an elevated shell.
+    log = getattr(args, "elevated_log", None)
+    if log:
+        try:
+            sink = open(log, "a", encoding="utf-8", errors="replace", buffering=1)
+            sys.stdout = sink
+            sys.stderr = sink
+        except OSError:
+            pass                        # unwritable log: run anyway, silently
     if getattr(args, "no_color", False):
         render.set_color(False)
     if not getattr(args, "func", None):
