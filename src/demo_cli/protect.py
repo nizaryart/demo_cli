@@ -56,6 +56,8 @@ guard uninstalled, and says exactly what it will do first.
 """
 from __future__ import annotations
 
+import json
+import ntpath
 import os
 import re
 import shutil
@@ -74,7 +76,7 @@ try:
 except Exception:                       # pragma: no cover - ctypes is stdlib
     ctypes = None
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from .fspassthrough import Backing
 
@@ -482,6 +484,10 @@ def protect(plan: Plan) -> List[str]:
         raise ValueError("; ".join(plan.problems))
     done = []
     locked_before_move = False
+    # BEFORE THE LOCK, or there is nothing left to record: lock_directory
+    # gives every entry in the tree an explicit ACL of our own making, and
+    # from that moment the project's own permissions are gone (finding #12).
+    record = capture_custom_acls(plan.source) if plan.will_lock and is_elevated() else {}
     if plan.will_lock and is_elevated():
         lock_directory(plan.source)
         if is_locked(plan.source) is True:
@@ -514,6 +520,18 @@ def protect(plan: Plan) -> List[str]:
         state = is_locked(plan.backing)
         if state is True:
             done.append(f"locked {plan.backing} to Administrators and SYSTEM")
+            # Stored only now, into a directory that is already locked - so
+            # the file an elevated unprotect will act on never sits anywhere
+            # an ordinary process could rewrite it.
+            if record:
+                if write_acl_record(plan.backing, record):
+                    done.append(f"recorded the permissions of {len(record)} "
+                                f"entr{'y' if len(record) == 1 else 'ies'} that "
+                                f"had their own, to restore on unprotect")
+                else:
+                    done.append(f"COULD NOT RECORD the permissions of "
+                                f"{len(record)} entries; unprotect will restore "
+                                f"inherited defaults instead of what they had")
         elif state is False:
             done.append(f"COULD NOT LOCK {plan.backing} - it is writable by "
                         f"anything, so the guard can be bypassed")
@@ -592,6 +610,9 @@ def unprotect(plan: Plan) -> List[str]:
     # become "unlocked". An unverifiable claim falls back to the evidence
     # there is, never up to the claim there is not.
     if is_elevated():
+        # Read it before the unlock: /reset is about to overwrite the ACL of
+        # every entry the record names, including the record's own.
+        record, problem = read_acl_record(plan.source)
         ok = unlock_directory(plan.source)
         state = is_locked(plan.source)
         freed = (state is False) if state is not None else ok
@@ -601,6 +622,23 @@ def unprotect(plan: Plan) -> List[str]:
             done.append(f"COULD NOT UNLOCK {plan.source} - the restored "
                         f"project is still Administrators-only. Fix with: "
                         f"icacls <path> /inheritance:e ; icacls <path> /reset /T")
+        if problem:
+            done.append(problem)
+        elif record:
+            # AFTER the unlock. /reset would undo every one of these.
+            restored, failed = restore_custom_acls(plan.source, record)
+            if restored:
+                done.append(f"restored the permissions of {restored} "
+                            f"entr{'y' if restored == 1 else 'ies'}")
+            if failed:
+                done.append(f"COULD NOT RESTORE the permissions of "
+                            f"{len(failed)}: {', '.join(failed[:5])}"
+                            f"{' ...' if len(failed) > 5 else ''}")
+        if record is not None:
+            try:
+                os.unlink(os.path.join(plan.source, ACL_RECORD_NAME))
+            except OSError:
+                pass                    # never there, or already gone
     else:
         done.append("not elevated: the ACL was left as it is. If the backing "
                     "was locked, re-run this from an Administrator shell.")
@@ -994,6 +1032,271 @@ def _read_dacl(path: str) -> Optional[List[Ace]]:
                 kernel.LocalFree(psd)
     except Exception:
         return None                     # an unreadable ACL is not an open one
+
+
+# --------------------------------------------------------------------------
+# Permissions the project had before we touched it
+#
+# THE LOSS (finding #12). unlock_directory ends in `icacls /reset`, and /reset
+# does not restore the ACL that was there - it restores the parent's
+# INHERITABLE ACEs. Nothing else is possible, because nothing recorded what
+# was there.
+#
+# For an ordinary project those are the same thing and /reset is exactly
+# right. For a project with permissions of its own they are not, and the
+# difference always runs one way: WIDER. A directory reachable only by its
+# owner comes back reachable by Administrators and SYSTEM as well. A key file
+# readable by one account comes back inheriting the project default. Protect
+# then unprotect is advertised as a round trip, and quietly was not one.
+#
+# So record it. Only entries that HAVE permissions of their own - a protected
+# ACL, or any non-inherited ACE - which on a normal project is none of them,
+# so the normal project pays a tree walk and stores an empty record.
+#
+# The record lives INSIDE the locked backing. That is not tidiness: unprotect
+# applies it while elevated, so anything that can write the record can write
+# an ACL as Administrator. Inside the lock, that requires being Administrator
+# already. Paths in it are relative and re-checked for containment on the way
+# out, so a record that somehow lies still cannot name C:\Windows.
+# --------------------------------------------------------------------------
+
+ACL_RECORD_NAME = ".demo_cli-acl.json"
+
+_SDDL_REVISION_1 = 1
+_PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
+_UNPROTECTED_DACL_SECURITY_INFORMATION = 0x20000000
+_DACL_SECURITY_INFORMATION = 0x00000004
+_SE_FILE_OBJECT = 1
+
+
+def has_custom_acl(aces: Optional[List[Ace]]) -> bool:
+    """Does this entry carry permissions of its own? Pure, so it is testable.
+
+    An inherited ACE is reproduced exactly by /reset, so it needs no record.
+    Anything else does: a non-inherited ACE, or an empty DACL, which is a
+    deliberate "nobody" that /reset would silently turn into "whatever the
+    parent says".
+
+    None - the ACL could not be read - is False. We cannot record what we
+    cannot read, and claiming otherwise would put a hole in the record rather
+    than in the answer.
+    """
+    if aces is None:
+        return False
+    if not aces:
+        return True
+    return any(not a.inherited for a in aces)
+
+
+def _sddl_of(path: str) -> Optional[str]:
+    """This entry's DACL as an SDDL string, or None.
+
+    SDDL rather than a hand-built descriptor: it is Windows' own round-trip
+    format, it carries the protected/auto-inherited flags in the same string,
+    and what goes back is what came out of this very directory - never
+    something this module composed.
+    """
+    if os.name != "nt" or ctypes is None:
+        return None
+    try:
+        advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        advapi.GetNamedSecurityInfoW.restype = ctypes.c_ulong
+
+        psd = ctypes.c_void_p()
+        err = advapi.GetNamedSecurityInfoW(
+            ctypes.c_wchar_p(path), _SE_FILE_OBJECT, _DACL_SECURITY_INFORMATION,
+            None, None, None, None, ctypes.byref(psd))
+        if err != 0 or not psd:
+            return None
+        try:
+            out = ctypes.c_void_p()
+            if not advapi.ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                    psd, _SDDL_REVISION_1, _DACL_SECURITY_INFORMATION,
+                    ctypes.byref(out), None):
+                return None
+            try:
+                return ctypes.wstring_at(out.value)
+            finally:
+                kernel.LocalFree(out)
+        finally:
+            kernel.LocalFree(psd)
+    except Exception:
+        return None
+
+
+def _sddl_is_protected(sddl: str) -> bool:
+    """Does this SDDL disable inheritance? The flags sit between "D:" and the
+    first ACE, and "P" among them is what icacls calls /inheritance:r.
+
+    Read here rather than assumed, because restoring a protected ACL as
+    unprotected would let the parent's ACEs back in - which is the exact loss
+    this whole record exists to prevent.
+    """
+    head = sddl.split("D:", 1)[-1].split("(", 1)[0] if "D:" in sddl else ""
+    return "P" in head.replace("AI", "").replace("AR", "")
+
+
+def _apply_sddl(path: str, sddl: str) -> bool:
+    """Put a recorded DACL back. True only if Windows says it took."""
+    if os.name != "nt" or ctypes is None:
+        return False
+    try:
+        advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        advapi.SetNamedSecurityInfoW.restype = ctypes.c_ulong
+
+        psd = ctypes.c_void_p()
+        if not advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                ctypes.c_wchar_p(sddl), _SDDL_REVISION_1,
+                ctypes.byref(psd), None):
+            return False
+        try:
+            present = ctypes.c_int()
+            pdacl = ctypes.c_void_p()
+            defaulted = ctypes.c_int()
+            if not advapi.GetSecurityDescriptorDacl(
+                    psd, ctypes.byref(present), ctypes.byref(pdacl),
+                    ctypes.byref(defaulted)):
+                return False
+            if not present.value:
+                return False
+            info = _DACL_SECURITY_INFORMATION | (
+                _PROTECTED_DACL_SECURITY_INFORMATION if _sddl_is_protected(sddl)
+                else _UNPROTECTED_DACL_SECURITY_INFORMATION)
+            err = advapi.SetNamedSecurityInfoW(
+                ctypes.c_wchar_p(path), _SE_FILE_OBJECT, ctypes.c_ulong(info),
+                None, None, pdacl, None)
+            return err == 0
+        finally:
+            kernel.LocalFree(psd)
+    except Exception:
+        return False
+
+
+def safe_member(root: str, rel: str) -> Optional[str]:
+    r"""Resolve one recorded path, or None if it does not stay inside root.
+
+    Pure enough to test anywhere, and the reason a lying record is only a
+    lying record. unprotect applies these while elevated, so a `..\..\Windows`
+    or an absolute path or a junction planted mid-tree would each be an
+    arbitrary ACL write as Administrator. realpath collapses all three into
+    the same question - does it still land under root - which is the same
+    check plan_protect uses for --backing (finding #13).
+    """
+    if not rel or os.path.isabs(rel) or ntpath.isabs(rel):
+        return None
+    full = os.path.join(root, rel)
+    base = _resolved(root)
+    here = _resolved(full)
+    if here == base:
+        return None                     # the root itself is not a member
+    try:
+        if os.path.commonpath([here, base]) != base:
+            return None
+    except ValueError:
+        return None                     # different drives
+    return full
+
+
+def capture_custom_acls(root: str) -> Dict[str, str]:
+    """{relative path: SDDL} for every entry with permissions of its own.
+
+    Never descends into a reparse point and never records one: a junction's
+    ACL belongs to its target, which is not part of this project (finding
+    #11). Entries whose ACL cannot be read are skipped rather than guessed
+    at - a record with a hole in it is better than a record with a lie in it.
+    """
+    out: Dict[str, str] = {}
+    # No os.name guard. _read_dacl already answers None off Windows, so the
+    # walk finds nothing there anyway - and an early return would have made
+    # this entire function unreachable on the machine the tests run on.
+    stack = [root]
+    while stack:
+        here = stack.pop()
+        try:
+            names = os.listdir(here)
+        except OSError:
+            continue
+        for name in names:
+            child = os.path.join(here, name)
+            if _is_reparse_point(child):
+                continue
+            if has_custom_acl(_read_dacl(child)):
+                sddl = _sddl_of(child)
+                if sddl:
+                    out[os.path.relpath(child, root)] = sddl
+            if os.path.isdir(child):
+                stack.append(child)
+    return out
+
+
+def write_acl_record(root: str, record: Dict[str, str]) -> bool:
+    """Store the record at the top of a directory that is ALREADY LOCKED.
+
+    O_EXCL after an unlink, not open(path, "w"). A pre-planted symlink at this
+    path would otherwise let an elevated process truncate whatever it points
+    at - the same defect as the fixed elevated-log path in finding #8, and it
+    would be careless to earn it twice.
+    """
+    path = os.path.join(root, ACL_RECORD_NAME)
+    try:
+        os.unlink(path)                 # removes a symlink, not its target
+    except OSError:
+        pass
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({"version": 1, "acls": record}, f, indent=1)
+        return True
+    except OSError:
+        return False
+
+
+def read_acl_record(root: str) -> Tuple[Optional[Dict[str, str]], str]:
+    """(record, problem). A missing record is (None, "") - the ordinary case
+    for a project protected before this existed, and not something to report.
+    A record that is there and unusable IS reported: silently falling back to
+    /reset is how permissions went missing without anyone noticing.
+    """
+    path = os.path.join(root, ACL_RECORD_NAME)
+    if not os.path.exists(path):
+        return None, ""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        acls = data["acls"]
+        if not isinstance(acls, dict):
+            raise ValueError("acls is not an object")
+        return {str(k): str(v) for k, v in acls.items()}, ""
+    except Exception as exc:
+        return None, (f"{path} could not be read ({exc}); the permissions this "
+                      f"project had before it was protected were NOT restored")
+
+
+def restore_custom_acls(root: str, record: Dict[str, str]) -> Tuple[int, List[str]]:
+    """Re-apply the record. Returns (restored, entries that failed).
+
+    An entry that no longer exists is not a failure - files change while a
+    project is protected, and there is nothing to restore a permission onto.
+    An entry that will not stay inside root IS dropped and reported.
+    """
+    done, failed = 0, []
+    for rel, sddl in sorted(record.items()):
+        full = safe_member(root, rel)
+        if full is None:
+            failed.append(f"{rel} (refused: outside the project)")
+            continue
+        if not os.path.lexists(full):
+            continue
+        if _is_reparse_point(full):
+            failed.append(f"{rel} (refused: became a link)")
+            continue
+        if _apply_sddl(full, sddl):
+            done += 1
+        else:
+            failed.append(rel)
+    return done, failed
 
 
 def is_locked(path: str) -> Optional[bool]:
