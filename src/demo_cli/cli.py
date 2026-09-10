@@ -1941,23 +1941,38 @@ def cmd_protect(a) -> int:
             #
             # So do not relay, and do not trust the exit code either: ask the
             # filesystem. The parent can read an ACL without elevation.
-            if protect_mod.is_locked(relock) is True:
+            state = protect_mod.is_locked(relock)
+            if state is True:
                 print("  " + render.c(f"locked {relock} to Administrators and SYSTEM", "green"))
                 print("  " + render.c("no files were moved.", "dim") + "\n")
                 return 0
-            print("  " + render.c(f"the elevated step exited {rc}, but {relock} is "
-                                  f"still not locked", "red") + "\n")
+            # None is not False. The whole reason this branch reads the ACL
+            # instead of the exit code is that "I do not know" must not be
+            # printed as an outcome - so it is not printed as the OTHER
+            # outcome either.
+            if state is False:
+                print("  " + render.c(f"the elevated step exited {rc}, but {relock} is "
+                                      f"still not locked", "red") + "\n")
+            else:
+                print("  " + render.c(f"the elevated step exited {rc}, and the ACL on "
+                                      f"{relock} could not be read - whether it is "
+                                      f"locked is unknown", "yellow") + "\n")
             return 1
         protect_mod.lock_directory(relock)
         # Believe is_locked, not lock_directory's return value. icacls has
         # exited 0 on a failed grant before (see protect.lock_directory), and
         # this project's rule is that a claim of protection needs evidence.
-        if protect_mod.is_locked(relock) is True:
+        state = protect_mod.is_locked(relock)
+        if state is True:
             print("  " + render.c(f"locked {relock} to Administrators and SYSTEM", "green"))
             print("  " + render.c("no files were moved.", "dim") + "\n")
             return 0
-        print("  " + render.c(f"COULD NOT LOCK {relock} - it is still writable, "
-                              f"so the guard can be bypassed", "red") + "\n")
+        if state is False:
+            print("  " + render.c(f"COULD NOT LOCK {relock} - it is still writable, "
+                                  f"so the guard can be bypassed", "red") + "\n")
+        else:
+            print("  " + render.c(f"COULD NOT VERIFY THE LOCK on {relock} - its ACL "
+                                  f"could not be read", "yellow") + "\n")
         return 1
 
     plan = protect_mod.plan_protect(a.project, getattr(a, "backing", None),

@@ -218,52 +218,128 @@ def test_lock_state_is_unknown_rather_than_false_off_windows(tmp_path):
     assert P.is_locked(str(tmp_path)) is None
 
 
-def test_lock_state_is_read_by_counting_entries_not_by_naming_principals(monkeypatch):
-    """Parsing icacls by principal NAME is wrong on any localised Windows.
+def test_the_french_machine_that_broke_name_matching_needs_no_special_case():
+    """The bug that started all of this, and why it cannot recur.
 
-    The real output from the development machine, which is French:
+    is_locked's first version looked for "BUILTIN\\Users" and $USERNAME. The
+    development machine is French and reports "BUILTIN\\Administrateurs", so
+    that version called a locked directory UNLOCKED.
 
-        C:\\...\\myproj.real BUILTIN\\Administrateurs:(OI)(CI)(F)
-                             NT AUTHORITY\\SYSTEM:(OI)(CI)(F)
+    Its replacement counted entries and matched rights strings, on the correct
+    observation that "(OI)(CI)(F)" is not localised. That was still reading a
+    RENDERING of the ACL, and it broke three ways (see judge_lock).
 
-    The first version of is_locked looked for "BUILTIN\\Users" and $USERNAME
-    and would have called this UNLOCKED. Rights strings like (OI)(CI)(F) are
-    not localised, so counting entries and checking their rights works in any
-    language.
-
-    The name half of that is still true. The COUNTING half was proven wrong on
-    2026-09-10: the correct lock now carries a third ACE (OWNER RIGHTS,
-    *S-1-3-4) and an inherited ACE can push an unlocked directory to three, so
-    is_locked moves to naming SIDs - not principals, SIDs, which are not
-    localised either. This assertion survives that move: Administrateurs and
-    SYSTEM are present, the user is not, so the directory is locked under
-    either rule. Only the docstring's reason is superseded.
+    The check now names SIDs, which no locale renames - so this test needs no
+    French fixture at all. There is nothing left for a language to change.
     """
-    import subprocess
-    path = r"C:\Users\pc\Desktop\lab\myproj.real"
-    out = (f"{path} BUILTIN\\Administrateurs:(OI)(CI)(F)\n"
-           "                                    NT AUTHORITY\\SYSTEM:(OI)(CI)(F)\n"
-           "\nSuccessfully processed 1 files; Failed processing 0 files\n")
-
-    monkeypatch.setattr(P.os, "name", "nt")
-    monkeypatch.setattr(P, "_icacls_present", lambda: True)
-    monkeypatch.setattr(subprocess, "run",
-                        lambda *a, **k: subprocess.CompletedProcess(a, 0, out, ""))
-    assert P.is_locked(path) is True
+    aces = [P.Ace(P.SYSTEM_SID, True, P._FULL_CONTROL, P._OI | P._CI),
+            P.Ace(P.ADMINS_SID, True, P._FULL_CONTROL, P._OI | P._CI),
+            P.Ace(P.OWNER_RIGHTS_SID, True, P._READ_CONTROL, P._OI | P._CI)]
+    assert P.judge_lock(aces) is True
 
 
-def test_a_directory_the_user_can_still_reach_is_not_locked(monkeypatch):
-    import subprocess
-    path = r"C:\Users\pc\Desktop\lab\myproj.real"
-    out = (f"{path} BUILTIN\\Administrateurs:(OI)(CI)(F)\n"
-           "                                    NT AUTHORITY\\SYSTEM:(OI)(CI)(F)\n"
-           "                                    DESKTOP-1\\pc:(OI)(CI)(F)\n"
-           "\nSuccessfully processed 1 files; Failed processing 0 files\n")
-    monkeypatch.setattr(P.os, "name", "nt")
-    monkeypatch.setattr(P, "_icacls_present", lambda: True)
-    monkeypatch.setattr(subprocess, "run",
-                        lambda *a, **k: subprocess.CompletedProcess(a, 0, out, ""))
-    assert P.is_locked(path) is False
+def test_the_lock_this_tool_used_to_apply_is_not_a_lock():
+    """Two ACEs, exactly as shipped until 2026-09-10. On hardware, unelevated:
+
+        icacls ptest.real /grant "pc:(OI)(CI)F"  ->  Successfully processed 1
+        cmd /c move ptest.real gone.real         ->  1 dir(s) moved
+
+    os.rename preserves ownership, and an owner holds WRITE_DAC implicitly.
+    Without the OWNER RIGHTS entry to override it, removing every ACE removes
+    nothing - so this must read as unlocked, not as a lock of an older shape.
+    """
+    aces = [P.Ace(P.SYSTEM_SID, True, P._FULL_CONTROL, P._OI | P._CI),
+            P.Ace(P.ADMINS_SID, True, P._FULL_CONTROL, P._OI | P._CI)]
+    assert P.judge_lock(aces) is False
+
+
+def test_a_directory_the_user_can_still_reach_is_not_locked():
+    aces = [P.Ace(P.SYSTEM_SID, True, P._FULL_CONTROL, P._OI | P._CI),
+            P.Ace(P.ADMINS_SID, True, P._FULL_CONTROL, P._OI | P._CI),
+            P.Ace(P.OWNER_RIGHTS_SID, True, P._READ_CONTROL, P._OI | P._CI),
+            P.Ace("S-1-5-21-1-2-3-1001", True, P._FULL_CONTROL, P._OI | P._CI)]
+    assert P.judge_lock(aces) is False
+
+
+def test_an_entry_inherited_from_the_parent_still_grants_access():
+    """The count-based check asked how MANY entries there were. An inherited
+    one made an open directory reach the expected number."""
+    # Otherwise correct, INCLUDING owner rights - so only the inherited entry
+    # can be what makes this False. Without that the test would still pass
+    # with the outsider rule deleted.
+    aces = [P.Ace(P.SYSTEM_SID, True, P._FULL_CONTROL, P._OI | P._CI),
+            P.Ace(P.ADMINS_SID, True, P._FULL_CONTROL, P._OI | P._CI),
+            P.Ace(P.OWNER_RIGHTS_SID, True, P._READ_CONTROL, P._OI | P._CI),
+            P.Ace("S-1-5-32-545", True, P._FULL_CONTROL,       # BUILTIN\Users
+                  P._OI | P._CI | P._INHERITED, inherited=True)]
+    assert P.judge_lock(aces) is False
+
+
+def test_a_deny_entry_is_not_read_as_the_grant_it_contains():
+    """icacls prints a deny as `(DENY)(OI)(CI)(F)`, which CONTAINS the exact
+    substring the old check searched for. A directory denied to everybody read
+    as locked. Masks and an ACE type cannot be confused that way."""
+    aces = [P.Ace(P.SYSTEM_SID, False, P._FULL_CONTROL, P._OI | P._CI),
+            P.Ace(P.ADMINS_SID, False, P._FULL_CONTROL, P._OI | P._CI),
+            P.Ace(P.OWNER_RIGHTS_SID, True, P._READ_CONTROL, P._OI | P._CI)]
+    assert P.judge_lock(aces) is False
+
+
+def test_owner_rights_granted_more_than_read_control_is_worse_than_absent():
+    """(RC) is the entire point: it REPLACES the owner's implicit rights. An
+    OWNER RIGHTS entry granting full control hands them back explicitly."""
+    aces = [P.Ace(P.SYSTEM_SID, True, P._FULL_CONTROL, P._OI | P._CI),
+            P.Ace(P.ADMINS_SID, True, P._FULL_CONTROL, P._OI | P._CI),
+            P.Ace(P.OWNER_RIGHTS_SID, True, P._FULL_CONTROL, P._OI | P._CI)]
+    assert P.judge_lock(aces) is False
+
+
+def test_a_grant_children_do_not_inherit_is_not_a_lock():
+    """lock_directory grants on the directory and RESETS the children so they
+    inherit it. Without (OI)(CI) the children inherit nothing and are left
+    with the empty DACL of 2026-08-25 - unreadable by anyone at all."""
+    aces = [P.Ace(P.SYSTEM_SID, True, P._FULL_CONTROL, 0),
+            P.Ace(P.ADMINS_SID, True, P._FULL_CONTROL, 0),
+            P.Ace(P.OWNER_RIGHTS_SID, True, P._READ_CONTROL, 0)]
+    assert P.judge_lock(aces) is False
+
+
+def test_an_inherit_only_entry_does_not_lock_the_directory_it_sits_on():
+    """INHERIT_ONLY seeds children and grants nothing here, so it can neither
+    lock nor unlock the thing being judged."""
+    locked = [P.Ace(P.SYSTEM_SID, True, P._FULL_CONTROL, P._OI | P._CI),
+              P.Ace(P.ADMINS_SID, True, P._FULL_CONTROL, P._OI | P._CI),
+              P.Ace(P.OWNER_RIGHTS_SID, True, P._READ_CONTROL, P._OI | P._CI)]
+    intruder = P.Ace("S-1-5-21-1-2-3-1001", True, P._FULL_CONTROL,
+                     P._OI | P._CI | P._INHERIT_ONLY)
+    assert P.judge_lock(locked + [intruder]) is True
+
+
+def test_full_control_spelled_as_generic_all_is_still_full_control():
+    aces = [P.Ace(P.SYSTEM_SID, True, P._GENERIC_ALL, P._OI | P._CI),
+            P.Ace(P.ADMINS_SID, True, P._GENERIC_ALL, P._OI | P._CI),
+            P.Ace(P.OWNER_RIGHTS_SID, True, P._READ_CONTROL, P._OI | P._CI)]
+    assert P.judge_lock(aces) is True
+
+
+def test_an_empty_dacl_is_not_a_lock():
+    """Nobody can reach it, including the guard. That is the directory of
+    2026-08-25 that only takeown recovered, and it needs attention, not a
+    green line."""
+    assert P.judge_lock([]) is False
+
+
+def test_a_dacl_that_could_not_be_read_is_unknown_not_open():
+    assert P.judge_lock(None) is None
+
+
+def test_the_lock_is_three_entries_and_the_third_is_owner_rights():
+    """Pins the shape lock_directory applies against the shape judge_lock
+    demands, so the two cannot drift apart."""
+    assert [sid for sid, _ in P._LOCK_ACL] == [P.SYSTEM_SID, P.ADMINS_SID,
+                                               P.OWNER_RIGHTS_SID]
+    assert dict(P._LOCK_ACL)[P.OWNER_RIGHTS_SID] == "(OI)(CI)(RC)"
+    assert P.OWNER_RIGHTS_SID == "S-1-3-4"
 
 
 def test_icacls_reporting_failures_is_not_a_success(monkeypatch):

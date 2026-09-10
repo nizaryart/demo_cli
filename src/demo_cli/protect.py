@@ -62,6 +62,16 @@ import shutil
 import sys
 import subprocess
 import tempfile
+
+try:
+    # AT MODULE SCOPE ON PURPOSE. Imported lazily inside _read_dacl, this
+    # picks its platform branch from os.name AT CALL TIME - and a test that
+    # sets os.name to "nt" to exercise a Windows path then made ctypes import
+    # its Windows half on Linux, which fails on `from _ctypes import
+    # FormatError`. Importing here binds it once, from the real platform.
+    import ctypes
+except Exception:                       # pragma: no cover - ctypes is stdlib
+    ctypes = None
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -93,11 +103,47 @@ def _icacls_present() -> bool:
 
 # Only these may touch the backing directory once it is locked. The guard runs
 # elevated and therefore qualifies; an ordinary agent process does not.
-_ACL_PRINCIPALS = ["*S-1-5-18",         # SYSTEM
-                   "*S-1-5-32-544"]     # Administrators
 # SIDs rather than names, because "Administrators" is localised - on a French
 # or Arabic Windows the name differs and icacls would fail with a message
 # nobody would connect to a locale.
+SYSTEM_SID = "S-1-5-18"
+ADMINS_SID = "S-1-5-32-544"
+
+# OWNER RIGHTS. THE THIRD ACE, AND THE ONLY REASON THE LOCK WORKS AT ALL.
+#
+# For three weeks this module granted the backing directory to SYSTEM and
+# Administrators and called it locked. On 2026-09-10, on the development
+# machine, with the lock applied and no elevation:
+#
+#     icacls ptest.real /grant "pc:(OI)(CI)F"  ->  Successfully processed 1
+#     Get-ChildItem ptest.real                 ->  f.txt
+#     cmd /c move ptest.real gone.real         ->  1 dir(s) moved
+#
+# No UAC prompt. The reason is that os.rename PRESERVES OWNERSHIP: the user
+# still owned the directory after protect ran, and an owner holds READ_CONTROL
+# and WRITE_DAC IMPLICITLY - not through any ACE, so removing every ACE
+# removes nothing. The owner simply grants themselves back in.
+#
+# S-1-3-4 is the OWNER RIGHTS SID, and an explicit ACE for it REPLACES that
+# implicit grant with whatever the ACE says. (RC) says "read the ACL, nothing
+# else", which is exactly the residue needed: is_locked keeps working from an
+# unelevated shell, and the owner can no longer re-grant or move the
+# directory. Verified on hardware, all four outcomes:
+#
+#     read files DENIED / grant DENIED / read ACL OK / move DENIED
+#
+# Rejected: /setowner to Administrators (ownership churn, and unprotect then
+# cannot give it back to a user it no longer knows) and /deny (which bricked
+# the directory outright - only `takeown /F <d> /R /A` recovered it).
+OWNER_RIGHTS_SID = "S-1-3-4"
+
+# (sid, icacls rights) - the whole definition of a locked directory, in the
+# order icacls is asked to apply it.
+_LOCK_ACL = [(SYSTEM_SID, "(OI)(CI)F"),
+             (ADMINS_SID, "(OI)(CI)F"),
+             (OWNER_RIGHTS_SID, "(OI)(CI)(RC)")]
+
+_ACL_PRINCIPALS = [f"*{sid}" for sid, _ in _LOCK_ACL]
 
 
 @dataclass
@@ -403,11 +449,24 @@ def protect(plan: Plan) -> List[str]:
     done = [f"moved {plan.source} -> {plan.backing}"]
     Backing.relocate(plan.source, plan.backing)
     if plan.will_lock and is_elevated():
-        if lock_directory(plan.backing):
+        # ASK THE FILESYSTEM, NOT THE COMMAND. lock_directory returning True
+        # means icacls exited 0 and admitted no failures - and icacls has
+        # exited 0 on a grant it did not apply before (see lock_directory's
+        # own docstring, 2026-08-25). A claim of protection is the one thing
+        # in this tool that must never rest on a tool's self-report, so the
+        # DACL is read back and judged. cli.py's relock branch already did
+        # this; protect() was still taking icacls at its word.
+        lock_directory(plan.backing)
+        state = is_locked(plan.backing)
+        if state is True:
             done.append(f"locked {plan.backing} to Administrators and SYSTEM")
-        else:
+        elif state is False:
             done.append(f"COULD NOT LOCK {plan.backing} - it is writable by "
                         f"anything, so the guard can be bypassed")
+        else:
+            done.append(f"COULD NOT VERIFY THE LOCK on {plan.backing} - its "
+                        f"ACL could not be read, so whether the guard can be "
+                        f"bypassed is unknown")
     return done
 
 
@@ -507,8 +566,8 @@ def lock_directory(path: str) -> bool:
     if os.name != "nt" or not _icacls_present():
         return False
     args = [_ICACLS, path, "/inheritance:r"]
-    for sid in _ACL_PRINCIPALS:
-        args += ["/grant:r", f"{sid}:(OI)(CI)F"]
+    for sid, rights in _LOCK_ACL:
+        args += ["/grant:r", f"*{sid}:{rights}"]
     if not _run(args):
         return False
     return _reset_children(path)
@@ -525,6 +584,12 @@ def unlock_directory(path: str) -> bool:
 
     Order matters: re-enable inheritance first, so the /reset that follows has
     a parent ACL to inherit; then push the same down to the children.
+
+    The OWNER RIGHTS entry needs no separate removal: it is an EXPLICIT ACE,
+    and /reset replaces the whole explicit ACL with the inherited one. Worth
+    stating because it is the one entry whose absence is invisible - a
+    directory that still caps its owner's rights after unprotect would look
+    completely normal until the owner tried to change its permissions.
     """
     if os.name != "nt" or not _icacls_present():
         return False
@@ -573,41 +638,182 @@ def _run(args: List[str]) -> bool:
     return not (m and int(m.group(1)) > 0)
 
 
+# Access mask and ACE flag bits, from winnt.h. Named here so the rules below
+# read as rules and not as hexadecimal.
+_FULL_CONTROL = 0x001F01FF          # FILE_ALL_ACCESS - what icacls calls (F)
+_GENERIC_ALL  = 0x10000000
+_READ_CONTROL = 0x00020000          # (RC) - read the ACL, and nothing else
+_SYNCHRONIZE  = 0x00100000          # harmless, and often set alongside
+_OI           = 0x01                # OBJECT_INHERIT_ACE    - files inherit
+_CI           = 0x02                # CONTAINER_INHERIT_ACE - subdirs inherit
+_INHERIT_ONLY = 0x08                # does NOT apply to this object
+_INHERITED    = 0x10                # came from the parent
+EVERYONE_SID  = "S-1-1-0"
+
+
+@dataclass(frozen=True)
+class Ace:
+    """One access-control entry, as the kernel stores it - not as icacls
+    prints it. `sid` is the canonical SID string, which is the same on every
+    Windows in every language."""
+    sid: str
+    allow: bool                     # False == a deny entry
+    mask: int
+    flags: int
+    inherited: bool = False
+
+
+def judge_lock(aces: Optional[List[Ace]]) -> Optional[bool]:
+    """Is this DACL a working lock? True / False / None, and nothing else.
+
+    PURE, so the whole rule set is testable off Windows - the probe that reads
+    a real DACL is twelve lines below and does no judging. Same split as
+    deps.py.
+
+    WHY THIS REPLACED COUNTING. The previous version counted entries and
+    checked their rights string, on the reasoning that "(OI)(CI)(F)" is not
+    localised while "BUILTIN\\Administrateurs" is. The reasoning was right and
+    the implementation was not:
+
+      * the correct lock now has THREE entries, so `len(aces) == 2` calls it
+        broken (2026-09-10);
+      * an entry inherited from the parent pushes the count up, so an OPEN
+        directory could reach the expected number;
+      * `"(OI)(CI)(F)" in line` is a substring test, and a DENY entry prints
+        as `(DENY)(OI)(CI)(F)` - which contains it. A directory denied to
+        everybody read as locked.
+
+    All three come from reading a rendering of the ACL instead of the ACL.
+    SIDs are not localised either, and they are what the check now names.
+
+    The rules, in order:
+
+      1. Nobody outside the three lock principals may be ALLOWED anything.
+         Conservative: a deny entry elsewhere might override such an allow,
+         and this still answers False. Understating protection is the safe
+         direction for this particular claim.
+      2. Administrators and SYSTEM must hold full control, INHERITABLE by both
+         files and subdirectories - the children were reset to inherit, so an
+         entry without (OI)(CI) leaves them with an empty DACL.
+      3. OWNER RIGHTS must be present, and must grant READ_CONTROL AND NOTHING
+         MORE. Absent, the owner keeps the implicit WRITE_DAC that made the
+         first three weeks of this feature a no-op. Granting it more than (RC)
+         would be worse than not granting it at all.
+
+    False means "not a working lock", which includes the directory denied to
+    everyone - that one is not writable, but the guard cannot use it either,
+    and it needs the same attention.
+    """
+    if aces is None:
+        return None
+
+    lock_sids = {sid for sid, _ in _LOCK_ACL}
+    # An INHERIT_ONLY entry does not apply to this directory at all; it only
+    # seeds children. It cannot lock or unlock the thing being judged.
+    live = [a for a in aces if not (a.flags & _INHERIT_ONLY)]
+
+    for a in live:
+        if a.allow and a.mask and a.sid not in lock_sids:
+            return False                                    # rule 1
+        if not a.allow and a.mask and a.sid in (SYSTEM_SID, ADMINS_SID):
+            return False                                    # denied to the guard
+
+    def _granted(sid: str) -> int:
+        """Everything allowed to this SID by an entry children also inherit."""
+        m = 0
+        for a in live:
+            if a.allow and a.sid == sid and (a.flags & _OI) and (a.flags & _CI):
+                m |= a.mask
+        return m
+
+    for sid in (SYSTEM_SID, ADMINS_SID):                    # rule 2
+        m = _granted(sid)
+        if not (m & _GENERIC_ALL or m & _FULL_CONTROL == _FULL_CONTROL):
+            return False
+
+    owner = _granted(OWNER_RIGHTS_SID)                      # rule 3
+    if not owner & _READ_CONTROL:
+        return False
+    if owner & ~(_READ_CONTROL | _SYNCHRONIZE):
+        return False
+
+    return True
+
+
+def _read_dacl(path: str) -> Optional[List[Ace]]:
+    """The directory's DACL, or None if it cannot be read.
+
+    GetNamedSecurityInfoW rather than parsing `icacls <path>`, because the
+    text output names principals in the console's language and flattens an
+    access mask into a rights string. This returns the SIDs and the masks
+    themselves. It needs no elevation - reading an ACL is READ_CONTROL, which
+    the lock deliberately leaves in place.
+    """
+    if os.name != "nt" or ctypes is None:
+        return None
+
+    class _Acl(ctypes.Structure):
+        _fields_ = [("AclRevision", ctypes.c_ubyte), ("Sbz1", ctypes.c_ubyte),
+                    ("AclSize", ctypes.c_ushort), ("AceCount", ctypes.c_ushort),
+                    ("Sbz2", ctypes.c_ushort)]
+
+    class _AceHeader(ctypes.Structure):
+        _fields_ = [("AceType", ctypes.c_ubyte), ("AceFlags", ctypes.c_ubyte),
+                    ("AceSize", ctypes.c_ushort)]
+
+    try:
+        advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        advapi.GetNamedSecurityInfoW.restype = ctypes.c_ulong
+
+        pdacl = ctypes.c_void_p()
+        psd = ctypes.c_void_p()
+        SE_FILE_OBJECT, DACL_SECURITY_INFORMATION = 1, 0x00000004
+        err = advapi.GetNamedSecurityInfoW(
+            ctypes.c_wchar_p(path), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+            None, None, ctypes.byref(pdacl), None, ctypes.byref(psd))
+        if err != 0:
+            return None
+        try:
+            if not pdacl:
+                # A NULL DACL IS NOT AN EMPTY ONE. It grants everyone full
+                # access, and reporting that as "no entries" would read as a
+                # lock so tight nothing is in it.
+                return [Ace(EVERYONE_SID, True, _FULL_CONTROL, _OI | _CI)]
+            count = ctypes.cast(pdacl, ctypes.POINTER(_Acl)).contents.AceCount
+            out: List[Ace] = []
+            for i in range(count):
+                pace = ctypes.c_void_p()
+                if not advapi.GetAce(pdacl, i, ctypes.byref(pace)):
+                    return None
+                hdr = ctypes.cast(pace, ctypes.POINTER(_AceHeader)).contents
+                if hdr.AceType not in (0, 1):       # ALLOWED / DENIED only
+                    continue                        # audit and alarm entries
+                # ACCESS_ALLOWED_ACE: header(4) mask(4) then the SID inline.
+                mask = ctypes.c_ulong.from_address(pace.value + 4).value
+                pstr = ctypes.c_void_p()
+                if not advapi.ConvertSidToStringSidW(
+                        ctypes.c_void_p(pace.value + 8), ctypes.byref(pstr)):
+                    return None
+                try:
+                    sid = ctypes.wstring_at(pstr.value)
+                finally:
+                    kernel.LocalFree(pstr)
+                out.append(Ace(sid, hdr.AceType == 0, mask, hdr.AceFlags,
+                               bool(hdr.AceFlags & _INHERITED)))
+            return out
+        finally:
+            if psd:
+                kernel.LocalFree(psd)
+    except Exception:
+        return None                     # an unreadable ACL is not an open one
+
+
 def is_locked(path: str) -> Optional[bool]:
     """True / False / None when it cannot be determined.
 
-    None rather than False when icacls is unavailable or unreadable: "I do not
-    know" and "it is open" are different answers, and doctor must not report
-    the second when it means the first.
+    None rather than False when the ACL cannot be read: "I do not know" and
+    "it is open" are different answers, and doctor must not report the second
+    when it means the first.
     """
-    if os.name != "nt" or not _icacls_present():
-        return None
-    try:
-        r = subprocess.run([_ICACLS, path], capture_output=True, text=True, timeout=30)
-        if r.returncode != 0:
-            return None
-    except Exception:
-        return None
-
-    # Count the access-control entries rather than recognising principal NAMES.
-    # The first version looked for "BUILTIN\\Users" and the USERNAME, which is
-    # wrong on any localised Windows - the machine this was developed against
-    # reports "BUILTIN\\Administrateurs". Rights strings like (OI)(CI)(F) are
-    # NOT localised, so counting entries and checking their rights works in any
-    # language.
-    #
-    # Locked == exactly the two principals we granted, each with inheritable
-    # full control, and nothing else.
-    aces = []
-    for i, line in enumerate((r.stdout or "").splitlines()):
-        line = line.strip()
-        if not line or line.startswith("Successfully") or line.startswith("Failed"):
-            continue
-        if i == 0:
-            line = line[len(path):].strip()     # first line carries the path
-        if ":" in line:
-            aces.append(line)
-    if not aces:
-        return None
-    return len(aces) == len(_ACL_PRINCIPALS) and \
-        all("(OI)(CI)(F)" in a.replace(" ", "") for a in aces)
+    return judge_lock(_read_dacl(path))
