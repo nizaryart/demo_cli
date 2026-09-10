@@ -460,24 +460,56 @@ def plan_protect(project: str, backing: Optional[str] = None,
 def protect(plan: Plan) -> List[str]:
     """Carry out a plan. Returns what was done, in order.
 
-    Ordered so that a failure leaves the least damage: relocate first (atomic,
-    reversible by one rename), lock second (cosmetic if it fails - the files
-    are already where they need to be, merely unlocked, and the warning says
-    so).
+    LOCK FIRST, THEN MOVE. The order used to be the other way round, on the
+    reasoning that relocating is atomic and locking is cosmetic if it fails.
+    The gap that leaves is small and completely reachable: between the rename
+    and the icacls call the directory sits UNLOCKED, UNDER ITS FINAL NAME, at
+    a path anything can predict from the project's own - `<project>.real`.
+    An agent does not have to win a race it cannot see; it can watch for that
+    name to appear.
+
+    A same-volume rename preserves the DACL (verified on hardware,
+    2026-09-10), so locking the directory before it moves means it is never
+    once reachable under the name that gives it away. relocate uses os.rename
+    and nothing else, so there is no copy path that could drop the ACL.
+
+    If the move then fails, the lock is taken back off: leaving somebody's
+    project locked to Administrators AT ITS ORIGINAL PATH would be a far worse
+    outcome than the failure itself.
     """
     if not plan.ok:
         raise ValueError("; ".join(plan.problems))
-    done = [f"moved {plan.source} -> {plan.backing}"]
-    Backing.relocate(plan.source, plan.backing)
+    done = []
+    locked_before_move = False
     if plan.will_lock and is_elevated():
-        # ASK THE FILESYSTEM, NOT THE COMMAND. lock_directory returning True
-        # means icacls exited 0 and admitted no failures - and icacls has
-        # exited 0 on a grant it did not apply before (see lock_directory's
-        # own docstring, 2026-08-25). A claim of protection is the one thing
-        # in this tool that must never rest on a tool's self-report, so the
-        # DACL is read back and judged. cli.py's relock branch already did
-        # this; protect() was still taking icacls at its word.
-        lock_directory(plan.backing)
+        lock_directory(plan.source)
+        if is_locked(plan.source) is True:
+            locked_before_move = True
+        else:
+            # A HALF-APPLIED ACL IS NOT CARRIED INTO THE BACKING. icacls can
+            # strip inheritance and then fail on the grant, and moving that
+            # tree would hand the user a project with an ACL nobody asked for
+            # and no record of what it used to be. /reset puts it back.
+            unlock_directory(plan.source)
+
+    try:
+        Backing.relocate(plan.source, plan.backing)
+    except Exception:
+        if locked_before_move:
+            unlock_directory(plan.source)
+        raise
+    done.append(f"moved {plan.source} -> {plan.backing}")
+
+    if plan.will_lock and is_elevated():
+        # ASK THE FILESYSTEM, NOT THE COMMAND, and ask it HERE - after the
+        # move. lock_directory returning True means icacls exited 0 and
+        # admitted no failures, and icacls has exited 0 on a grant it did not
+        # apply before (see lock_directory's own docstring, 2026-08-25). A
+        # claim of protection is the one thing in this tool that must never
+        # rest on a tool's self-report.
+        #
+        # Reading it back at the destination also checks the assumption this
+        # whole ordering rests on: that the rename carried the DACL with it.
         state = is_locked(plan.backing)
         if state is True:
             done.append(f"locked {plan.backing} to Administrators and SYSTEM")
@@ -513,26 +545,24 @@ def plan_unprotect(project: str, backing: Optional[str] = None) -> Plan:
 
 
 def unprotect(plan: Plan) -> List[str]:
-    """Undo a protect. Unlock first, because a locked directory cannot be moved
-    by the account that is about to move it."""
+    """Undo a protect. MOVE FIRST, THEN UNLOCK - the mirror of protect().
+
+    This used to unlock first, and said so: "a locked directory cannot be
+    moved by the account that is about to move it". That is not true of the
+    account that does the moving. The lock grants Administrators (OI)(CI)F,
+    full control includes DELETE, and unprotect only gets this far when it is
+    running elevated - so the mover is precisely the principal the lock lets
+    through.
+
+    Unlocking first opened the same window protect() had, in the same place
+    and with the same name: the directory sat UNLOCKED at `<project>.real`,
+    the one path an agent can derive from the project's own, for as long as
+    three icacls calls take on a tree. Renaming first means the only moment it
+    is unlocked, it is already home under the name the user chose.
+    """
     if not plan.ok:
         raise ValueError("; ".join(plan.problems))
     done = []
-    # A failed unlock is SAID, not skipped. The first version appended the
-    # "unlocked" line only on success and carried on otherwise, so a project
-    # came home still locked to Administrators with its owner shut out and
-    # nothing in the output to explain it. Handing something back in a state
-    # the user cannot use, silently, is the failure this project is about.
-    if is_elevated():
-        if unlock_directory(plan.backing):
-            done.append(f"unlocked {plan.backing}")
-        else:
-            done.append(f"COULD NOT UNLOCK {plan.backing} - the restored "
-                        f"project will still be Administrators-only. Fix with: "
-                        f"icacls <path> /inheritance:e ; icacls <path> /reset /T")
-    else:
-        done.append("not elevated: the ACL was left as it is. If the backing "
-                    "was locked, re-run this from an Administrator shell.")
     # NEVER let this raise. The backing directory is locked to Administrators,
     # so an unelevated rename fails with WinError 5 - and an unhandled
     # traceback out of the command whose whole job is "get me out of this" is
@@ -546,6 +576,33 @@ def unprotect(plan: Plan) -> List[str]:
             f"an Administrator shell. Nothing was moved, and your files are "
             f"intact at {plan.backing}.") from None
     done.append(f"moved {plan.backing} -> {plan.source}")
+
+    # A failed unlock is SAID, not skipped. The first version appended the
+    # "unlocked" line only on success and carried on otherwise, so a project
+    # came home still locked to Administrators with its owner shut out and
+    # nothing in the output to explain it. Handing something back in a state
+    # the user cannot use, silently, is the failure this project is about.
+    #
+    # Read it back where that is possible, for the same reason protect()
+    # stopped believing lock_directory (finding #14) - but fall back to the
+    # exit code where it is not. is_locked answers None whenever the ACL
+    # cannot be read, which is every non-Windows machine and every Windows one
+    # where the lock is tighter than usual, and "I could not check" must not
+    # become "unlocked". An unverifiable claim falls back to the evidence
+    # there is, never up to the claim there is not.
+    if is_elevated():
+        ok = unlock_directory(plan.source)
+        state = is_locked(plan.source)
+        freed = (state is False) if state is not None else ok
+        if freed:
+            done.append(f"unlocked {plan.source}")
+        else:
+            done.append(f"COULD NOT UNLOCK {plan.source} - the restored "
+                        f"project is still Administrators-only. Fix with: "
+                        f"icacls <path> /inheritance:e ; icacls <path> /reset /T")
+    else:
+        done.append("not elevated: the ACL was left as it is. If the backing "
+                    "was locked, re-run this from an Administrator shell.")
     return done
 
 

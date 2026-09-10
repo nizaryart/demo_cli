@@ -238,3 +238,111 @@ def test_the_probe_agrees_with_icacls_on_the_same_directory(tmp_path):
     # (F) is full control - the mask judge_lock's rule 2 tests for.
     assert sum(1 for a in aces if a.mask & P._FULL_CONTROL == P._FULL_CONTROL) \
         == sum(1 for l in lines if "(F)" in l)
+
+
+# --------------------------------------------------------------------------
+# The window between the rename and the icacls call
+#
+# Findings #4 and #9. Neither is about whether the lock is right; both are
+# about WHEN it is absent. `<project>.real` is derivable from the project's
+# own path, so an agent does not need to win a race it cannot see - it can
+# watch for that name to appear. protect left it there unlocked for as long
+# as icacls takes on a tree, and unprotect put it back there unlocked for the
+# same span on the way out.
+#
+# A same-volume rename preserves the DACL (hardware, 2026-09-10), so the fix
+# is ordering and nothing else.
+
+def _order(monkeypatch, *, locked=True, relocate_fails=False):
+    calls = []
+    monkeypatch.setattr(P, "is_elevated", lambda: True)
+    monkeypatch.setattr(P, "lock_directory",
+                        lambda p: calls.append(("lock", p)) or True)
+    monkeypatch.setattr(P, "unlock_directory",
+                        lambda p: calls.append(("unlock", p)) or True)
+    monkeypatch.setattr(P, "is_locked", lambda p: locked)
+
+    def _move(a, b):
+        calls.append(("move", a, b))
+        if relocate_fails:
+            raise PermissionError("something holds it open")
+    monkeypatch.setattr(P.Backing, "relocate", staticmethod(_move))
+    monkeypatch.setattr(P.os, "rename", lambda a, b: calls.append(("move", a, b)))
+    return calls
+
+
+def test_the_backing_is_locked_before_it_ever_has_that_name(tmp_path, monkeypatch):
+    calls = _order(monkeypatch)
+    plan = _plan(tmp_path)
+    P.protect(plan)
+    assert [c[0] for c in calls] == ["lock", "move"], calls
+    # locked at the ORIGINAL path - the whole point
+    assert calls[0][1] == plan.source
+
+
+def test_a_move_that_fails_does_not_leave_the_project_locked(tmp_path, monkeypatch):
+    """Somebody's project locked to Administrators, at its original path,
+    because the step after the lock failed - worse than the failure."""
+    calls = _order(monkeypatch, relocate_fails=True)
+    plan = _plan(tmp_path)
+    with pytest.raises(PermissionError):
+        P.protect(plan)
+    assert [c[0] for c in calls] == ["lock", "move", "unlock"], calls
+    assert calls[-1][1] == plan.source
+
+
+def test_a_lock_that_did_not_take_is_undone_before_the_move(tmp_path, monkeypatch):
+    """icacls can strip inheritance and then fail on the grant. Moving that
+    tree hands the user a project with an ACL nobody asked for."""
+    calls = _order(monkeypatch, locked=False)
+    plan = _plan(tmp_path)
+    P.protect(plan)
+    assert [c[0] for c in calls] == ["lock", "unlock", "move"], calls
+
+
+def test_the_lock_is_verified_at_the_destination_not_the_source(tmp_path, monkeypatch):
+    """Reading it back after the move also checks the assumption the whole
+    ordering rests on: that the rename carried the DACL with it."""
+    seen = []
+    monkeypatch.setattr(P, "is_elevated", lambda: True)
+    monkeypatch.setattr(P, "lock_directory", lambda p: True)
+    monkeypatch.setattr(P, "unlock_directory", lambda p: True)
+    monkeypatch.setattr(P, "is_locked", lambda p: seen.append(p) or True)
+    monkeypatch.setattr(P.Backing, "relocate", staticmethod(lambda a, b: None))
+    plan = _plan(tmp_path)
+    P.protect(plan)
+    assert seen[-1] == plan.backing
+
+
+def test_unprotect_moves_it_home_before_unlocking_it(tmp_path, monkeypatch):
+    """The mirror. The only moment it is unlocked, it is already home under
+    the name the user chose - not sitting at .real."""
+    calls = _order(monkeypatch, locked=False)
+    plan = P.Plan(source=str(tmp_path / "proj"), backing=str(tmp_path / "proj.real"),
+                  mountpoint=str(tmp_path / "proj"), will_lock=True)
+    P.unprotect(plan)
+    assert [c[0] for c in calls] == ["move", "unlock"], calls
+    assert calls[1][1] == plan.source          # unlocked at its FINAL path
+
+
+def test_unprotect_reports_a_lock_that_survived(tmp_path, monkeypatch):
+    calls = _order(monkeypatch, locked=True)
+    plan = P.Plan(source=str(tmp_path / "proj"), backing=str(tmp_path / "proj.real"),
+                  mountpoint=str(tmp_path / "proj"), will_lock=True)
+    done = P.unprotect(plan)
+    assert any("COULD NOT UNLOCK" in d for d in done), done
+
+
+def test_unprotect_falls_back_to_the_exit_code_when_it_cannot_check(tmp_path, monkeypatch):
+    """is_locked answers None on every non-Windows machine. "I could not
+    check" must not become "unlocked"."""
+    monkeypatch.setattr(P, "is_elevated", lambda: True)
+    monkeypatch.setattr(P, "is_locked", lambda p: None)
+    monkeypatch.setattr(P.os, "rename", lambda a, b: None)
+    plan = P.Plan(source=str(tmp_path / "proj"), backing=str(tmp_path / "proj.real"),
+                  mountpoint=str(tmp_path / "proj"), will_lock=True)
+
+    monkeypatch.setattr(P, "unlock_directory", lambda p: False)
+    assert any("COULD NOT UNLOCK" in d for d in P.unprotect(plan))
+    monkeypatch.setattr(P, "unlock_directory", lambda p: True)
+    assert any(d.startswith("unlocked") for d in P.unprotect(plan))
