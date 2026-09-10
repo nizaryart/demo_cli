@@ -213,10 +213,48 @@ def test_an_inheriting_acl_is_not_recognised_as_protected():
     assert P._sddl_is_protected("D:(A;OICI;FA;;;BA)") is False
 
 
+@pytest.mark.skipif(os.name == "nt", reason="there is a real descriptor here")
 def test_the_sddl_calls_are_inert_off_windows(tmp_path):
     assert P._sddl_of(str(tmp_path)) is None
     assert P._apply_sddl(str(tmp_path), "D:P(A;;FA;;;BA)") is False
     assert P.capture_custom_acls(str(tmp_path)) == {}
+
+
+@pytest.mark.skipif(os.name != "nt", reason="needs a real security descriptor")
+def test_a_recorded_descriptor_goes_back_exactly(tmp_path):
+    """The only test that exercises _sddl_of and _apply_sddl TOGETHER.
+
+    Everything else in this file stubs them, so the whole record layer could
+    be correct around two functions that do not work. Capture, change,
+    restore, compare - which is exactly what protect and unprotect do to a
+    project, at the size of one directory.
+
+    The intermediate state grants OWNER RIGHTS full control, so the account
+    running the test keeps access even if this fails halfway. A test that
+    leaves a directory nobody can delete is how the Windows suite crashed in
+    its own teardown on 2026-09-10.
+    """
+    d = tmp_path / "sub"
+    d.mkdir()
+    original = P._sddl_of(str(d))
+    assert original and original.startswith("D:"), original
+    try:
+        assert P._apply_sddl(str(d), "D:P(A;OICI;FA;;;OW)") is True
+        assert P._sddl_of(str(d)) != original
+    finally:
+        assert P._apply_sddl(str(d), original) is True
+    assert P._sddl_of(str(d)) == original
+
+
+@pytest.mark.skipif(os.name != "nt", reason="needs a real security descriptor")
+def test_an_entry_with_only_inherited_permissions_is_not_recorded(tmp_path):
+    """The claim that an ordinary project costs nothing, on real ACLs rather
+    than on hand-built Ace lists."""
+    d = tmp_path / "sub"
+    d.mkdir()
+    (d / "plain.txt").write_text("x")
+    assert P.has_custom_acl(P._read_dacl(str(d / "plain.txt"))) is False
+    assert P.capture_custom_acls(str(d)) == {}
 
 
 # --------------------------------------------------------------------------
