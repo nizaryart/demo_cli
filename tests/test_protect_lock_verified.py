@@ -346,3 +346,16 @@ def test_unprotect_falls_back_to_the_exit_code_when_it_cannot_check(tmp_path, mo
     assert any("COULD NOT UNLOCK" in d for d in P.unprotect(plan))
     monkeypatch.setattr(P, "unlock_directory", lambda p: True)
     assert any(d.startswith("unlocked") for d in P.unprotect(plan))
+
+
+def test_no_test_runs_with_real_elevation():
+    """The conftest guard, pinned.
+
+    It is the only thing stopping an elevated Windows run from locking a
+    pytest temp directory for real and leaving it that way - which happened,
+    with every test green and the crash landing in pytest's own teardown
+    (2026-09-10). A safety net nobody can see is one nobody notices deleting,
+    so this fails the moment the fixture stops being applied.
+    """
+    assert P.is_elevated.__name__ == "<lambda>", \
+        "conftest's autouse guard is not in effect: a test could write a real ACL"
