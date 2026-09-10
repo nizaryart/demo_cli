@@ -135,6 +135,27 @@ ADMINS_SID = "S-1-5-32-544"
 # Rejected: /setowner to Administrators (ownership churn, and unprotect then
 # cannot give it back to a user it no longer knows) and /deny (which bricked
 # the directory outright - only `takeown /F <d> /R /A` recovered it).
+#
+# WHOSE RIGHTS IT CAPS DEPENDS ON WHO OWNS THE DIRECTORY, and that is not
+# something this module chooses - os.rename preserves the owner, so the lock
+# inherits whatever the project already had. Both cases are safe and they are
+# not the same (measured end to end, 2026-09-10):
+#
+#   owner is the user      the (Rc) cap applies to them: they cannot grant
+#   (a project they made)  themselves back and cannot move the directory, but
+#                          CAN still read the ACL - so is_locked answers True
+#                          from an ordinary shell, with no elevation.
+#
+#   owner is Administrators  the user matches no entry at all and is denied
+#   (a directory created     everything, the ACL included. Stronger, and
+#    from an elevated shell) is_locked can then only answer None.
+#
+# So a None from is_locked on a directory that plainly exists is not evidence
+# that it is unlocked - it may be evidence of the opposite. Nothing here tries
+# to read that tea leaf; None stays "I do not know". It is recorded because
+# the difference cost two hours of contradictory test results: a lab created
+# in the elevated window measured completely differently from one created the
+# way a user actually creates a project.
 OWNER_RIGHTS_SID = "S-1-3-4"
 
 # (sid, icacls rights) - the whole definition of a locked directory, in the
@@ -814,6 +835,7 @@ def is_locked(path: str) -> Optional[bool]:
 
     None rather than False when the ACL cannot be read: "I do not know" and
     "it is open" are different answers, and doctor must not report the second
-    when it means the first.
+    when it means the first. See OWNER_RIGHTS_SID for the case where None is
+    caused by the lock being TIGHTER than usual, not by its absence.
     """
     return judge_lock(_read_dacl(path))
