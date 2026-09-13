@@ -790,14 +790,28 @@ def cmd_install_hook(a) -> int:
         print(f"Installed PreToolUse hook into {target}")
         print("Gates Codex shell commands (Bash) AND file edits (apply_patch).")
         print()
-        print("  ACTION REQUIRED - the hook is INERT until both of these are done:")
-        print("   1. RESTART Codex. Hook config is read once, at session start; a")
-        print("      session already running keeps whatever it loaded and this")
-        print("      install has no effect on it (silently - no warning either side).")
-        print("   2. Run  /hooks  in Codex and approve this entry. Trust is tracked")
-        print("      by hash, so re-approve after any upgrade.")
+        # WHAT THIS SAID UNTIL 2026-09-13, and why it was changed: it listed
+        # approving the hook in /hooks as REQUIRED, and ended "Until then: no
+        # gating, no receipts, no protection." On Codex 0.154.0 / Windows the
+        # hook gated Bash and apply_patch, wrote receipts and snapshotted, with
+        # no approval step at all - so the tool was telling the user they were
+        # unprotected while it was protecting them. Wrong in the worse
+        # direction: a user who believes the guard is off either stops trusting
+        # what it says or turns it off for real.
+        print("  RESTART CODEX. Hook config is read once, at session start; a")
+        print("  session already running keeps whatever it loaded and this")
+        print("  install has no effect on it (silently - no warning either side).")
         print()
-        print("  Until then: no gating, no receipts, no protection.")
+        print("  Until you restart: no gating, no receipts, no protection.")
+        print()
+        print("  Some Codex builds also gate hooks behind approval. If nothing is")
+        print("  captured after a restart, run  /hooks  and approve this entry -")
+        print("  trust is tracked by hash, so re-approve after any upgrade.")
+        print("  Verified NOT required on 0.154.0 (Windows).")
+        print()
+        print("  Either way, confirm with evidence, not with this message:")
+        print("  run one command through Codex, then  demo_cli receipt --list")
+        print("  An installed hook is not an active hook.")
         if a.scope != "global":
             print()
             print("  TIP: --scope global installs to ~/.codex/hooks.json so every Codex")

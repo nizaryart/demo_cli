@@ -259,13 +259,55 @@ def _handle_apply_patch(guard, patch_text: str, stdout, session_id: str) -> int:
     return 0
 
 
+def _strip_bom(raw: str) -> str:
+    r"""Drop a byte-order mark from the front of a hook payload.
+
+    A PARSE FAILURE HERE FAILS OPEN - the hook steps aside and the command
+    runs unguarded - so a BOM is not a cosmetic problem. Windows produces one
+    readily: piping a string to a native process from PowerShell delivered
+    TWO of them (2026-09-13):
+
+        b'\xef\xbb\xbf\xef\xbb\xbf{"hook_event_name":"PreToolUse",...'
+
+    And the failure does not announce itself as a BOM. Read through a cp1252
+    locale those bytes decode to the mojibake `ï»¿`, so json reports
+    "Expecting value: line 1 column 1 (char 0)" rather than its own
+    "Unexpected UTF-8 BOM" - which is exactly why this was first misdiagnosed
+    as something else entirely.
+
+    Codex itself sends clean UTF-8; this was found with a hand-fed payload and
+    the real host is unaffected. It is fixed anyway, because the cost is one
+    lstrip and the failure mode is a guard that silently is not there. A
+    Windows BOM has already broken this project's config parsing once.
+
+    Every leading mark is stripped, not just the first: two arrived, so
+    assuming one is assuming a number nobody has a reason to trust.
+    """
+    return raw.lstrip("﻿")
+
+
 def run_pretooluse(stdin, stdout) -> int:
     # Fail-open on our own parsing errors, but LOUD on stderr so the user can
     # see the tool stepped aside rather than silently allowing.
+    raw = ""
     try:
         raw = stdin.read()
-        data = json.loads(raw) if raw.strip() else {}
+        # STRIP FIRST, THEN ASK IF IT IS EMPTY. U+FEFF is not whitespace to
+        # str.strip(), so a payload of nothing but a BOM read as "there is
+        # content here" and then parsed to nothing - an empty-input case
+        # reported as a parse failure, which fails open with a scary message.
+        body = _strip_bom(raw)
+        data = json.loads(body) if body.strip() else {}
     except Exception as exc:
+        # DEBUG FIRST, BECAUSE THIS IS THE BRANCH THAT NEEDS IT. The debug
+        # print used to sit below, after the except - so it fired only when
+        # parsing had ALREADY SUCCEEDED and printed nothing at all for the one
+        # failure it exists to diagnose. Setting the flag on a real failure
+        # produced no extra output (Windows, 2026-09-13), and the payload had
+        # to be captured by piping into a separate python before anyone could
+        # see what the hook had been handed.
+        if os.environ.get("DEMO_CLI_HOOK_DEBUG"):
+            _stderr(f"demo_cli [codex] unparseable payload: {raw[:400]!r}")
         _stderr(f"demo_cli: could not parse Codex hook input, stepping aside ({exc})")
         return 0
 
