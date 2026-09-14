@@ -99,7 +99,7 @@ def test_a_last_line_larger_than_the_window_is_still_found(tmp_path):
     hypothetical - redact() does not truncate - and a fixed window returned
     GENESIS for it, which is the bug the widening loop was added for."""
     p = tmp_path / "r.jsonl"
-    _write(p, [_row("b" * 64, pad=300_000)])
+    _write(p, [_row("b" * 64, pad=100_000)])   # one line past the window
     assert R.last_hash(str(p)) == "b" * 64
 
 
@@ -107,7 +107,8 @@ def test_a_good_line_buried_under_megabytes_of_torn_ones(tmp_path):
     """Widening has to keep going until it finds one or reaches the start.
     Stopping early would report GENESIS and break the chain."""
     p = tmp_path / "r.jsonl"
-    _write(p, [_row("c" * 64)] + ["{torn" + "z" * 900] * 3000)
+    # still comfortably past the 64 KB window, at ~900 KB rather than 2.7 MB
+    _write(p, [_row("c" * 64)] + ["{torn" + "z" * 900] * 1000)
     assert R.last_hash(str(p)) == "c" * 64
 
 
@@ -150,41 +151,55 @@ class _CountingOpen:
         return _F()
 
 
+# SIZED AGAINST THE WINDOW, NOT AGAINST A ROUND NUMBER. These first wrote a
+# 20 MB ledger twice, which proves nothing a 2 MB one does not: _tail_hash
+# reads 64 KB, so 2 MB is thirty-two windows and the margin is already an
+# order of magnitude. The Windows box ran out of disk on them (2026-09-13) -
+# ~45 MB per run, and pytest keeps three runs of temp directories. A test
+# that needs a big file should ask how big, and answer with the constant that
+# actually decides the outcome.
+LEDGER_ROWS = 2_200            # ~2 MB at 800 bytes of padding
+WINDOW = 65_536                # _tail_hash's starting read
+
+
 def test_reading_the_head_does_not_read_the_ledger(tmp_path, monkeypatch):
-    """The point, pinned without a stopwatch. A 20 MB ledger must cost a
-    window, not a file - so appending stays flat instead of growing with
-    everything the guard has ever recorded."""
+    """The point, pinned without a stopwatch. A ledger many times the read
+    window must still cost a window, not a file - so appending stays flat
+    instead of growing with everything the guard has ever recorded."""
     p = tmp_path / "r.jsonl"
-    _write(p, [_row(f"{i:064x}", pad=800) for i in range(22_000)])
-    assert os.path.getsize(p) > 20_000_000
+    _write(p, [_row(f"{i:064x}", pad=800) for i in range(LEDGER_ROWS)])
+    size = os.path.getsize(p)
+    assert size > 20 * WINDOW, "the fixture is too small to prove anything"
 
     counter = _CountingOpen()
     monkeypatch.setattr(R, "open", counter, raising=False)
-    assert R.last_hash(str(p)) == f"{21999:064x}"
-    assert counter.read < 1_000_000, f"read {counter.read} bytes of a 20MB file"
+    assert R.last_hash(str(p)) == f"{LEDGER_ROWS - 1:064x}"
+    assert counter.read < 3 * WINDOW, \
+        f"read {counter.read} bytes of a {size} byte file"
 
 
 def test_the_counter_would_notice_a_full_scan(tmp_path, monkeypatch):
     """The test above passes trivially if the wrapper counts nothing. This
     reads the same file the old way and shows the counter reacts."""
     p = tmp_path / "r.jsonl"
-    _write(p, [_row(f"{i:064x}", pad=800) for i in range(22_000)])
+    _write(p, [_row(f"{i:064x}", pad=800) for i in range(LEDGER_ROWS)])
+    size = os.path.getsize(p)
 
     counter = _CountingOpen()
     monkeypatch.setattr(R, "open", counter, raising=False)
     with R.open(str(p), encoding="utf-8") as f:
         for _ in f:
             pass
-    assert counter.read > 20_000_000
+    assert counter.read >= size
 
 
 def test_appending_to_a_long_ledger_still_chains_correctly(tmp_path):
     """End to end: the head that gets written is the real one."""
     p = tmp_path / "r.jsonl"
-    _write(p, [_row(f"{i:064x}", pad=800) for i in range(5_000)])
+    _write(p, [_row(f"{i:064x}", pad=800) for i in range(1_000)])
     rec = R.Receipt(action_raw="rm -rf ./out", action_type="rm_rf",
                     target_environment="development", decision="REVERSIBLE",
                     reason="snapshot taken", mode="enforce")
     R.append_receipt(str(p), rec)
-    assert rec.prev_receipt_hash == f"{4999:064x}"
+    assert rec.prev_receipt_hash == f"{999:064x}"
     assert R.last_hash(str(p)) == rec.receipt_hash

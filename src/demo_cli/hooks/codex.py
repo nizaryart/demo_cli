@@ -85,6 +85,7 @@ from typing import Dict, List, Optional, Tuple
 
 from . import attributed
 
+from ..classify import POSIX, POWERSHELL
 from ..config import load_config
 from ..context import Intent
 from ..decide import ASK, BLOCKING
@@ -286,6 +287,42 @@ def _strip_bom(raw: str) -> str:
     return raw.lstrip("﻿")
 
 
+def _dialect() -> str:
+    r"""Which shell wrote this command text.
+
+    THE TOOL NAME CANNOT ANSWER THIS, and that is the whole difficulty.
+    _SHELL_TOOLS is {"Bash"}, and on Windows Codex sends that name while
+    running PowerShell - the live session of 2026-09-13 carried
+    `Get-Item -LiteralPath .\important.txt | Select-Object ... | Format-List`
+    and `Remove-Item -LiteralPath .\important.txt` under tool_name "Bash".
+    The Claude Code adapter CAN use the tool name, because Claude Code sends
+    "PowerShell" and "Bash" as different tools; it says so in its own comment,
+    and this adapter deliberately does NOT copy it.
+
+    So the platform, which is the next best signal: Codex's shell tool runs
+    the platform default shell, and on Windows that is PowerShell.
+
+    THIS REPLACES NO SIGNAL AT ALL. Until now this adapter passed nothing and
+    took the POSIX default, so every PowerShell command Codex ran on Windows
+    was classified as POSIX. That was harmless in practice - three separate
+    layers ignore the dialect, which is why 2026-09-13 gated correctly anyway
+    (see tests/test_codex_windows_observed.py) - but it is about to stop
+    being harmless, because gating the short PowerShell aliases is the first
+    feature that depends on this being right.
+
+    THE RESIDUAL, stated rather than hidden: if Codex on Windows ever shells
+    out to bash or WSL directly, the outer guess is wrong. Two things bound
+    that. A NAMED nested shell corrects itself - `bash -c "..."`,
+    `cmd /c "..."`, `powershell -Command "..."` and `pwsh -c "..."` are all
+    unwrapped and re-dialected by recovery.effective_segments regardless of
+    what the outer call was told. And the cost of being wrong is small today:
+    of eleven dialect-taking functions, the only behavioural difference
+    measured is whether a backtick escapes the next character when splitting
+    segments (2026-09-14).
+    """
+    return POWERSHELL if os.name == "nt" else POSIX
+
+
 def run_pretooluse(stdin, stdout) -> int:
     # Fail-open on our own parsing errors, but LOUD on stderr so the user can
     # see the tool stepped aside rather than silently allowing.
@@ -341,6 +378,7 @@ def run_pretooluse(stdin, stdout) -> int:
             intent=Intent(),                  # Codex sends no per-call description
             agent_id="codex",
             session_id=data.get("session_id", "unknown"),
+            dialect=_dialect(),
         )
     except Exception as exc:  # our bug must not brick the user's agent
         _stderr(f"demo_cli: internal error, stepping aside ({exc})")
