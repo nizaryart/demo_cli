@@ -96,18 +96,30 @@ def test_the_receipt_names_the_agents_file(lab):
         "hook_event_name": "PreToolUse", "tool_name": "Bash",
         "tool_input": {"command": "rm data.db"},
         "cwd": str(sub), "session_id": "s"})), out)
-    # STRICT. The first version of this assertion was
-    #     str(sub) in recovery_point  OR  "sub" in json.dumps(receipt)
-    # and it PASSED AGAINST THE BUG - the bare substring "sub" turns up
-    # somewhere in a receipt whatever happened. Caught by running it before
-    # the fix existed, which is the only reason it is not the seventh test in
-    # this project to pass for the wrong reason.
+    # READ THE FIELD, DO NOT GREP THE RECEIPT. This assertion has now been
+    # wrong twice, in opposite directions:
+    #
+    #   v1  str(sub) in recovery_point OR "sub" in json.dumps(receipt)
+    #       - PASSED AGAINST THE BUG. The bare substring "sub" turns up in a
+    #         receipt whatever happened.
+    #   v2  str(sub) in json.dumps(receipt)
+    #       - passed on Linux, FAILED ON WINDOWS. json.dumps escapes every
+    #         backslash, so a Windows path can never match as a raw
+    #         substring; a POSIX path has no backslashes and matches fine.
+    #
+    # Both were symptoms of testing a rendering instead of the value - the
+    # same mistake is_locked made against icacls output. target_label is the
+    # field that carries the resolved operand, so name it.
     last = _receipts(proj)[-1]
     assert last["decision"] == "REVERSIBLE"
-    target = last.get("context", {}).get("target") or last.get("recovery_point") or ""
-    assert str(sub) in json.dumps(last), (
-        "no field in the receipt names the directory the agent was actually "
-        f"standing in: {last}")
+    resolved = last["context"]["target_label"]
+    assert resolved == str(sub / "data.db"), (
+        f"the receipt names {resolved}, but the agent was standing in {sub}")
+    # context.cwd is the PROJECT ROOT on purpose - guard.py builds it with
+    # cwd=self.config.project_root, so it records the project rather than a
+    # transient directory. Pinned so the next reader does not "fix" it to
+    # follow the agent.
+    assert last["context"]["cwd"] == str(proj)
 
 
 # --------------------------------------------------------- file-edit path
