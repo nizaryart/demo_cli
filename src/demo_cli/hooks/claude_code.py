@@ -34,7 +34,7 @@ from .. import fsreport
 from ..classify import POSIX, POWERSHELL
 from ..config import load_config
 from ..context import Intent
-from ..guard import Guard
+from ..guard import AgentDirectoryUnreachable, Guard, agent_directory
 
 _FILE_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 # Claude Code fires the same PreToolUse shape for both a POSIX shell (Bash) and
@@ -137,24 +137,30 @@ def run_pretooluse(stdin, stdout) -> int:
             # Claude Code fires the same event shape for both shells, and the
             # tool name is the only reliable signal of which one wrote the text.
             # A Windows box can run either, so os.name is NOT a safe guess.
-            result = guard.evaluate(
-                command,
-                intent=Intent(reasoning=description),
-                agent_id=data.get("agent_id", "claude-code"),
-                session_id=data.get("session_id", "unknown"),
-                dialect=POWERSHELL if tool_name == "PowerShell" else POSIX,
-            )
+            with agent_directory(cwd):
+                result = guard.evaluate(
+                    command,
+                    intent=Intent(reasoning=description),
+                    agent_id=data.get("agent_id", "claude-code"),
+                    session_id=data.get("session_id", "unknown"),
+                    dialect=POWERSHELL if tool_name == "PowerShell" else POSIX,
+                )
         else:
             # Edit / Write / MultiEdit -> file_path ; NotebookEdit -> notebook_path
             file_path = tool_input.get("file_path") or tool_input.get("notebook_path")
             if not file_path:
                 return 0
-            result = guard.evaluate_file_edit(
-                file_path, tool_name=tool_name,
-                intent=Intent(reasoning=description),
-                agent_id=data.get("agent_id", "claude-code"),
-                session_id=data.get("session_id", "unknown"),
-            )
+            # BOTH ENTRY POINTS. evaluate_file_edit does its own
+            # os.path.abspath(file_path), so wrapping only the shell call
+            # above would leave every relative Edit / Write / MultiEdit /
+            # NotebookEdit resolving against the hook's directory.
+            with agent_directory(cwd):
+                result = guard.evaluate_file_edit(
+                    file_path, tool_name=tool_name,
+                    intent=Intent(reasoning=description),
+                    agent_id=data.get("agent_id", "claude-code"),
+                    session_id=data.get("session_id", "unknown"),
+                )
     except Exception as exc:  # our bug must not block the user
         sys.stderr.write(f"demo_cli: internal error, stepping aside ({exc})\n")
         return 0

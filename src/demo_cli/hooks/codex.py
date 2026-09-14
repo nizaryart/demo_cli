@@ -89,7 +89,7 @@ from ..classify import POSIX, POWERSHELL
 from ..config import load_config
 from ..context import Intent
 from ..decide import ASK, BLOCKING
-from ..guard import Guard
+from ..guard import AgentDirectoryUnreachable, Guard, agent_directory
 
 # The command Codex invokes; also written into hooks.json on install.
 HOOK_COMMAND = "demo_cli hook-codex"
@@ -370,16 +370,27 @@ def run_pretooluse(stdin, stdout) -> int:
     try:
         cfg = load_config(start=cwd)
         guard = Guard(config=cfg)
-        if tool_name == _PATCH_TOOL:
-            return _handle_apply_patch(guard, command, stdout,
-                                       data.get("session_id", "unknown"))
-        result = guard.evaluate(
-            command,
-            intent=Intent(),                  # Codex sends no per-call description
-            agent_id="codex",
-            session_id=data.get("session_id", "unknown"),
-            dialect=_dialect(),
-        )
+        with agent_directory(cwd):
+            if tool_name == _PATCH_TOOL:
+                return _handle_apply_patch(guard, command, stdout,
+                                           data.get("session_id", "unknown"))
+            result = guard.evaluate(
+                command,
+                intent=Intent(),              # Codex sends no per-call description
+                agent_id="codex",
+                session_id=data.get("session_id", "unknown"),
+                dialect=_dialect(),
+            )
+    except AgentDirectoryUnreachable as exc:
+        # WE CANNOT STAND WHERE THE AGENT STANDS, so we cannot resolve what it
+        # is about to touch. Escalating costs almost nothing - this happens
+        # only when the directory is gone or unreadable - and proceeding would
+        # mean guessing a base we already know is wrong.
+        _emit(stdout, "deny",
+              f"the working directory the agent reported ({exc}) cannot be "
+              f"entered, so a relative path in this command cannot be "
+              f"resolved and nothing can be captured for it")
+        return 0
     except Exception as exc:  # our bug must not brick the user's agent
         _stderr(f"demo_cli: internal error, stepping aside ({exc})")
         return 0

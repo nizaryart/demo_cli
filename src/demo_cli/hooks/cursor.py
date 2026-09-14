@@ -51,7 +51,7 @@ import sys
 from typing import Dict, Optional
 
 from ..config import load_config
-from ..guard import Guard
+from ..guard import Guard, agent_directory
 
 # The command string Cursor invokes; also written into hooks.json on install.
 HOOK_COMMAND = "demo_cli hook-cursor"
@@ -93,12 +93,23 @@ def run_before_shell(stdin, stdout) -> int:
     try:
         cfg = load_config(start=cwd)
         guard = Guard(config=cfg)
-        result = guard.evaluate(
-            command,
-            agent_id=data.get("conversation_id", "cursor"),
-            session_id=data.get("generation_id", "unknown"),
-        )
+        with agent_directory(cwd):
+            result = guard.evaluate(
+                command,
+                agent_id=data.get("conversation_id", "cursor"),
+                session_id=data.get("generation_id", "unknown"),
+            )
     except Exception as exc:
+        # Also catches AgentDirectoryUnreachable, and this adapter needs no
+        # special case for it: failing closed IS the right answer when the
+        # directory the agent named cannot be entered, because a relative
+        # operand then has no base anyone can trust. The other two adapters
+        # have to say so explicitly; this one already did.
+        #
+        # Cursor is the host where this is most likely to bite: `cwd` falls
+        # back to workspace_roots[0], and a multi-root workspace can have the
+        # agent working under a root that is not the first one.
+        #
         # We held a real command and could not evaluate it. Fail CLOSED: deny.
         # This is the deliberate opposite of the Claude Code adapter's fail-open
         # on internal error, and matches the failClosed posture Cursor asks for.

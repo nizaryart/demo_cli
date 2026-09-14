@@ -17,6 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
+import contextlib
 import os
 
 from . import approval, checkpoint, preview as preview_mod, recovery
@@ -68,6 +69,71 @@ class GuardResult:
         if d in ASK:
             return "ask"
         return "allow"
+
+
+class AgentDirectoryUnreachable(RuntimeError):
+    """The directory the agent said it was working in cannot be entered."""
+
+
+@contextlib.contextmanager
+def agent_directory(cwd: str):
+    r"""Stand where the agent stands, for the duration of one evaluation.
+
+    WHY THIS EXISTS. Every adapter reads `cwd` from the hook payload, uses it
+    for load_config(start=cwd), and then lets paths resolve against the HOOK
+    PROCESS's own directory. evaluate() takes no cwd; evaluate_file_edit()
+    calls os.path.abspath(file_path) directly. Project P, agent working in
+    P/sub, a file of the same name in both:
+
+        decision       REVERSIBLE
+        printed        "recovery point captured before this ran"
+        snapshot held  the file at P
+        agent deleted  the file in P/sub
+
+    `undo` restores the bystander and the real work is gone. Commit 14dda64
+    fixed that exact sentence for a `cd` INSIDE a command line - "a recovery
+    point holding the wrong tree, reported REVERSIBLE" - and never questioned
+    the process's own directory as a base that might already be wrong.
+
+    LIVES HERE, NOT IN THE ADAPTERS, and wraps BOTH entry points. The first
+    draft wrapped only the shell call, which left Edit / Write / MultiEdit /
+    NotebookEdit resolving against the hook's directory - a partial fix that
+    reads as complete, and the fifth time in this project a claim has landed
+    in one of two places (design review, 2026-09-14).
+
+    load_config MUST ALREADY HAVE RUN when this is entered. Config discovery
+    walks up from `cwd` explicitly and stores absolute paths: project_root,
+    recovery_dir and receipts_path are all os.path.join(project_root, ...),
+    so neither ledger nor any snapshot destination moves in here. That
+    ordering is load-bearing, not incidental.
+
+    UNREACHABLE MEANS ESCALATE, NOT "CARRY ON HERE". chdir fails only when
+    the directory is gone or unreadable - rare, and a state in which nobody
+    can resolve a relative operand correctly. Falling back to our own
+    directory would be "resolved is not the same as found" a third time:
+    holding the information that the base is unreliable, and discarding it.
+
+    A FAILED RESTORE IS LOUD. The hook is NOT always a one-shot process -
+    cli.py calls run_pretooluse in-process inside doctor's self-test, itself
+    already inside a chdir - so swallowing this would leave a surviving
+    caller in the agent's directory, every later resolution wrong and nothing
+    reporting it. That is the class being closed, recreated by its own fix.
+    """
+    previous = os.getcwd()
+    try:
+        os.chdir(cwd)
+    except OSError as exc:
+        raise AgentDirectoryUnreachable(str(cwd)) from exc
+    try:
+        yield
+    finally:
+        try:
+            os.chdir(previous)
+        except OSError as exc:                       # pragma: no cover
+            raise RuntimeError(
+                f"could not return to {previous} after evaluating in {cwd}: "
+                f"{exc}. This process's working directory is now wrong for "
+                f"everything that follows.") from None
 
 
 class Guard:
