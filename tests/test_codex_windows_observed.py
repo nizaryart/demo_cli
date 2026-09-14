@@ -136,10 +136,27 @@ def test_remove_item_is_snapshotted_before_it_deletes(tmp_path):
 
 
 @pytest.mark.skipif(os.name != "nt", reason=r".\file resolves only on Windows")
-def test_the_verbatim_windows_command_still_snapshots_on_windows(tmp_path):
-    """The transcript replayed exactly, where it can be: on Windows. This is
+def test_the_verbatim_windows_command_still_snapshots_on_windows(tmp_path, monkeypatch):
+    r"""The transcript replayed exactly, where it can be: on Windows. This is
     the only test in the file that asserts the observed command AND the
-    observed outcome together."""
+    observed outcome together.
+
+    THE CHDIR IS PART OF THE CONDITION, NOT SCAFFOLDING. A relative path in
+    the command is resolved against the HOOK PROCESS'S working directory -
+    guard.evaluate takes no cwd, and all three adapters read `cwd` from the
+    payload only to find the config. On the real machine Codex spawns the
+    hook inside the project, so the two coincide and `.\important.txt`
+    resolved. Without the chdir this test has the payload pointing at
+    tmp_path while the process sits in the repo, the path resolves nowhere,
+    and the command escalates instead of snapshotting - which is what it did
+    on Windows on 2026-09-14, correctly.
+
+    That divergence is a real gap, recorded separately: if the two ever
+    differ AND a same-named file sits in the hook's directory, the snapshot
+    covers the wrong file while the receipt says REVERSIBLE. Here it is
+    pinned as an assumption this test depends on.
+    """
+    monkeypatch.chdir(tmp_path)
     target = _lab(tmp_path)
     rc, raw = _run(_shell(r"Remove-Item -LiteralPath .\important.txt", tmp_path),
                    tmp_path)

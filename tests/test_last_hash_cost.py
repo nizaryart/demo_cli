@@ -190,7 +190,16 @@ def test_the_counter_would_notice_a_full_scan(tmp_path, monkeypatch):
     with R.open(str(p), encoding="utf-8") as f:
         for _ in f:
             pass
-    assert counter.read >= size
+    # NOT `>= size`. getsize counts bytes ON DISK, and a newline written in
+    # text mode is \r\n on Windows - two bytes - while reading it back in
+    # text mode yields \n, one. So the counter legitimately totals one byte
+    # per line LESS than the file's size: 2,043,800 against 2,046,000 for
+    # 2,200 rows, which is exactly LEDGER_ROWS (Windows, 2026-09-14).
+    # Comparing against the tail budget instead makes the pair symmetric -
+    # one reads under it, the other far over - and says the same thing the
+    # same way on both platforms.
+    assert counter.read > 3 * WINDOW, \
+        f"read only {counter.read} bytes of a {size} byte file"
 
 
 def test_appending_to_a_long_ledger_still_chains_correctly(tmp_path):
