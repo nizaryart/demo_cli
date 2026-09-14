@@ -21,13 +21,36 @@ from typing import List, Optional, Tuple
 # Rule tables
 # --------------------------------------------------------------------------
 
+# SQL statement shapes. A SQL verb is also an English word, so each demands
+# the statement's grammar, never a lone verb. Shared by the destructive table,
+# _SQL_MUTATING and is_sql_preview_candidate so they cannot drift apart.
+_SQL_TRUNCATE_RX = (
+    # Bare `TRUNCATE t` only when the statement ends there: "truncate <word>"
+    # is ordinary English. Accepted miss: psql -c "TRUNCATE users", no semicolon.
+    r"\bTRUNCATE\s+TABLE\b"
+    r"|\bTRUNCATE\s+[\w.\"`\[\]]+\s*(?:;|$)"
+)
+# Accepted miss: MySQL's multi-table `DELETE t FROM a`. Allowing a word between
+# DELETE and FROM matches "delete files from src" in a commit message.
+_SQL_DELETE_RX = r"\bDELETE\s+FROM\b"
+_SQL_UPDATE_RX = r"\bUPDATE\s+[\w.\"`\[\]]+\s+SET\b"
+_SQL_DDL_RX = (
+    r"\b(?:DROP|ALTER|CREATE)\s+"
+    r"(?:TEMP(?:ORARY)?\s+|UNIQUE\s+|MATERIALIZED\s+|OR\s+REPLACE\s+)*"
+    r"(?:TABLE|DATABASE|SCHEMA|INDEX|VIEW|SEQUENCE|TRIGGER|FUNCTION|"
+    r"PROCEDURE|ROLE|USER|EXTENSION|TYPE)\b"
+)
+_SQL_INSERT_RX = r"\bINSERT\s+(?:OR\s+\w+\s+)?INTO\b|\bREPLACE\s+INTO\b"
+
 # (rule_id, action_type, pattern). First match wins, order matters.
 _DESTRUCTIVE_RULES = [
     ("sql_drop", "sql", r"\bDROP\s+(?:DATABASE|TABLE|SCHEMA)\b"),
-    ("sql_truncate", "sql", r"\bTRUNCATE\b"),
-    ("sql_delete", "sql", r"\bDELETE\s+FROM\b"),
+    ("sql_truncate", "sql", _SQL_TRUNCATE_RX),
+    ("sql_delete", "sql", _SQL_DELETE_RX),
     ("tf_destroy", "infra", r"\bterraform\s+destroy\b"),
-    ("kubectl_delete", "infra", r"\bkubectl\s+delete\s+(?:namespace|ns|pv|pvc|deploy(?:ment)?|sts)\b"),
+    # Any kind, not a resource list: every form removes cluster state we hold
+    # no copy of, so none deserves a different answer.
+    ("kubectl_delete", "infra", r"\bkubectl\s+delete\b"),
     ("cloud_delete", "infra", r"\b(?:aws|gcloud|az)\b[\w\s.-]*\b(?:delete|terminate|destroy|rb)\b"),
     ("railway_drop", "infra", r"railway\s+run.*production.*(?:DROP|DELETE|TRUNCATE)"),
     ("railway_vol_del", "infra", r"railway\s+volume\s+delete"),
@@ -116,10 +139,13 @@ _DESTRUCTIVE_RULES = [
     # perimeter honest and avoid flooding review. Each has no local file operand,
     # so decide.py escalates them (no snapshot to stand behind).
     ("git_worktree_remove", "git", r"\bgit\s+worktree\s+remove\b[^|;&]*(?:--force|\s-f)\b"),
-    # branch delete: only -D (force) is destructive; -d refuses on unmerged work,
-    # so it is SAFE. Match a capital D case-sensitively via (?-i:...) even though
-    # the table is compiled with re.I - so `-d` is NOT swept in.
-    ("git_branch_delete", "git", r"\bgit\s+branch\b[^|;&]*\s(?-i:-\w*D\w*)\b"),
+    # Only the force form is destructive; a lone -d / --delete refuses on
+    # unmerged work. Two spellings: -D, matched case-sensitively via (?-i:...)
+    # despite re.I on the table, and `--delete --force` / `-d -f` in either
+    # order, where the lookaheads are what keep the safe lone form out.
+    ("git_branch_delete", "git",
+     r"\bgit\s+branch\b(?:[^|;&]*\s(?-i:-\w*D\w*)\b"
+     r"|(?=[^|;&]*\s(?:--delete|-d)\b)(?=[^|;&]*\s(?:--force|-f)\b)[^|;&]*)"),
     ("git_checkout_discard", "git", r"\bgit\s+checkout\b[^|;&]*?(?:\s--\s|\s\.(?:\s|$))"),
     ("git_restore", "git", r"\bgit\s+restore\b"),
     ("git_stash_drop", "git", r"\bgit\s+stash\s+(?:drop|clear)\b"),
@@ -216,6 +242,10 @@ _NONRECOVERABLE_SURFACES = [
                          r"|hooks\.slack\.com|chat\.postMessage"),
     ("vcs_remote_state", r"\b(gh|hub)\s+(pr|issue|release)\s+(close|merge|delete|create)\b"
                          r"|\bgh\s+repo\s+delete\b|\bgh\s+api\b[^|;&]*-X\s*(?:DELETE|PUT)\b"),
+    # Generic twin of the `gh api -X DELETE` clause above. POST is deliberately
+    # absent: it is the verb of logins and form submissions, not of destruction.
+    ("http_api_write", r"\b(?:curl|wget|xh|http(?:ie)?)\b[^|;&]*"
+                       r"\s(?:-X\s*|--request[= ])(?:DELETE|PUT|PATCH)\b"),
     ("credential_rotation", r"\brotat(?:e|ing)\b[^|;&]*\b(key|secret|credential|token)\b"
                             r"|\b(?:aws\s+iam|gcloud\s+iam|az\s+role)\b"),
     ("secret_write", r"\b(vault|aws\s+secretsmanager|aws\s+ssm)\b[^|;&]*\b(put|write|delete|set)\b"),
@@ -241,10 +271,18 @@ _NONRECOVERABLE_SURFACES = [
 _NONRECOVERABLE = [(label, re.compile(rx, re.I)) for label, rx in _NONRECOVERABLE_SURFACES]
 
 _SQL_READ = re.compile(r"^\s*SELECT\b", re.I)
-_SQL_MUTATING = re.compile(r"\b(UPDATE|INSERT|DELETE|DROP|TRUNCATE|ALTER|CREATE|REPLACE)\b", re.I)
-_SQL_DELETE = re.compile(r"\bDELETE\s+FROM\b", re.I)
-_SQL_UPDATE = re.compile(r"\bUPDATE\s+\w+\s+SET\b", re.I)
-_SQL_TRUNCATE = re.compile(r"\bTRUNCATE\b", re.I)
+
+# Was a bare word list searched anywhere in the command, while _SQL_READ above
+# is anchored. 21 of 61 ordinary commands escalated on it; see
+# tests/test_sql_verb_is_not_sql.py.
+_SQL_MUTATING = re.compile(
+    f"{_SQL_DELETE_RX}|{_SQL_INSERT_RX}|{_SQL_UPDATE_RX}"
+    f"|(?:{_SQL_TRUNCATE_RX})|{_SQL_DDL_RX}",
+    re.I,
+)
+_SQL_DELETE = re.compile(_SQL_DELETE_RX, re.I)
+_SQL_UPDATE = re.compile(_SQL_UPDATE_RX, re.I)
+_SQL_TRUNCATE = re.compile(_SQL_TRUNCATE_RX, re.I)
 
 
 # --------------------------------------------------------------------------

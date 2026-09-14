@@ -64,6 +64,7 @@ _RECOVERY_HINTS = {
     "external_payment": "the provider dashboard (refund/void) - not always possible",
     "schema_migration": "the migration tool's downgrade",
     "remote_vcs_history": "a teammate's un-force-pushed clone or the remote's reflog",
+    "http_api_write": "the API's own trash / restore endpoint, if it has one - often none",
 }
 
 
