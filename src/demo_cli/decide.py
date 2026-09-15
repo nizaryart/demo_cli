@@ -65,6 +65,8 @@ _RECOVERY_HINTS = {
     "schema_migration": "the migration tool's downgrade",
     "remote_vcs_history": "a teammate's un-force-pushed clone or the remote's reflog",
     "http_api_write": "the API's own trash / restore endpoint, if it has one - often none",
+    "service_control": "the service's original definition (sc qc / Get-Service), if anyone captured it",
+    "account_control": "the account must be recreated by hand; its SID and grants do not come back",
 }
 
 

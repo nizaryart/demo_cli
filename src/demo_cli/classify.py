@@ -68,6 +68,22 @@ PS_MOVE_ALIASES = "mi|move"
 PS_RENAME_ALIASES = "ren|rni"
 PS_NEW_ITEM_ALIASES = "ni"
 PS_CLEAR_CONTENT_ALIASES = "clc"
+# gsv (Get-Service) and sasv (Start-Service) are reads and are not here.
+PS_STOP_SERVICE_ALIASES = "spsv"
+
+# sc.exe verbs that change something. The query forms - query, queryex, qc,
+# q*, showsid, sdshow, GetDisplayName, GetKeyName, EnumDepend, QueryLock - are
+# reads and must never appear here.
+#
+# `failureflag` precedes `failure` so the longer verb is not cut short.
+#
+# Taken from `sc.exe /?` on Windows 10, with one correction: that help text
+# does not list `delete` at all, though it works. A verb list built only from
+# it would have had a hole.
+_SC_WRITE_VERBS = (
+    "delete|config|create|sdset|failureflag|failure|privs|sidtype"
+    "|description|triggerinfo|preferrednode|managedaccount|boot|stop"
+)
 
 # (rule_id, action_type, pattern). First match wins, order matters.
 _DESTRUCTIVE_RULES = [
@@ -81,6 +97,33 @@ _DESTRUCTIVE_RULES = [
     ("cloud_delete", "infra", r"\b(?:aws|gcloud|az)\b[\w\s.-]*\b(?:delete|terminate|destroy|rb)\b"),
     ("railway_drop", "infra", r"railway\s+run.*production.*(?:DROP|DELETE|TRUNCATE)"),
     ("railway_vol_del", "infra", r"railway\s+volume\s+delete"),
+    # ---- Service and account control -------------------------------------
+    # A service or a local account is registry + SCM state, not a file we can
+    # copy, so none of this is snapshottable - see _LOCAL_UNRECOVERABLE.
+    #
+    # `sc` needs no dialect gate here, unlike the Set-Content alias: every
+    # reading of `sc delete svc` is destructive. On 5.1 it is Set-Content
+    # writing a file called "delete"; on PowerShell 7 and cmd.exe it removes
+    # the service. The VERB is what removes the ambiguity the path form had,
+    # and `cmd /c "sc delete x"` arrives as POSIX, so gating would miss it.
+    # `sc <server>` takes \\Name before the verb.
+    ("service_control", "system",
+     rf"\bsc(?:\.exe)?\s+(?:\\\\\S+\s+)?(?:{_SC_WRITE_VERBS})\b"),
+    ("service_control", "system",
+     r"\b(?:Stop-Service|Remove-Service|Set-Service|New-Service"
+     r"|Suspend-Service|Restart-Service)\b"),
+    ("service_control", "system",
+     rf"^\s*(?:{PS_STOP_SERVICE_ALIASES})\b", POWERSHELL),
+    ("service_control", "system",
+     r"\bnet\s+stop\b"
+     r"|\bsystemctl\b[^|;&]*\s(?:stop|disable|mask|kill)\b"
+     r"|\bservice\s+\S+\s+stop\b"),
+    # Blocking `net stop` while `net user victim /delete` walks through would
+    # stop the smaller thing and wave the larger one past.
+    ("account_control", "system",
+     r"\bnet\s+(?:user|localgroup)\b[^|;&]*\s/(?:delete|add)\b"
+     r"|\bnet\s+share\b[^|;&]*\s/delete\b"
+     r"|\b(?:userdel|groupdel|deluser|delgroup)\b"),
     ("git_force_push", "git", r"\bgit\s+push\b.*(?:--force|-f)\b"),
     ("git_reset_hard", "git", r"\bgit\s+reset\s+--hard\b"),
     # rm with both recursive and force, in either flag order (-rf or -fr),
@@ -252,6 +295,8 @@ _EXTERNAL_IRREVERSIBLE = {
 # every environment, since an unrecoverable mutation is never waved through on
 # the strength of an environment label.
 _LOCAL_UNRECOVERABLE = {
+    "service_control": "service_control",
+    "account_control": "account_control",
     "rmdir_s": "recursive_force_delete",
     "del_force": "recursive_force_delete",
     "fs_mkfs": "disk_format",
