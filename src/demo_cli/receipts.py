@@ -239,6 +239,11 @@ class Receipt:
     context_mismatches: List = field(default_factory=list)
     pipeline_segments: List = field(default_factory=list)
     remote_exec: bool = False
+    # Which shell the guard judged this text as. None for anything that is not
+    # a shell command (a file edit has no dialect). The adapters decide it from
+    # signals the receipt does not otherwise record, so without this the trail
+    # cannot answer "which rules were even eligible" after the fact.
+    dialect: Optional[str] = None
     agent_id: str = "unknown"
     session_id: str = "unknown"
     invariant: str = INVARIANT

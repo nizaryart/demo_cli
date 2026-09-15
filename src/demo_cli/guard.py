@@ -419,6 +419,7 @@ class Guard:
             context_mismatches=[list(m) for m in mismatches],
             pipeline_segments=c.segments if c.is_pipeline else [],
             remote_exec=c.remote_exec,
+            dialect=dialect,
             agent_id=agent_id,
             session_id=session_id,
         )
