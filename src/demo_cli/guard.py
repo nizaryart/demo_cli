@@ -235,7 +235,7 @@ class Guard:
             # RESOLVED-AND-ABSENT means "creates". An unresolvable name -
             # $env:APPDATA\notes.txt, $(Get-Date).txt - used to come back as a
             # literal that os.path.exists denied, and was read as creation.
-            named, resolved = recovery.ps_named_target(command)
+            named, resolved = recovery.ps_named_target(command, dialect)
             if resolved and not os.path.exists(named):
                 c.is_destructive = False
                 c.is_mutating = False

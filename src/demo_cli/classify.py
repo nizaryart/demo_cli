@@ -51,6 +51,24 @@ _SQL_DDL_RX = (
 )
 _SQL_INSERT_RX = r"\bINSERT\s+(?:OR\s+\w+\s+)?INTO\b|\bREPLACE\s+INTO\b"
 
+# PowerShell aliases, read off `Get-Alias` on Windows PowerShell 5.1
+# (2026-09-15) rather than remembered. recovery.py imports these, so the two
+# modules cannot drift about what a command IS.
+#
+# `rm` and `mv` are absent on purpose: rm_local and mv_overwrite already catch
+# them in every dialect, and re-labelling them here would churn the rule id on
+# receipts for no gain.
+#
+# `sc` is absent on purpose too. It is Set-Content on 5.1 and sc.exe on
+# PowerShell 7, we cannot see the version, and `sc.exe /?` does not even list
+# all its own verbs - so no verb list can separate them honestly.
+PS_REMOVE_ALIASES = "ri|del|erase|rd|rmdir"
+PS_COPY_ALIASES = "cpi|copy|cp"
+PS_MOVE_ALIASES = "mi|move"
+PS_RENAME_ALIASES = "ren|rni"
+PS_NEW_ITEM_ALIASES = "ni"
+PS_CLEAR_CONTENT_ALIASES = "clc"
+
 # (rule_id, action_type, pattern). First match wins, order matters.
 _DESTRUCTIVE_RULES = [
     ("sql_drop", "sql", r"\bDROP\s+(?:DATABASE|TABLE|SCHEMA)\b"),
@@ -92,11 +110,11 @@ _DESTRUCTIVE_RULES = [
     # path (see decide.py for the still-unrecovered hard-stop).
     ("ps_remove_item_rf", "shell",
      r"\bRemove-Item\b(?=[^|;&]*\s-r[a-z]*\b)(?=[^|;&]*\s-f[a-z]*\b)[^|;&]*"),
-    # Alias twin, PowerShell only (see _POWERSHELL_ONLY). Same rule id: the
-    # receipt should not care which spelling the agent used. Placed next to its
-    # cmdlet so first-match-wins precedence is unchanged.
+    # Alias twin, PowerShell only. Same rule id: the receipt should not care
+    # which spelling the agent used.
     ("ps_remove_item_rf", "shell",
-     r"\bri\b(?=[^|;&]*\s-r[a-z]*\b)(?=[^|;&]*\s-f[a-z]*\b)[^|;&]*", POWERSHELL),
+     rf"\b(?:{PS_REMOVE_ALIASES})\b(?=[^|;&]*\s-r[a-z]*\b)"
+     rf"(?=[^|;&]*\s-f[a-z]*\b)[^|;&]*", POWERSHELL),
     # Any top-level Remove-Item (alias `ri`) - the PowerShell twin of rm_local.
     # Closes the parity gap: `Remove-Item app.db` and `Remove-Item -Recurse x`
     # (no -Force) were previously missed on Windows while `rm app.db` was caught
@@ -104,7 +122,6 @@ _DESTRUCTIVE_RULES = [
     # positional operand and snapshots it), so NOT in _LOCAL_UNRECOVERABLE.
     # Listed AFTER ps_remove_item_rf so the -Recurse -Force nuke keeps its id.
     ("ps_remove_item", "shell", r"^\s*Remove-Item\b[^|;&]*"),
-    ("ps_remove_item", "shell", r"^\s*ri\b[^|;&]*", POWERSHELL),
     # ---- PowerShell content destroyers -----------------------------------
     # Windows had ONE rule (Remove-Item) while POSIX had a dozen. These close
     # the parity gap. Deliberately narrow, in three ways:
@@ -122,18 +139,32 @@ _DESTRUCTIVE_RULES = [
     #    an agent writing the short form is missed. A false positive that gets
     #    the guard uninstalled costs more than a miss.
     ("ps_clear_content", "shell", r"^\s*Clear-Content\b[^|;&]*"),
-    ("ps_clear_content", "shell", r"^\s*clc\b[^|;&]*", POWERSHELL),
+    ("ps_clear_content", "shell",
+     rf"^\s*(?:{PS_CLEAR_CONTENT_ALIASES})\b[^|;&]*", POWERSHELL),
     ("ps_set_content", "shell",
      r"^\s*(?:Set-Content|Out-File)\b(?![^|;&]*\s-(?:Append|NoClobber)\b)[^|;&]*"),
     ("ps_move_force", "shell", r"^\s*Move-Item\b(?=[^|;&]*\s-Force\b)[^|;&]*"),
+    ("ps_move_force", "shell",
+     rf"^\s*(?:{PS_MOVE_ALIASES})\b(?=[^|;&]*\s-Force\b)[^|;&]*", POWERSHELL),
     ("ps_copy_force", "shell", r"^\s*Copy-Item\b(?=[^|;&]*\s-Force\b)[^|;&]*"),
+    ("ps_copy_force", "shell",
+     rf"^\s*(?:{PS_COPY_ALIASES})\b(?=[^|;&]*\s-Force\b)[^|;&]*", POWERSHELL),
     ("ps_rename_force", "shell", r"^\s*Rename-Item\b(?=[^|;&]*\s-Force\b)[^|;&]*"),
+    ("ps_rename_force", "shell",
+     rf"^\s*(?:{PS_RENAME_ALIASES})\b(?=[^|;&]*\s-Force\b)[^|;&]*", POWERSHELL),
     ("ps_new_item_force", "shell", r"^\s*New-Item\b(?=[^|;&]*\s-Force\b)[^|;&]*"),
+    ("ps_new_item_force", "shell",
+     rf"^\s*(?:{PS_NEW_ITEM_ALIASES})\b(?=[^|;&]*\s-Force\b)[^|;&]*", POWERSHELL),
     # Whole-volume operations. No snapshot can cover these, so they hard-stop -
     # the Windows counterpart of mkfs.
     ("ps_format_volume", "shell", r"\b(?:Format-Volume|Clear-Disk)\b"),
     ("rmdir_s", "shell", r"\brmdir\b.*\/[sS]"),
     ("del_force", "shell", r"\bdel\b.*\/[fFsS]"),
+    # del / erase / rd / rmdir are Remove-Item in PowerShell and need NO flag,
+    # while the two cmd.exe rules above require /f or /s. Placed after them so
+    # the cmd.exe hard stops keep precedence when both could match.
+    ("ps_remove_item", "shell",
+     rf"^\s*(?:{PS_REMOVE_ALIASES})\b[^|;&]*", POWERSHELL),
     ("mv_overwrite", "shell", r"\bmv\s+(?:-[a-z]*f[a-z]*\s+)?\S+\s+\S+"),
     # A small, bounded set of other local data-destroyers a cooperative agent
     # can run by mistake. These are LOCAL (no external blast radius): they are

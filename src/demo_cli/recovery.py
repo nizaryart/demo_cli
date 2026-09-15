@@ -25,7 +25,10 @@ import uuid
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-from .classify import (POSIX, POWERSHELL, effective_command, effective_segments,
+from .classify import (POSIX, POWERSHELL, PS_CLEAR_CONTENT_ALIASES,
+                       PS_COPY_ALIASES, PS_MOVE_ALIASES, PS_NEW_ITEM_ALIASES,
+                       PS_REMOVE_ALIASES, PS_RENAME_ALIASES,
+                       effective_command, effective_segments,
                        join_continuations,
                        strip_ps_escapes,
                        redirect_target, split_segments,
@@ -113,8 +116,9 @@ _PS_REMOVE_RE = re.compile(r"^\s*Remove-Item\b", re.I)
 # classify.py gates the matching rule the same way; if these two disagree, one
 # module calls a command a deletion while the other looks for its target in
 # text that does not describe one.
-_PS_REMOVE_ALIAS_RE = re.compile(r"^\s*ri\b", re.I)
-_PS_REMOVE_ANY_RE = re.compile(r"^\s*(?:Remove-Item|ri)\b", re.I)
+_PS_REMOVE_ALIAS_RE = re.compile(rf"^\s*(?:{PS_REMOVE_ALIASES})\b", re.I)
+_PS_REMOVE_ANY_RE = re.compile(
+    rf"^\s*(?:Remove-Item|{PS_REMOVE_ALIASES})\b", re.I)
 
 
 def _ps_remove_hit(seg: str, dialect: str) -> bool:
@@ -488,8 +492,26 @@ def _ps_remove_item_operand(cmd: str) -> Optional[str]:
 # The PowerShell cmdlets that overwrite or empty ONE named file, and the ones
 # that clobber a DESTINATION. Kept separate from Remove-Item's reader, which has
 # its own tested behaviour we do not want to disturb.
-_PS_CONTENT_RE = re.compile(r"^\s*(?:Clear-Content|clc|Set-Content|Out-File|New-Item)\b", re.I)
+_PS_CONTENT_RE = re.compile(
+    r"^\s*(?:Clear-Content|Set-Content|Out-File|New-Item)\b", re.I)
+_PS_CONTENT_ALIAS_RE = re.compile(
+    rf"^\s*(?:{PS_CLEAR_CONTENT_ALIASES}|{PS_NEW_ITEM_ALIASES})\b", re.I)
 _PS_DEST_RE = re.compile(r"^\s*(?:Move-Item|Copy-Item|Rename-Item)\b", re.I)
+# `cp`, `copy` and `move` are ordinary POSIX commands, and this matcher feeds
+# the multiplicity counter - counting `cp a b` as a destructive step on POSIX
+# would escalate an ordinary `rm x; cp a b`. Hence the gate, not a wider regex.
+_PS_DEST_ALIAS_RE = re.compile(
+    rf"^\s*(?:{PS_MOVE_ALIASES}|{PS_COPY_ALIASES}|{PS_RENAME_ALIASES})\b", re.I)
+
+
+def _ps_content_hit(seg: str, dialect: str) -> bool:
+    return bool(_PS_CONTENT_RE.search(seg)
+                or (dialect == POWERSHELL and _PS_CONTENT_ALIAS_RE.search(seg)))
+
+
+def _ps_dest_hit(seg: str, dialect: str) -> bool:
+    return bool(_PS_DEST_RE.search(seg)
+                or (dialect == POWERSHELL and _PS_DEST_ALIAS_RE.search(seg)))
 
 _PS_DEST_FLAGS = {"-destination"}
 # -NewName IS NOT A PATH. `Rename-Item -Path C:\proj\a.txt -NewName b.txt`
@@ -503,7 +525,8 @@ _PS_DEST_FLAGS = {"-destination"}
 # FLAG: -NewName exists only on Rename-Item, so matching the cmdlet would only
 # ever be a proxy for matching the flag - and a less precise one.
 _PS_NEWNAME_FLAGS = {"-newname"}
-_PS_RENAME_RE = re.compile(r"^\s*Rename-Item\b", re.I)
+_PS_RENAME_RE = re.compile(
+    rf"^\s*(?:Rename-Item|{PS_RENAME_ALIASES})\b", re.I)
 # Flags whose NEXT token is a value, not a path. Without this list
 # `Set-Content -Path x -Value "hello"` yields two candidate targets and looks
 # ambiguous, so a perfectly ordinary overwrite would escalate instead of being
@@ -648,7 +671,8 @@ def _ps_dest_target(cmd: str) -> Optional[str]:
     return dst
 
 
-def ps_named_target(cmd: str) -> Tuple[Optional[str], bool]:
+def ps_named_target(cmd: str,
+                    dialect: str = POSIX) -> Tuple[Optional[str], bool]:
     r"""(absolute path, resolved?) for a PowerShell write or clobber.
 
     Same contract and same shape as resolve_redirect_target, deliberately: two
@@ -668,9 +692,9 @@ otes.txt` came
     and only the caller can act on that. Resolved means "we know which file",
     nothing more.
     """
-    if _PS_CONTENT_RE.search(cmd):
+    if _ps_content_hit(cmd, dialect):
         named = _ps_write_target(cmd)
-    elif _PS_DEST_RE.search(cmd):
+    elif _ps_dest_hit(cmd, dialect):
         named = _ps_dest_target(cmd)
     else:
         return None, False
@@ -952,8 +976,8 @@ def extract_path_operand(cmd: str, dialect: str = POSIX) -> Optional[str]:
     _MATCHERS = ((_rx(_RM_RE), _rm),
                  (_rx(_MV_RE), _mv),
                  (_ps_remove_hit, _existing(_ps_remove_item_operand)),
-                 (_rx(_PS_CONTENT_RE), _existing(_ps_write_target)),
-                 (_rx(_PS_DEST_RE), _existing(_ps_dest_target)))
+                 (_ps_content_hit, _existing(_ps_write_target)),
+                 (_ps_dest_hit, _existing(_ps_dest_target)))
 
     acting = {i for i, (seg, d) in enumerate(pairs)
               if any(m(seg, d) for m, _ in _MATCHERS) or redirect_target(seg)}
