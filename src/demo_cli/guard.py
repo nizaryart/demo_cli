@@ -318,7 +318,7 @@ class Guard:
             and not recovery.resolve_redirect_target(command, dialect)[1])
         if target is not None and (
                 (target_path is None
-                 and (recovery.is_fs_delete(command) or unresolved_redirect))
+                 and (recovery.is_fs_delete(command, dialect) or unresolved_redirect))
                 or multi_destructive):
             target = None
 

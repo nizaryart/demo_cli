@@ -61,15 +61,19 @@ def test_remove_item_recurse_force_is_destructive_but_not_a_classify_time_surfac
 
 
 def test_remove_item_flag_order_alias_and_abbreviations():
+    from demo_cli.classify import POWERSHELL
     for cmd in [
         "Remove-Item -Force -Recurse ./build",   # reversed order
         "Remove-Item -r -fo build",              # abbreviated flags
-        "ri -Recurse -Force ./x",                # alias
         "REMOVE-ITEM -RECURSE -FORCE .",         # case
     ]:
         c = classify_pipeline(cmd)
         assert c.is_destructive, cmd
         assert c.matched_rule == "ps_remove_item_rf", cmd
+    # The alias is PowerShell-only: `ri` is Ruby's doc viewer on POSIX.
+    c = classify_pipeline("ri -Recurse -Force ./x", POWERSHELL)
+    assert c.is_destructive
+    assert c.matched_rule == "ps_remove_item_rf"
 
 
 def test_remove_item_requires_both_recurse_and_force():

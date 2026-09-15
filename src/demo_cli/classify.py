@@ -18,6 +18,15 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 # --------------------------------------------------------------------------
+# Shell dialects
+# --------------------------------------------------------------------------
+# Defined before the rule tables because a rule may be eligible in only one of
+# them. The full dialect machinery (continuations, escapes, splitting) is
+# further down; only the names are needed here.
+POSIX = "posix"
+POWERSHELL = "powershell"
+
+# --------------------------------------------------------------------------
 # Rule tables
 # --------------------------------------------------------------------------
 
@@ -82,14 +91,20 @@ _DESTRUCTIVE_RULES = [
     # it is honestly recoverable when the target is a single, existing, in-project
     # path (see decide.py for the still-unrecovered hard-stop).
     ("ps_remove_item_rf", "shell",
-     r"\b(?:Remove-Item|ri)\b(?=[^|;&]*\s-r[a-z]*\b)(?=[^|;&]*\s-f[a-z]*\b)[^|;&]*"),
+     r"\bRemove-Item\b(?=[^|;&]*\s-r[a-z]*\b)(?=[^|;&]*\s-f[a-z]*\b)[^|;&]*"),
+    # Alias twin, PowerShell only (see _POWERSHELL_ONLY). Same rule id: the
+    # receipt should not care which spelling the agent used. Placed next to its
+    # cmdlet so first-match-wins precedence is unchanged.
+    ("ps_remove_item_rf", "shell",
+     r"\bri\b(?=[^|;&]*\s-r[a-z]*\b)(?=[^|;&]*\s-f[a-z]*\b)[^|;&]*", POWERSHELL),
     # Any top-level Remove-Item (alias `ri`) - the PowerShell twin of rm_local.
     # Closes the parity gap: `Remove-Item app.db` and `Remove-Item -Recurse x`
     # (no -Force) were previously missed on Windows while `rm app.db` was caught
     # on POSIX. Recoverable (recovery.py resolves the -Path/-LiteralPath/
     # positional operand and snapshots it), so NOT in _LOCAL_UNRECOVERABLE.
     # Listed AFTER ps_remove_item_rf so the -Recurse -Force nuke keeps its id.
-    ("ps_remove_item", "shell", r"^\s*(?:Remove-Item|ri)\b[^|;&]*"),
+    ("ps_remove_item", "shell", r"^\s*Remove-Item\b[^|;&]*"),
+    ("ps_remove_item", "shell", r"^\s*ri\b[^|;&]*", POWERSHELL),
     # ---- PowerShell content destroyers -----------------------------------
     # Windows had ONE rule (Remove-Item) while POSIX had a dozen. These close
     # the parity gap. Deliberately narrow, in three ways:
@@ -106,7 +121,8 @@ _DESTRUCTIVE_RULES = [
     #    `rni`/`ren` are likewise too short to match safely. Accepted trade:
     #    an agent writing the short form is missed. A false positive that gets
     #    the guard uninstalled costs more than a miss.
-    ("ps_clear_content", "shell", r"^\s*(?:Clear-Content|clc)\b[^|;&]*"),
+    ("ps_clear_content", "shell", r"^\s*Clear-Content\b[^|;&]*"),
+    ("ps_clear_content", "shell", r"^\s*clc\b[^|;&]*", POWERSHELL),
     ("ps_set_content", "shell",
      r"^\s*(?:Set-Content|Out-File)\b(?![^|;&]*\s-(?:Append|NoClobber)\b)[^|;&]*"),
     ("ps_move_force", "shell", r"^\s*Move-Item\b(?=[^|;&]*\s-Force\b)[^|;&]*"),
@@ -158,7 +174,14 @@ _DESTRUCTIVE_RULES = [
     ("git_filter_branch", "git", r"\bgit\s+filter-(?:branch|repo)\b"),
     ("git_update_ref_delete", "git", r"\bgit\s+update-ref\s+-d\b"),
 ]
-_DESTRUCTIVE = [(rid, a, re.compile(rx, re.I | re.S)) for rid, a, rx in _DESTRUCTIVE_RULES]
+# A rule may carry a FOURTH element: the dialect it is eligible in. Absent
+# means every dialect, which is all but the short PowerShell aliases.
+#
+# Only the aliases are gated. A full cmdlet name is unambiguous in any shell,
+# so gating it would buy nothing and would cost a miss whenever an adapter's
+# dialect guess is wrong.
+_DESTRUCTIVE = [(r[0], r[1], re.compile(r[2], re.I | re.S),
+                 r[3] if len(r) > 3 else None) for r in _DESTRUCTIVE_RULES]
 
 # Destructive rules whose blast radius is EXTERNAL / remote. A local snapshot
 # can never truthfully cover them, so they are treated as non-recoverable
@@ -300,8 +323,7 @@ _SQL_TRUNCATE = re.compile(_SQL_TRUNCATE_RX, re.I)
 # would MERGE two separate commands, which can stop an anchored rule such as
 # rm_local (`^\s*rm`) from matching - a silent miss, the worst outcome. So the
 # caller states which shell the text came from; this module never guesses.
-POSIX = "posix"
-POWERSHELL = "powershell"
+# POSIX / POWERSHELL are defined at the top of the file, above the rule tables.
 _CONTINUATION = {POSIX: "\\", POWERSHELL: "`"}
 
 
@@ -938,9 +960,11 @@ class Classification:
         return self.is_mutating or self.is_destructive
 
 
-def _classify_segment(cmd: str) -> dict:
+def _classify_segment(cmd: str, dialect: str = POSIX) -> dict:
     matched, atype = None, "shell"
-    for rid, action_type, rx in _DESTRUCTIVE:
+    for rid, action_type, rx, only_in in _DESTRUCTIVE:
+        if only_in is not None and only_in != dialect:
+            continue
         if rx.search(cmd):
             matched, atype = rid, action_type
             break
@@ -992,9 +1016,9 @@ def _classify_segment(cmd: str) -> dict:
     }
 
 
-def classify(cmd: str) -> Classification:
+def classify(cmd: str, dialect: str = POSIX) -> Classification:
     """Classify a single command (no pipeline awareness)."""
-    s = _classify_segment(cmd)
+    s = _classify_segment(cmd, dialect)
     return Classification(
         is_destructive=s["is_destructive"],
         is_mutating=s["is_mutating"],
@@ -1018,11 +1042,16 @@ def classify_pipeline(cmd: str, dialect: str = POSIX) -> Classification:
     # `powershell -Command "Remove-Item x"` IS a Remove-Item. Judge the payload
     # and judge it in ITS dialect - recovery.extract_path_operand calls the
     # same function, or the two would disagree about what the command even is.
-    segments = [seg for seg, _ in effective_segments(cmd, dialect)]
-    seg_results = [_classify_segment(seg) for seg in segments]
+    # EACH SEGMENT CARRIES ITS OWN DIALECT, and it is not always the outer one.
+    # `powershell.exe -Command "ri x"` run from bash arrives as POSIX and
+    # effective_segments correctly re-dialects the payload to POWERSHELL; this
+    # used to discard that and judge every segment as the outer shell.
+    pairs = effective_segments(cmd, dialect)
+    segments = [seg for seg, _ in pairs]
+    seg_results = [_classify_segment(seg, d) for seg, d in pairs]
     if not seg_results:
         segments = [cmd]
-        seg_results = [_classify_segment(cmd)]
+        seg_results = [_classify_segment(cmd, dialect)]
 
     def any_of(key):
         return any(s[key] for s in seg_results)

@@ -108,7 +108,18 @@ def resolve_target(cmd: str, explicit_db: Optional[str] = None,
 _ENV_ASSIGN = re.compile(r"^[A-Za-z_]\w*=")
 _RM_RE = re.compile(r"^\s*(?:[A-Za-z_]\w*=\S*\s+)*(?:sudo\s+)?rm\b", re.I)
 _MV_RE = re.compile(r"^\s*(?:[A-Za-z_]\w*=\S*\s+)*(?:sudo\s+)?mv\b", re.I)
-_PS_REMOVE_RE = re.compile(r"^\s*(?:Remove-Item|ri)\b", re.I)
+_PS_REMOVE_RE = re.compile(r"^\s*Remove-Item\b", re.I)
+# `ri` is Remove-Item in PowerShell and Ruby's documentation viewer on POSIX.
+# classify.py gates the matching rule the same way; if these two disagree, one
+# module calls a command a deletion while the other looks for its target in
+# text that does not describe one.
+_PS_REMOVE_ALIAS_RE = re.compile(r"^\s*ri\b", re.I)
+_PS_REMOVE_ANY_RE = re.compile(r"^\s*(?:Remove-Item|ri)\b", re.I)
+
+
+def _ps_remove_hit(seg: str, dialect: str) -> bool:
+    return bool(_PS_REMOVE_RE.search(seg)
+                or (dialect == POWERSHELL and _PS_REMOVE_ALIAS_RE.search(seg)))
 
 # Brace expansion. The shell expands `{a,b}` and `{1..3}` BEFORE globbing and
 # *unconditionally* - independent of what exists on disk - so `rm file{1,2,3}.txt`
@@ -448,7 +459,7 @@ def _ps_remove_item_operand(cmd: str) -> Optional[str]:
     the honesty rule is that a target this function cannot pin down exactly
     must not be snapshotted at all.
     """
-    if not _PS_REMOVE_RE.search(cmd):
+    if not _PS_REMOVE_ANY_RE.search(cmd):
         return None
     tokens = _tokenize(cmd, windows_paths=True)[1:]  # PowerShell: \\ is a path sep
     targets: List[str] = []
@@ -753,7 +764,8 @@ def expanded_operands(cmd: str, dialect: str = POSIX) -> List[str]:
     the line touches, and showing half of it would be the display telling a
     smaller version of the same lie.
     """
-    segments, moved = _operand_context(cmd, dialect)
+    pairs, moved = _operand_context(cmd, dialect)
+    segments = [seg for seg, _ in pairs]
     seen, out = set(), []
     for index, seg in enumerate(segments):
         if not (_RM_RE.search(seg) or _MV_RE.search(seg)):
@@ -849,7 +861,8 @@ def extract_path_operand(cmd: str, dialect: str = POSIX) -> Optional[str]:
     # Several destructive segments (`rm a.txt; rm b.txt`) return None. Picking
     # one would snapshot a.txt while b.txt died unrecorded, with the receipt
     # claiming a recovery - the partial-recovery lie FIX #5 exists to prevent.
-    segments, moved = _operand_context(cmd, dialect)
+    pairs, moved = _operand_context(cmd, dialect)
+    segments = [seg for seg, _ in pairs]
     # `base` stays None whenever the shell has not actually moved, so every
     # command without a `cd` - the overwhelming majority - takes exactly the
     # path it took before, returning relative operands relative. Only a real
@@ -931,19 +944,24 @@ def extract_path_operand(cmd: str, dialect: str = POSIX) -> Optional[str]:
     # A set of indices, so one segment matching two rules still counts once,
     # and the redirect detector is included because `> file` is a destructive
     # step even though no rule regex covers it.
-    acting = {i for i, seg in enumerate(segments)
-              if any(rx.search(seg) for rx in (_RM_RE, _MV_RE, _PS_REMOVE_RE,
-                                               _PS_CONTENT_RE, _PS_DEST_RE))
-              or redirect_target(seg)}
+    def _rx(rx):
+        return lambda seg, _d: bool(rx.search(seg))
+
+    # (does this segment act?, what is its target?). A matcher takes the
+    # segment AND its dialect, because `ri` only means Remove-Item in one.
+    _MATCHERS = ((_rx(_RM_RE), _rm),
+                 (_rx(_MV_RE), _mv),
+                 (_ps_remove_hit, _existing(_ps_remove_item_operand)),
+                 (_rx(_PS_CONTENT_RE), _existing(_ps_write_target)),
+                 (_rx(_PS_DEST_RE), _existing(_ps_dest_target)))
+
+    acting = {i for i, (seg, d) in enumerate(pairs)
+              if any(m(seg, d) for m, _ in _MATCHERS) or redirect_target(seg)}
     if len(acting) > 1:
         return None
 
-    for rx, handler in ((_RM_RE, _rm),
-                        (_MV_RE, _mv),
-                        (_PS_REMOVE_RE, _existing(_ps_remove_item_operand)),
-                        (_PS_CONTENT_RE, _existing(_ps_write_target)),
-                        (_PS_DEST_RE, _existing(_ps_dest_target))):
-        hits = [(i, seg) for i, seg in enumerate(segments) if rx.search(seg)]
+    for match, handler in _MATCHERS:
+        hits = [(i, seg) for i, (seg, d) in enumerate(pairs) if match(seg, d)]
         if not hits:
             continue
         if len(hits) != 1:
@@ -1171,15 +1189,16 @@ def _changes_directory(segments: List[str]) -> bool:
     return any(_CD_RE.match(seg) for seg in segments)
 
 
-def _operand_context(cmd: str, dialect: str = POSIX) -> Tuple[List[str], bool]:
-    """(effective segments, does anything move the working directory?).
+def _operand_context(cmd: str,
+                     dialect: str = POSIX) -> Tuple[List[Tuple[str, str]], bool]:
+    """([(segment, its dialect)], does anything move the working directory?).
 
-    The segment/substitute preamble was copied into three functions and was
-    already a drift risk.
+    The dialect is per SEGMENT, not per line: `powershell -c "ri x"` run from
+    bash is a PowerShell segment inside a POSIX command, and the `ri` alias is
+    only Remove-Item in the former.
     """
-    segments = [seg for seg, _ in
-                effective_segments(cmd, dialect, substitute=True)] or [cmd]
-    return segments, _changes_directory(segments)
+    pairs = list(effective_segments(cmd, dialect, substitute=True)) or [(cmd, dialect)]
+    return pairs, _changes_directory([seg for seg, _ in pairs])
 
 
 def _base_at(cmd: str, segments: List[str], index: int,
@@ -1245,7 +1264,8 @@ def unignorable_dirs(cmd: str, dialect: str = POSIX) -> frozenset:
     .demo_cli/something` is a request to delete recovery points, not a reason
     to duplicate them.
     """
-    segments, moved = _operand_context(cmd, dialect)
+    pairs, moved = _operand_context(cmd, dialect)
+    segments = [seg for seg, _ in pairs]
     # End of the line on purpose: "does this command reach into an ignored
     # directory ANYWHERE" is a whole-line question, unlike the two callers
     # below which care about one segment's view.
@@ -1261,11 +1281,12 @@ def unignorable_dirs(cmd: str, dialect: str = POSIX) -> frozenset:
     return frozenset(hit - {".demo_cli", ".demo_cli_recovery"})
 
 
-def is_fs_delete(cmd: str) -> bool:
+def is_fs_delete(cmd: str, dialect: str = POSIX) -> bool:
     """True if cmd is a local filesystem delete/move whose target THIS module
     resolves by operand extraction (rm / mv / PowerShell Remove-Item). Used by
     the guard to refuse a partial .db-name capture for such a command (#004)."""
-    return bool(_RM_RE.search(cmd) or _MV_RE.search(cmd) or _PS_REMOVE_RE.search(cmd))
+    return bool(_RM_RE.search(cmd) or _MV_RE.search(cmd)
+                or _ps_remove_hit(cmd, dialect))
 
 
 def is_remote_pg(ref: str) -> bool:
