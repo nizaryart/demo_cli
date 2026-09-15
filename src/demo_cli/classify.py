@@ -670,7 +670,24 @@ def substitute_assignments(cmd: str, dialect: str = POSIX) -> str:
 _POWERSHELL_EXE = re.compile(r"^\s*(?:[\w:.\\/ ()-]*[\\/])?(?:powershell|pwsh)(?:\.exe)?\b",
                              re.I)
 _CMD_EXE = re.compile(r"^\s*(?:[\w:.\\/ ()-]*[\\/])?cmd(?:\.exe)?\s+/[ck]\b", re.I)
-_POSIX_SH = re.compile(r"^\s*(?:[\w./-]*/)?(?:bash|sh|dash|zsh)\s+-c\b")
+# POSIX shells cluster short flags, so `-lc` is `-l -c` and `-ilc` is
+# `-i -l -c`. Demanding a bare `-c` here meant `bash -lc "rm app.db"` was never
+# unwrapped, and every ANCHORED rule (rm_local, ps_remove_item, the ps_* set)
+# then saw a segment beginning with "bash" and did not fire - a silent pass,
+# not the lost snapshot the notes recorded. `-lc` is the form agent shell tools
+# actually emit.
+#
+# `c` may sit ANYWHERE in the cluster. Measured, not reasoned: -c, -lc, -cl,
+# -clx, -cil and a repeated `-c -c` all run the script. An earlier draft
+# required c last and called `-cl` an accepted miss; running it showed it is a
+# real one.
+#
+# Uppercase is tolerated in the leading flags (-C is noclobber) but the cluster
+# still needs a LOWERCASE c, since -C is not -c.
+_POSIX_SH = re.compile(
+    r"^\s*(?:[\w./-]*/)?(?:bash|sh|dash|zsh)"
+    r"(?:\s+(?:--[\w-]+|-[A-Za-z]+))*"
+    r"\s+-[A-Za-z]*c[A-Za-z]*\b")
 
 # PowerShell accepts abbreviations: -Command, -Comm, -c. Same for
 # -EncodedCommand / -enc / -e. Matching the documented prefixes rather than the
