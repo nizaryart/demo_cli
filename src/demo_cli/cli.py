@@ -2398,12 +2398,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     ih = sub.add_parser("install-hook", parents=[common],
                         help="wire the safety hook into Claude Code, Cursor, or Codex")
-    ih.add_argument("--cursor", action="store_true",
-                    help="install the Cursor beforeShellExecution hook (into .cursor/hooks.json) "
-                         "instead of the Claude Code PreToolUse hook")
-    ih.add_argument("--codex", action="store_true",
-                    help="install the Codex PreToolUse hook (into .codex/hooks.json) "
-                         "instead of the Claude Code PreToolUse hook")
+    # Claude Code is the default host, and was reachable ONLY as the bare form.
+    # Two hosts had a flag and the third did not, so `--claude` failed with a
+    # usage dump listing every subcommand - and the bare form is the one that
+    # writes host config with no host named in the command.
+    ih_host = ih.add_mutually_exclusive_group()
+    ih_host.add_argument("--claude", action="store_true",
+                         help="install the Claude Code PreToolUse hook (the default)")
+    ih_host.add_argument("--cursor", action="store_true",
+                         help="install the Cursor beforeShellExecution hook (into .cursor/hooks.json) "
+                              "instead of the Claude Code PreToolUse hook")
+    ih_host.add_argument("--codex", action="store_true",
+                         help="install the Codex PreToolUse hook (into .codex/hooks.json) "
+                              "instead of the Claude Code PreToolUse hook")
     ih.add_argument("--scope", choices=("project", "global"), default="project")
     ih.add_argument("--print", action="store_true", help="print the settings snippet instead of writing")
     ih.set_defaults(func=cmd_install_hook)
