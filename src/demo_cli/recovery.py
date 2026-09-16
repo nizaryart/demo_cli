@@ -57,6 +57,27 @@ _IGNORE = shutil.ignore_patterns(*sorted(IGNORED_DIRS))
 # Override with DEMO_CLI_MAX_SNAPSHOT_MB.
 _DEFAULT_MAX_SNAPSHOT_MB = 256
 
+# The byte cap bounds DISK SPACE. This one bounds TIME, and they are not the
+# same instrument. Measured 2026-09-16 on Windows NTFS with Defender live:
+#
+#     2,000 files   131.1 MB   copytree 2.041s
+#     2,000 files     1.0 MB   copytree 1.878s     131x the data, 9% the time
+#    20,000 files    10.2 MB   copytree 21.794s
+#
+# 991 us per file, essentially independent of size, so a 256 MB cap of 1 KB
+# files is 262,144 files and about 260 seconds. WSL2 measures 183 us/file -
+# five times faster - which is why this has to be configurable rather than a
+# constant someone guessed on a Linux box.
+#
+# The budget it has to fit inside is the HOOK timeout, and exceeding that is
+# not a slow snapshot. It is a kill: the hook dies with no verdict, the host
+# runs the command unguarded, and - measured on Claude Code the same day - it
+# says NOTHING to the user. A crashed hook is announced; a timed-out one is
+# silent. So this is refused in advance, never discovered afterwards.
+#
+# Override with DEMO_CLI_MAX_SNAPSHOT_FILES.
+_DEFAULT_MAX_SNAPSHOT_FILES = 25_000
+
 
 @dataclass
 class Target:
@@ -1508,6 +1529,26 @@ def _max_snapshot_bytes() -> int:
         return default
 
 
+def _max_snapshot_files() -> int:
+    """The file-count cap, parsed as defensively as the byte cap above and for
+    the same reason: this runs before the try/except around the copy, and a
+    typo in one environment variable must not turn every directory capture into
+    an unguarded delete."""
+    raw = os.environ.get("DEMO_CLI_MAX_SNAPSHOT_FILES")
+    if raw is None:
+        return _DEFAULT_MAX_SNAPSHOT_FILES
+    try:
+        n = float(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_MAX_SNAPSHOT_FILES
+    if not math.isfinite(n) or n < 0:
+        return _DEFAULT_MAX_SNAPSHOT_FILES
+    try:
+        return int(n)
+    except (ValueError, OverflowError):
+        return _DEFAULT_MAX_SNAPSHOT_FILES
+
+
 def _contains(outer: str, inner: str) -> bool:
     """Is `inner` at or underneath `outer`? Absolute, normalised, and it never
     raises - commonpath throws on paths from different drives, which on
@@ -1519,37 +1560,47 @@ def _contains(outer: str, inner: str) -> bool:
         return False
 
 
-def _dir_size(path: str, cap: int, ignore_dirs=None, skip_path=None) -> int:
-    """Sum file sizes under `path`, ignoring the same noise as the copy, and
-    short-circuiting as soon as `cap` is exceeded (so we never walk a huge tree
-    just to find out it is huge).
+def _walk_cost(path: str, byte_cap: int, file_cap: Optional[int] = None,
+               ignore_dirs=None, skip_path=None) -> Tuple[int, int]:
+    """(bytes, files) under `path`, skipping the same directories the copy will.
+
+    ONE walk, two budgets. Short-circuits as soon as either cap is exceeded, so
+    a huge tree is never walked to the end just to find out it is huge.
 
     `ignore_dirs` MUST be whatever the copy will skip. If the measurement
-    excludes a directory the copy then includes, the cap check passes and the
-    copy is unbounded - which is how a "256 MB cap" quietly copies gigabytes.
-    checkpoint.py keeps .git, so it passes its own set.
+    excludes a directory the copy then includes, neither cap bounds anything -
+    which is how a "256 MB cap" quietly copies gigabytes. checkpoint.py keeps
+    .git, so it passes its own set.
 
     Until 2026-08-24 this held a hardcoded duplicate of IGNORED_DIRS, exactly
     the drift the comment on that constant warns about.
     """
     ignore = IGNORED_DIRS if ignore_dirs is None else frozenset(ignore_dirs)
-    total = 0
-    for root, dirs, files in os.walk(path):
+    total = files = 0
+    for root, dirs, names in os.walk(path):
         dirs[:] = [d for d in dirs if d not in ignore
                    and not (skip_path and _contains(skip_path,
                                                     os.path.join(root, d)))]
-        for f in files:
+        for f in names:
+            files += 1
             try:
                 total += os.path.getsize(os.path.join(root, f))
             except OSError:
                 pass
-            if total > cap:
-                return total
-    return total
+            if total > byte_cap or (file_cap is not None and files > file_cap):
+                return total, files
+    return total, files
+
+
+def _dir_size(path: str, cap: int, ignore_dirs=None, skip_path=None) -> int:
+    """Bytes only. The byte half of _walk_cost, for callers that have no time
+    budget to spend (checkpoint's own cap check, and the tests)."""
+    return _walk_cost(path, cap, None, ignore_dirs, skip_path)[0]
 
 
 def snapshot(target: Optional[Target], recovery_dir: str, strategy: str = "snapshot",
-             action: Optional[str] = None, ignore_dirs=None) -> Optional[dict]:
+             action: Optional[str] = None, ignore_dirs=None,
+             notes: Optional[dict] = None) -> Optional[dict]:
     """Capture a recovery point for a target. Returns the recovery entry or None.
 
     `strategy` comes from config: "snapshot" captures; "none"/"attest" never
@@ -1560,6 +1611,12 @@ def snapshot(target: Optional[Target], recovery_dir: str, strategy: str = "snaps
     `action` is the human-readable thing that prompted the snapshot (a command
     or a file-edit), stored on the entry so `demo_cli log` can show *why* each
     recovery point exists.
+
+    `notes`, when given, receives a "refused" key explaining a cap refusal in
+    words the caller can put in front of a person. Returning a bare None says
+    only that there is no recovery point; it cannot say the tree was too big,
+    by how much, or which knob to turn - and this is the one refusal a user can
+    actually do something about.
     """
     if not target or strategy in ("none", "attest"):
         return None
@@ -1621,7 +1678,27 @@ def snapshot(target: Optional[Target], recovery_dir: str, strategy: str = "snaps
             return out
 
         cap = _max_snapshot_bytes()
-        if _dir_size(ref, cap, ignore_dirs, skip_path=skip) > cap:
+        file_cap = _max_snapshot_files()
+        nbytes, nfiles = _walk_cost(ref, cap, file_cap, ignore_dirs, skip_path=skip)
+        if nbytes > cap:
+            if notes is not None:
+                notes["refused"] = (
+                    f"{os.path.basename(ref) or ref} exceeds the "
+                    f"{cap // (1024 * 1024)} MB snapshot cap; raise "
+                    f"DEMO_CLI_MAX_SNAPSHOT_MB or name a narrower target.")
+            return None
+        if file_cap is not None and nfiles > file_cap:
+            # TIME, not space. Capture is ~1 ms per file on Windows, so this
+            # many files would outlast the hook's timeout - and a hook killed
+            # mid-copy is a SILENT unguarded command, not a slow one.
+            if notes is not None:
+                notes["refused"] = (
+                    f"{os.path.basename(ref) or ref} holds more than "
+                    f"{file_cap:,} files; capturing it would outlast the "
+                    f"agent's hook timeout, and a hook killed mid-copy lets "
+                    f"the command run unguarded with no warning. Raise "
+                    f"DEMO_CLI_MAX_SNAPSHOT_FILES and the hook timeout "
+                    f"together, or name a narrower target.")
             return None
         snap = os.path.join(recovery_dir, f"{os.path.basename(ref.rstrip('/'))}.{ts}.{rid}.snapdir")
         # symlinks=True, AND NOT ONLY TO AVOID A CRASH.

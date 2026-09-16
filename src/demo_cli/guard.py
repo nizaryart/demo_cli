@@ -350,8 +350,10 @@ class Guard:
         reached = recovery.unignorable_dirs(command, dialect)
         keep_out = (None if not reached
                     else frozenset(recovery.IGNORED_DIRS) - reached)
+        snap_notes: dict = {}
         entry = (recovery.snapshot(target, self.config.recovery_dir, strategy,
-                                   action=command, ignore_dirs=keep_out)
+                                   action=command, ignore_dirs=keep_out,
+                                   notes=snap_notes)
                  if (c.needs_recovery and not remote_pg) else None)
 
         # LAST RESORT, never a first choice. Reached only when the command
@@ -401,6 +403,20 @@ class Guard:
                       f"preserved. Undo restores the entire tree.")
         elif checkpoint_skipped:
             reason = f"{reason} {checkpoint.reason_text(checkpoint_skipped, self.config)}"
+        # A cap refusal is the one "no recovery point" a person can act on, so
+        # it says which cap, and which knob. Only when nothing was captured -
+        # a checkpoint may have covered the command after the cap refused.
+        if entry is None and snap_notes.get("refused"):
+            reason = f"{reason} {snap_notes['refused']}"
+
+        # THE RECEIPT IS NOT THE PERSON. Everything above appended to a local
+        # `reason` that only ever reached the Receipt, while every adapter
+        # shows result.decision.reason - so the checkpoint explanation, whose
+        # own comment says "someone whose action was blocked has to be told why
+        # the checkpoint was refused", was told to the ledger and to nobody
+        # else. Put the augmented text back on the decision so the two agree
+        # and the adapters carry it without each having to remember.
+        decision.reason = reason
 
         receipt = Receipt(
             action_raw=command,

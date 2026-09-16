@@ -458,7 +458,14 @@ def settings_snippet() -> Dict:
         {"hooks": [{"type": "command",
                     "command": HOOK_COMMAND,
                     "statusMessage": "demo_cli safety check",
-                    "timeout": 30}]}
+                    # 30 was a guess. Capture costs ~1 ms per file on Windows
+                    # NTFS with Defender live (measured 2026-09-16), so 30s
+                    # bought only ~30,000 files - an ordinary .venv or dist.
+                    # Overrunning is not a slow snapshot but a SILENT one: the
+                    # hook is killed, the host runs the command unguarded and
+                    # says nothing. Buying room is cheap; the cap below is what
+                    # actually bounds it.
+                    "timeout": 120}]}
     ]}}
 
 

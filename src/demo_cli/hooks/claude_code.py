@@ -204,14 +204,26 @@ _FILE_MATCHER = "Edit|Write|MultiEdit|NotebookEdit"
 _SHELL_MATCHERS = ("Bash", "PowerShell")
 
 
+# DECLARED, not left to the host. We used to declare none here and take
+# whatever Claude Code's default is - a number we do not know and therefore
+# cannot size the snapshot cap against. Measured 2026-09-16: on a timeout the
+# host kills the hook, runs the command unguarded, and prints nothing (a
+# CRASHED hook it does announce). An unknown budget for a silent failure is
+# not a budget.
+_HOOK_TIMEOUT = 120
+
+
+def _handler() -> Dict:
+    return {"type": "command", "command": "demo_cli hook", "timeout": _HOOK_TIMEOUT}
+
+
 def settings_snippet() -> Dict:
     return {
         "hooks": {
             "PreToolUse": [
-                {"matcher": m, "hooks": [{"type": "command", "command": "demo_cli hook"}]}
-                for m in _SHELL_MATCHERS
+                {"matcher": m, "hooks": [_handler()]} for m in _SHELL_MATCHERS
             ] + [
-                {"matcher": _FILE_MATCHER, "hooks": [{"type": "command", "command": "demo_cli hook"}]},
+                {"matcher": _FILE_MATCHER, "hooks": [_handler()]},
             ]
         }
     }
@@ -243,7 +255,7 @@ def install_into_settings(path: str) -> None:
     for matcher in (*_SHELL_MATCHERS, _FILE_MATCHER):
         if not _present(matcher):
             pre.append({"matcher": matcher,
-                        "hooks": [{"type": "command", "command": "demo_cli hook"}]})
+                        "hooks": [_handler()]})
 
     with open(path, "w", encoding="utf-8") as f:
         json.dump(settings, f, indent=2)
