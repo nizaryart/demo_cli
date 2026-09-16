@@ -2,11 +2,11 @@
 
 import re
 
-__version__ = "1.0.7"
+__version__ = "1.0.8"
 
 
 def release_tag() -> str:
-    """The git tag matching this version: 1.0.7 -> v1.0.7.
+    """The git tag matching this version: 1.2.3 -> v1.2.3.
 
     The beta form is still understood (0.4.0b8 -> v0.4.0-beta.8) because
     receipts written by those versions quote a tag this function produced,

@@ -15,7 +15,7 @@ import re
 
 import pytest
 
-from demo_cli.version import release_tag
+from demo_cli.version import __version__, release_tag
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SH = os.path.join(ROOT, "install.sh")
@@ -56,6 +56,29 @@ def test_both_installers_pin_the_current_release_tag(sh, ps):
         assert found == {tag}, (
             f"{name} pins {sorted(found)} but this tree is {tag}. "
             f"Bump the scripts with version.py, or tag what they point at.")
+
+
+def test_readme_pins_the_current_release_tag():
+    """The README carries the command people actually copy-paste, and until
+    2026-09-16 nothing checked it. The two installer scripts were guarded by
+    the test above; the README could lag a release silently, which is the same
+    broken promise about WHICH code arrives - on the more-read surface."""
+    text = open(os.path.join(ROOT, "README.md"), encoding="utf-8").read()
+    tag = release_tag()
+    found = set(re.findall(r"v\d+\.\d+\.\d+(?:-beta\.\d+)?", text))
+    assert found, "README pins no version at all"
+    assert found == {tag}, (
+        f"README pins {sorted(found)} but this tree is {tag}. "
+        f"Bump the README with version.py.")
+
+
+def test_readme_states_the_version_the_install_will_print():
+    # `demo_cli --version  # should print X` is a claim a reader checks
+    # against their terminal. Wrong, and they conclude the install failed.
+    text = open(os.path.join(ROOT, "README.md"), encoding="utf-8").read()
+    claims = re.findall(r"should print\s+(\d+\.\d+\.\d+\S*)", text)
+    assert claims, "README no longer states what --version prints"
+    assert set(claims) == {__version__}, (claims, __version__)
 
 
 def test_neither_installer_points_at_a_moving_branch(sh, ps):
