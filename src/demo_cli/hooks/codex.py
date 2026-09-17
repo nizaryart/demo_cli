@@ -90,7 +90,7 @@ from ..config import load_config
 from ..context import Intent
 from ..decide import ASK, BLOCKING
 from ..guard import AgentDirectoryUnreachable, Guard, agent_directory
-from . import event_list, load_host_config, reconcile_handler
+from . import event_list, hook_timeout, load_host_config, reconcile_handler
 
 # The command Codex invokes; also written into hooks.json on install.
 HOOK_COMMAND = "demo_cli hook-codex"
@@ -469,9 +469,9 @@ def settings_snippet() -> Dict:
                     # bought only ~30,000 files - an ordinary .venv or dist.
                     # Overrunning is not a slow snapshot but a SILENT one: the
                     # hook is killed, the host runs the command unguarded and
-                    # says nothing. Buying room is cheap; the cap below is what
-                    # actually bounds it.
-                    "timeout": 120}]}
+                    # says nothing. Shared with Claude Code via hook_timeout()
+                    # because the snapshot cap is sized against this number.
+                    "timeout": hook_timeout()}]}
     ]}}
 
 

@@ -30,8 +30,8 @@ import os
 
 import pytest
 
-from demo_cli.hooks import reconcile_handler
-from demo_cli.hooks.claude_code import _HOOK_TIMEOUT, install_into_settings
+from demo_cli.hooks import hook_timeout, reconcile_handler
+from demo_cli.hooks.claude_code import install_into_settings
 from demo_cli.hooks.codex import HOOK_COMMAND as CODEX_COMMAND
 from demo_cli.hooks.codex import install_into_hooks_json as codex_install
 from demo_cli.hooks.cursor import HOOK_COMMAND as CURSOR_COMMAND
@@ -77,7 +77,7 @@ def test_a_stale_timeout_is_raised(tmp_path):
         for m in MATCHERS]}})
     install_into_settings(p)
     for m in MATCHERS:
-        assert _handler_of(p, m)["timeout"] == _HOOK_TIMEOUT, m
+        assert _handler_of(p, m)["timeout"] == hook_timeout(), m
 
 
 def test_it_reports_what_it_changed(tmp_path):
@@ -124,7 +124,7 @@ def test_the_users_other_settings_and_hooks_survive(tmp_path):
     assert "PostToolUse" in after["hooks"]
     bash = [b for b in after["hooks"]["PreToolUse"] if b["matcher"] == "Bash"][0]
     assert [h["command"] for h in bash["hooks"]] == ["their-own-tool", "demo_cli hook"]
-    assert bash["hooks"][1]["timeout"] == _HOOK_TIMEOUT
+    assert bash["hooks"][1]["timeout"] == hook_timeout()
 
 
 def test_a_partial_install_is_both_reconciled_and_completed(tmp_path):
@@ -138,7 +138,7 @@ def test_a_partial_install_is_both_reconciled_and_completed(tmp_path):
     assert any("Bash: timeout" in c for c in changed), changed
     assert any("PowerShell: registered" in c for c in changed), changed
     assert {h["timeout"] for h in
-            (_handler_of(p, m) for m in MATCHERS)} == {_HOOK_TIMEOUT}
+            (_handler_of(p, m) for m in MATCHERS)} == {hook_timeout()}
 
 
 # ------------------------------------------------------------ codex

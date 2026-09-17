@@ -1,8 +1,54 @@
 """Agent-harness integrations (auto-fire entrypoints)."""
 import json
+import math
 import os
 
 TAG = "[demo_cli]"
+
+# THE BUDGET WE DECLARE TO THE HOST, in seconds, and the ONLY place it is
+# written. Claude Code had a named constant and Codex an inline literal, so
+# the two could drift - and the snapshot cap is sized against this number, in
+# a test that read Codex's copy, so editing one host silently re-sized the
+# margin for the other.
+#
+# Measured 2026-09-16: on a timeout the host kills the hook, runs the command
+# UNGUARDED and prints nothing (a crashed hook it does announce). An unknown
+# budget for a silent failure is not a budget.
+_DEFAULT_HOOK_TIMEOUT = 120
+
+
+def hook_timeout() -> int:
+    """The declared hook budget, overridable with DEMO_CLI_HOOK_TIMEOUT.
+
+    IT EXISTS BECAUSE THE TOOL ALREADY TOLD PEOPLE TO RAISE IT. The snapshot
+    cap refusals say "raise DEMO_CLI_MAX_SNAPSHOT_FILES and the hook timeout
+    together", and until now the hook timeout was a module constant with no
+    env var, no config key and no flag - the only route was hand-editing the
+    host's JSON, which is how a BOM gets in. Advice you cannot follow is the
+    same defect class as the cap refusal that named no knob at all.
+
+    Read at install time, not import time, and it only reaches the host when
+    `install-hook` is re-run - the value lives in the host's config file, not
+    in our process. The refusal text says so.
+
+    Parsed as defensively as the snapshot caps and for the same reason: a typo
+    must not shrink the budget a silent failure is measured against. Zero and
+    negatives fall back to the default, because "no timeout" is the host's
+    own ambiguous default and the thing we exist to stop declaring.
+    """
+    raw = os.environ.get("DEMO_CLI_HOOK_TIMEOUT")
+    if raw is None:
+        return _DEFAULT_HOOK_TIMEOUT
+    try:
+        n = float(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_HOOK_TIMEOUT
+    if not math.isfinite(n) or n < 1:
+        return _DEFAULT_HOOK_TIMEOUT
+    try:
+        return int(n)
+    except (ValueError, OverflowError):
+        return _DEFAULT_HOOK_TIMEOUT
 
 
 class HostConfigUnreadable(RuntimeError):

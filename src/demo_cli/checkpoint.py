@@ -199,7 +199,9 @@ def reason_text(skipped: str, cfg: Config) -> str:
         TOO_MANY_FILES: f"Workspace holds more than {file_cap:,} files; capturing "
                         f"it would outlast the agent's hook timeout, and a hook "
                         f"killed mid-copy lets the command run unguarded with no "
-                        f"warning. Raise DEMO_CLI_MAX_SNAPSHOT_FILES and the hook "
-                        f"timeout together, or resolve the target explicitly.",
+                        f"warning. Raise DEMO_CLI_MAX_SNAPSHOT_FILES and "
+                        f"DEMO_CLI_HOOK_TIMEOUT together, then re-run "
+                        f"`demo_cli install-hook`. Or resolve the target "
+                        f"explicitly.",
         FAILED: "Checkpoint copy did not complete; no recovery was taken.",
     }.get(skipped, "No checkpoint was taken.")

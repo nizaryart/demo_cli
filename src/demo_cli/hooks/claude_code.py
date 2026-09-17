@@ -35,7 +35,7 @@ from ..classify import POSIX, POWERSHELL
 from ..config import load_config
 from ..context import Intent
 from ..guard import AgentDirectoryUnreachable, Guard, agent_directory
-from . import event_list, load_host_config, reconcile_handler
+from . import event_list, hook_timeout, load_host_config, reconcile_handler
 
 _FILE_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 # Claude Code fires the same PreToolUse shape for both a POSIX shell (Bash) and
@@ -229,17 +229,13 @@ _FILE_MATCHER = "Edit|Write|MultiEdit|NotebookEdit"
 _SHELL_MATCHERS = ("Bash", "PowerShell")
 
 
-# DECLARED, not left to the host. We used to declare none here and take
-# whatever Claude Code's default is - a number we do not know and therefore
-# cannot size the snapshot cap against. Measured 2026-09-16: on a timeout the
-# host kills the hook, runs the command unguarded, and prints nothing (a
-# CRASHED hook it does announce). An unknown budget for a silent failure is
-# not a budget.
-_HOOK_TIMEOUT = 120
-
-
+# DECLARED, not left to the host, and the value is hooks.hook_timeout() so
+# both hosts read one knob. We used to declare none here and take whatever
+# Claude Code's default is - a number we do not know and therefore cannot
+# size the snapshot cap against.
 def _handler() -> Dict:
-    return {"type": "command", "command": "demo_cli hook", "timeout": _HOOK_TIMEOUT}
+    return {"type": "command", "command": "demo_cli hook",
+            "timeout": hook_timeout()}
 
 
 def settings_snippet() -> Dict:

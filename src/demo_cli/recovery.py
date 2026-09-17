@@ -1716,8 +1716,9 @@ def snapshot(target: Optional[Target], recovery_dir: str, strategy: str = "snaps
                     f"{file_cap:,} files; capturing it would outlast the "
                     f"agent's hook timeout, and a hook killed mid-copy lets "
                     f"the command run unguarded with no warning. Raise "
-                    f"DEMO_CLI_MAX_SNAPSHOT_FILES and the hook timeout "
-                    f"together, or name a narrower target.")
+                    f"DEMO_CLI_MAX_SNAPSHOT_FILES and DEMO_CLI_HOOK_TIMEOUT "
+                    f"together, then re-run `demo_cli install-hook` so the "
+                    f"host sees the new budget. Or name a narrower target.")
             return None
         snap = os.path.join(recovery_dir, f"{os.path.basename(ref.rstrip('/'))}.{ts}.{rid}.snapdir")
         # symlinks=True, AND NOT ONLY TO AVOID A CRASH.

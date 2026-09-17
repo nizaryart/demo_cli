@@ -39,7 +39,6 @@ import pytest
 
 from demo_cli.cli import _hook_check_rows, _host_hook_audit, _host_hook_status
 from demo_cli.config import Config
-from demo_cli.hooks import claude_code as cc
 
 MATCHERS = ("Bash", "PowerShell", "Edit|Write|MultiEdit|NotebookEdit")
 
@@ -188,7 +187,7 @@ def test_expected_values_come_from_the_installer_not_a_copy(lab, monkeypatch):
     _claude(lab, [{"matcher": m, "hooks": [_handler(timeout=120)]} for m in MATCHERS])
     assert _audit(lab, "claude code") == ([], [])
 
-    monkeypatch.setattr(cc, "_HOOK_TIMEOUT", 300)
+    monkeypatch.setenv("DEMO_CLI_HOOK_TIMEOUT", "300")
     stale, _ = _audit(lab, "claude code")
     assert stale and all("current 300" in s for s in stale), (
         f"the audit did not follow the installer's own constant: {stale}")

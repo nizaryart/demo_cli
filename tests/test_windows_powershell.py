@@ -66,11 +66,11 @@ def test_install_upgrades_bash_only_install_to_cover_powershell(tmp_path):
     # 120 - one machine, two budgets, and doctor printed one ok row. The
     # assertion reads the HANDLER now; reading only the matcher list is what
     # let the claim go unchecked for eleven days.
-    from demo_cli.hooks.claude_code import _HOOK_TIMEOUT
+    from demo_cli.hooks import hook_timeout
     for b in blocks:
         handler = [h for h in b["hooks"] if h["command"] == "demo_cli hook"][0]
         assert handler["type"] == "command"
-        assert handler["timeout"] == _HOOK_TIMEOUT, (
+        assert handler["timeout"] == hook_timeout(), (
             f"{b['matcher']} kept a stale handler: {handler}")
 
 
