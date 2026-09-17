@@ -1634,6 +1634,25 @@ def snapshot(target: Optional[Target], recovery_dir: str, strategy: str = "snaps
     if kind in ("sqlite", "file"):
         if not os.path.exists(ref):
             return None
+        # The byte cap bounds DISK SPACE, and one file spends it as readily as
+        # a tree. Only the dir branch below ever checked it, so this branch
+        # copied a multi-GB file happily - on EVERY edit, with no dedup behind
+        # it - and a copy that outlives the hook budget is a silent unguarded
+        # command, not a slow one. The file COUNT cap is deliberately absent:
+        # one file is one file, and for a single copy bytes bound the time too.
+        cap = _max_snapshot_bytes()
+        try:
+            size = os.path.getsize(ref)
+        except OSError:
+            return None
+        if size > cap:
+            if notes is not None:
+                notes["refused"] = (
+                    f"{os.path.basename(ref) or ref} is "
+                    f"{size // (1024 * 1024)} MB, over the "
+                    f"{cap // (1024 * 1024)} MB snapshot cap; raise "
+                    f"DEMO_CLI_MAX_SNAPSHOT_MB or take an independent backup.")
+            return None
         bak = os.path.join(recovery_dir, f"{os.path.basename(ref)}.{ts}.{rid}.bak")
         try:
             shutil.copy2(ref, bak)
