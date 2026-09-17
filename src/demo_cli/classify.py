@@ -129,7 +129,15 @@ _DESTRUCTIVE_RULES = [
     # rm with both recursive and force, in either flag order (-rf or -fr),
     # bounded so it does not leak across a pipe / chain separator. Listed first
     # so this specific, higher-signal id wins for the -rf case.
-    ("rm_rf", "shell", r"\brm\b(?=[^|;&]*\b-?[a-z]*r[a-z]*\b)(?=[^|;&]*\b-?[a-z]*f[a-z]*\b)[^|;&]*"),
+    # NOT `docker rm -f` / `podman rm -f`. Until 2026-09-17 those matched here
+    # and nowhere else: right outcome (ESCALATE), wrong name on the receipt,
+    # and `docker rm` without -f was ALLOW. rm_local below excludes docker in
+    # twelve lines of comment; this rule never did, because it is unanchored
+    # on purpose. Safe to exclude only now that container_runtime covers it
+    # honestly - before that, the accident was the only thing stopping it.
+    ("rm_rf", "shell",
+     r"(?<!docker )(?<!podman )\brm\b"
+     r"(?=[^|;&]*\b-?[a-z]*r[a-z]*\b)(?=[^|;&]*\b-?[a-z]*f[a-z]*\b)[^|;&]*"),
     # Any *top-level* rm, not only -rf. A plain `rm app.db` deletes a file just
     # as irrecoverably from the shell's point of view, and "delete this file" is
     # the single most common destructive thing an agent does. Anchored to the
@@ -334,6 +342,23 @@ _FILE_WRITERS = re.compile(
 # Surfaces a local snapshot cannot truthfully cover. A mutation here is NOT
 # made "reversible" by copying a file - it must be escalated honestly (P2).
 # (label, pattern)
+# The shell prefix that can legally sit before a command word: leading
+# NAME=value assignments and sudo. The three new rules at the end of this
+# list are ANCHORED with it, which is the whole reason they are safe.
+# Unanchored, `\bdocker\s+rm\b` escalates
+# `git commit -m 'docker rm cleanup script'` and `\bnpm\s+unpublish\b`
+# escalates `rg 'npm unpublish' docs/` - the same accident as the SQL word
+# list, which escalated 21 of 61 ordinary commands on 09-14.
+#
+# Stated misses this buys: `docker exec redis redis-cli FLUSHALL` and
+# `ssh host docker rm x`. A wrapper word before the verb defeats the anchor,
+# and that is the trade for not firing on prose.
+#
+# rm_local and recovery._RM_RE spell this same prefix out independently; not
+# unified here because rm_local is the most load-bearing regex in the table
+# and this change has no reason to touch it.
+_CMD_PREFIX = r"^\s*(?:[A-Za-z_]\w*=\S*\s+)*(?:sudo\s+)?"
+
 _NONRECOVERABLE_SURFACES = [
     ("external_email", r"\b(sendgrid|mailgun|ses\s+send-email|smtp)\b|\bmail\s+-s\b"),
     ("external_payment", r"\b(stripe|paypal|braintree)\b[^|;&]*\b(charge|refund|payout|capture)\b"),
@@ -366,6 +391,40 @@ _NONRECOVERABLE_SURFACES = [
     ("paas_destroy", r"\bheroku\s+(?:apps:destroy|pg:reset)\b"
                      r"|\bsupabase\s+db\s+reset\b"
                      r"|\bfly(?:ctl)?\s+(?:apps\s+destroy|destroy)\b"),
+
+    # Measured 2026-09-17: 18 of 19 destructive forms below were ALLOW -
+    # nothing captured and nothing claimed, which is the bottom of the ladder
+    # but still a command that destroys data the tool never mentions.
+    #
+    # SURFACES, not plain destructive rules, and the reason is decide.py: step
+    # 3 honours a structural approval token and step 6 never checks one. A
+    # legitimate `docker volume rm` has no path at all as a plain rule. Same
+    # inversion as the service/account rules on 09-16.
+    #
+    # A container layer, a flushed keyspace and an unpublished version all sit
+    # outside the project tree, so no local snapshot could cover any of them
+    # however hard we tried - which is what makes them surfaces honestly.
+    ("container_runtime",
+     _CMD_PREFIX + r"(?:docker|podman)(?:-compose)?\s+(?:"
+     # `rm` destroys the container's writable layer whether or not -f is
+     # given; -f only kills it first. rmi destroys the image.
+     r"(?:rm|rmi)\b"
+     r"|(?:volume|image|container|network|system|builder)\s+(?:rm|prune)\b"
+     # `down` alone removes containers and networks; only the -v form takes
+     # named volumes, which is the line worth drawing.
+     r"|(?:compose\s+)?down\b[^|;&]*\s--?v(?:olumes)?\b"
+     r")"),
+
+    # FLUSHALL/FLUSHDB discard the keyspace. Whether the instance is local or
+    # remote is unknowable here, and we hold no copy either way.
+    ("datastore_flush", _CMD_PREFIX + r"redis-cli\b[^|;&]*\bflush(?:all|db)\b"),
+
+    # Registry removal. npm forbids re-publishing the same version, so this is
+    # irreversible by policy rather than by physics. cargo/gem yank are the
+    # same act elsewhere - listing only npm would be the kubectl-delete
+    # mistake of 09-16, an enumeration that looks complete and is not.
+    ("package_registry",
+     _CMD_PREFIX + r"(?:(?:npm|pnpm|yarn)\s+unpublish\b|cargo\s+yank\b|gem\s+yank\b)"),
 ]
 _NONRECOVERABLE = [(label, re.compile(rx, re.I)) for label, rx in _NONRECOVERABLE_SURFACES]
 

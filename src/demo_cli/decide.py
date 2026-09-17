@@ -67,6 +67,9 @@ _RECOVERY_HINTS = {
     "http_api_write": "the API's own trash / restore endpoint, if it has one - often none",
     "service_control": "the service's original definition (sc qc / Get-Service), if anyone captured it",
     "account_control": "the account must be recreated by hand; its SID and grants do not come back",
+    "container_runtime": "rebuild from the Dockerfile / compose file, or a volume backup if one exists",
+    "datastore_flush": "the instance's own RDB or AOF snapshot, if persistence was enabled - otherwise none",
+    "package_registry": "the registry's restore window, if any - npm forbids re-publishing the same version",
 }
 
 
