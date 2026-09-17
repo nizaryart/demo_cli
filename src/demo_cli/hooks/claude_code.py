@@ -27,7 +27,7 @@ from __future__ import annotations
 import json
 import os
 import sys
-from typing import Dict
+from typing import Dict, List
 
 from . import attributed
 from .. import fsreport
@@ -35,7 +35,7 @@ from ..classify import POSIX, POWERSHELL
 from ..config import load_config
 from ..context import Intent
 from ..guard import AgentDirectoryUnreachable, Guard, agent_directory
-from . import event_list, load_host_config
+from . import event_list, load_host_config, reconcile_handler
 
 _FILE_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 # Claude Code fires the same PreToolUse shape for both a POSIX shell (Bash) and
@@ -254,28 +254,39 @@ def settings_snippet() -> Dict:
     }
 
 
-def install_into_settings(path: str) -> None:
+def install_into_settings(path: str) -> List[str]:
+    """Register or RECONCILE the PreToolUse hooks. Returns what changed.
+
+    Add-if-absent until 2026-09-17: a matching command string skipped the
+    whole entry, so the raised timeout never reached an existing install and
+    doctor reported it green. Now each matcher is brought up to _handler().
+    """
     settings = load_host_config(path)
     pre = event_list(settings, "PreToolUse")
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
 
-    def _present(matcher: str) -> bool:
-        return any(
-            isinstance(b, dict) and b.get("matcher") == matcher
-            and any(isinstance(h, dict) and h.get("command") == "demo_cli hook"
-                    for h in b.get("hooks") or [])
-            for b in pre
-        )
+    def _ours(matcher: str):
+        for b in pre:
+            if not isinstance(b, dict) or b.get("matcher") != matcher:
+                continue
+            for h in b.get("hooks") or []:
+                if isinstance(h, dict) and h.get("command") == "demo_cli hook":
+                    return h
+        return None
 
-    # Existing Bash-only installs (pre-PowerShell-support) are upgraded here:
-    # the Bash block is left untouched (no duplicate), and the missing
-    # PowerShell block is appended so Windows shell commands start routing
-    # through the hook too.
+    # A pre-PowerShell install is still upgraded by appending the missing
+    # block; what is new is that the block already there is no longer skipped.
+    changed: List[str] = []
     for matcher in (*_SHELL_MATCHERS, _FILE_MATCHER):
-        if not _present(matcher):
-            pre.append({"matcher": matcher,
-                        "hooks": [_handler()]})
+        handler = _ours(matcher)
+        if handler is None:
+            pre.append({"matcher": matcher, "hooks": [_handler()]})
+            changed.append(f"{matcher}: registered")
+        else:
+            changed += [f"{matcher}: {c}" for c in
+                        reconcile_handler(handler, _handler())]
 
     with open(path, "w", encoding="utf-8") as f:
         json.dump(settings, f, indent=2)
         f.write("\n")
+    return changed

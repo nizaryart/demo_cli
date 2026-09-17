@@ -68,6 +68,37 @@ def event_list(settings: dict, event: str) -> list:
     return handlers
 
 
+def reconcile_handler(existing: dict, wanted: dict) -> list:
+    """Bring `existing` up to `wanted` IN PLACE. Returns what changed.
+
+    The installers were add-if-absent: one matching command string and the
+    whole entry was skipped, so a raised hook timeout never reached anyone
+    already installed and `doctor` called it ok. Cursor already repaired one
+    field this way (failClosed); the other two hosts did not.
+
+    A TIMEOUT THE USER RAISED IS KEPT. The defect is a budget that was too
+    LOW, so raising ours is never wrong and lowering theirs would re-introduce
+    the silent kill - the host destroys the hook mid-copy, runs the command
+    unguarded and prints nothing. A deliberately LOWERED timeout is therefore
+    not honoured, and that is the one case this overrides on purpose.
+
+    Keys we do not write are left alone. Dropping something a user added
+    would be the same class of silent loss the parse refusal exists to stop.
+    """
+    changed = []
+    for key, value in wanted.items():
+        current = existing.get(key)
+        if (key == "timeout" and isinstance(current, (int, float))
+                and not isinstance(current, bool) and current > value):
+            continue
+        if current == value:
+            continue
+        changed.append(f"{key} {current!r} -> {value!r}" if key in existing
+                       else f"{key} {value!r} added")
+        existing[key] = value
+    return changed
+
+
 def attributed(reason: str) -> str:
     """Prefix a message the AGENT will read with who is speaking.
 

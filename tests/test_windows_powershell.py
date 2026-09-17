@@ -56,8 +56,22 @@ def test_install_upgrades_bash_only_install_to_cover_powershell(tmp_path):
     blocks = json.loads(open(path, encoding="utf-8").read())["hooks"]["PreToolUse"]
     matchers = [b["matcher"] for b in blocks]
     assert "Bash" in matchers and "PowerShell" in matchers
-    # Upgraded in place, not duplicated: still exactly one Bash block.
+    # Not duplicated: still exactly one Bash block.
     assert matchers.count("Bash") == 1
+
+    # UPGRADED IN PLACE, which this comment claimed from 09-06 until
+    # 2026-09-17 while the code only ever skipped the existing block. The
+    # fixture above is a pre-timeout handler, so before the reconcile landed
+    # the Bash block kept no timeout at all while the two appended blocks got
+    # 120 - one machine, two budgets, and doctor printed one ok row. The
+    # assertion reads the HANDLER now; reading only the matcher list is what
+    # let the claim go unchecked for eleven days.
+    from demo_cli.hooks.claude_code import _HOOK_TIMEOUT
+    for b in blocks:
+        handler = [h for h in b["hooks"] if h["command"] == "demo_cli hook"][0]
+        assert handler["type"] == "command"
+        assert handler["timeout"] == _HOOK_TIMEOUT, (
+            f"{b['matcher']} kept a stale handler: {handler}")
 
 
 def test_install_into_settings_is_idempotent_for_powershell(tmp_path):

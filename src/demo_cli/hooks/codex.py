@@ -90,7 +90,7 @@ from ..config import load_config
 from ..context import Intent
 from ..decide import ASK, BLOCKING
 from ..guard import AgentDirectoryUnreachable, Guard, agent_directory
-from . import event_list, load_host_config
+from . import event_list, load_host_config, reconcile_handler
 
 # The command Codex invokes; also written into hooks.json on install.
 HOOK_COMMAND = "demo_cli hook-codex"
@@ -485,16 +485,39 @@ def _declares_our_hook(group) -> bool:
                for h in group.get("hooks", []) or [])
 
 
-def install_into_hooks_json(path: str) -> None:
-    """Merge the PreToolUse hook into an existing `.codex/hooks.json`,
-    preserving any other events the user already declared. Idempotent."""
+def install_into_hooks_json(path: str) -> List[str]:
+    """Merge or RECONCILE the PreToolUse hook in `.codex/hooks.json`,
+    preserving any other events the user already declared. Returns what
+    changed.
+
+    Add-if-absent until 2026-09-17, which is why ~/.codex/hooks.json on the
+    dev box still carried the pre-upgrade "timeout": 30. It also repairs the
+    inert shape: a handler with no "type" is accepted by the parser and then
+    ignored, and re-running install used to leave it exactly as it was.
+    """
     settings = load_host_config(path)
     pre = event_list(settings, "PreToolUse")
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
 
-    if not any(_declares_our_hook(g) for g in pre):
+    wanted = settings_snippet()["hooks"]["PreToolUse"][0]["hooks"][0]
+    handler = None
+    for g in pre:
+        if not isinstance(g, dict):
+            continue
+        for h in g.get("hooks") or []:
+            if isinstance(h, dict) and h.get("command") == HOOK_COMMAND:
+                handler = h
+                break
+        if handler is not None:
+            break
+
+    if handler is None:
         pre.append(settings_snippet()["hooks"]["PreToolUse"][0])
+        changed = ["registered"]
+    else:
+        changed = reconcile_handler(handler, wanted)
 
     with open(path, "w", encoding="utf-8") as f:
         json.dump(settings, f, indent=2)
         f.write("\n")
+    return changed

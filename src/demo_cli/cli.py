@@ -887,6 +887,20 @@ def cmd_init(a) -> int:
     return 0
 
 
+def _report_reconcile(changed) -> None:
+    """Say what a re-run actually DID.
+
+    A re-install that repaired a stale entry printed the same "Installed..."
+    line as one that changed nothing, so there was no way to tell a repair
+    from a no-op - which is part of why the stale timeout survived unnoticed.
+    """
+    if not changed:
+        print("  already current - nothing changed.")
+        return
+    for item in changed:
+        print(f"  reconciled: {item}")
+
+
 def cmd_install_hook(a) -> int:
     try:
         return _install_hook(a)
@@ -904,8 +918,9 @@ def _install_hook(a) -> int:
             return 0
         target = (os.path.expanduser("~/.codex/hooks.json") if a.scope == "global"
                   else os.path.join(os.getcwd(), ".codex", "hooks.json"))
-        install_into_hooks_json(target)
+        changed = install_into_hooks_json(target)
         print(f"Installed PreToolUse hook into {target}")
+        _report_reconcile(changed)
         print("Gates Codex shell commands (Bash) AND file edits (apply_patch).")
         print()
         # WHAT THIS SAID UNTIL 2026-09-13, and why it was changed: it listed
@@ -946,8 +961,9 @@ def _install_hook(a) -> int:
             return 0
         target = (os.path.expanduser("~/.cursor/hooks.json") if a.scope == "global"
                   else os.path.join(os.getcwd(), ".cursor", "hooks.json"))
-        install_into_hooks_json(target)
+        changed = install_into_hooks_json(target)
         print(f"Installed beforeShellExecution hook into {target}")
+        _report_reconcile(changed)
         print("demo_cli will now fire before each Cursor shell command (failClosed: true).")
         return 0
     from .hooks.claude_code import settings_snippet, install_into_settings
@@ -957,8 +973,9 @@ def _install_hook(a) -> int:
         return 0
     target = (os.path.expanduser("~/.claude/settings.json") if a.scope == "global"
               else os.path.join(os.getcwd(), ".claude", "settings.json"))
-    install_into_settings(target)
+    changed = install_into_settings(target)
     print(f"Installed PreToolUse hook into {target}")
+    _report_reconcile(changed)
     print("demo_cli will now fire automatically before each Bash command.")
     return 0
 
