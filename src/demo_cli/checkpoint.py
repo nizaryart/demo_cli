@@ -92,6 +92,7 @@ DISABLED = "disabled"
 NO_ROOT = "no_project_root"
 TOO_BROAD = "too_broad"
 TOO_LARGE = "too_large"
+TOO_MANY_FILES = "too_many_files"
 FAILED = "copy_failed"
 
 
@@ -162,9 +163,17 @@ def capture(cfg: Config, action: str) -> CheckpointResult:
     if recovery._too_broad(root):
         return CheckpointResult(skipped=TOO_BROAD)
 
+    # One walk, two budgets. Bytes bound disk space, files bound TIME, and
+    # only the byte half was ever checked here - so a tree that tripped the
+    # file cap INSIDE snapshot() came back as "copy_failed", which names
+    # neither the cause nor the knob and describes a copy that never began.
     cap = recovery._max_snapshot_bytes()
-    if recovery._dir_size(root, cap, CHECKPOINT_IGNORE) > cap:
+    file_cap = recovery._max_snapshot_files()
+    nbytes, nfiles = recovery._walk_cost(root, cap, file_cap, CHECKPOINT_IGNORE)
+    if nbytes > cap:
         return CheckpointResult(skipped=TOO_LARGE)
+    if file_cap is not None and nfiles > file_cap:
+        return CheckpointResult(skipped=TOO_MANY_FILES)
 
     entry = recovery.snapshot(
         recovery.Target(kind="dir", ref=root, label="checkpoint"),
@@ -179,6 +188,7 @@ def capture(cfg: Config, action: str) -> CheckpointResult:
 def reason_text(skipped: str, cfg: Config) -> str:
     """Why no checkpoint, in words the person reading the receipt can act on."""
     cap_mb = recovery._max_snapshot_bytes() // (1024 * 1024)
+    file_cap = recovery._max_snapshot_files()
     return {
         DISABLED: "Checkpointing is off; enable [checkpoint] in .demo_cli.toml.",
         NO_ROOT: "No project root to checkpoint.",
@@ -186,5 +196,10 @@ def reason_text(skipped: str, cfg: Config) -> str:
                    f"copy honestly (home or filesystem root).",
         TOO_LARGE: f"Workspace exceeds the {cap_mb} MB checkpoint cap; raise "
                    f"DEMO_CLI_MAX_SNAPSHOT_MB or resolve the target explicitly.",
+        TOO_MANY_FILES: f"Workspace holds more than {file_cap:,} files; capturing "
+                        f"it would outlast the agent's hook timeout, and a hook "
+                        f"killed mid-copy lets the command run unguarded with no "
+                        f"warning. Raise DEMO_CLI_MAX_SNAPSHOT_FILES and the hook "
+                        f"timeout together, or resolve the target explicitly.",
         FAILED: "Checkpoint copy did not complete; no recovery was taken.",
     }.get(skipped, "No checkpoint was taken.")

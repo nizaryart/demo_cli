@@ -499,8 +499,10 @@ class Guard:
 
         rule = self.config.match_target(label)
         strategy = rule.recovery if rule else "snapshot"
+        snap_notes: dict = {}
         entry = (recovery.snapshot(target, self.config.recovery_dir, strategy,
-                                   action=f"{tool_name} {os.path.basename(ap)}")
+                                   action=f"{tool_name} {os.path.basename(ap)}",
+                                   notes=snap_notes)
                  if exists else None)
         recovery_captured = entry is not None
 
@@ -511,11 +513,18 @@ class Guard:
             decision = Decision(REVERSIBLE, "File snapshotted before the edit; reversible.",
                                 recoverable=True)
         else:
+            # A cap refusal names the cause and the knob; the generic advice
+            # below is false for it - the path IS readable and IS in the root.
+            refused = snap_notes.get("refused")
             decision = Decision(
                 ESCALATE,
-                "Could not snapshot the file before editing; no recovery path.",
+                "Could not snapshot the file before editing; no recovery path."
+                + (f" {refused}" if refused else ""),
                 recoverable=False,
-                next_steps=["Check the file is readable and within the project root."],
+                next_steps=(
+                    ["Raise the cap named above, or edit a narrower target.",
+                     "Or take an independent backup before editing."] if refused
+                    else ["Check the file is readable and within the project root."]),
             )
 
         receipt = Receipt(
