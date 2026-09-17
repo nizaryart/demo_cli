@@ -51,6 +51,34 @@ _CREATES_IF_MISSING = {"ps_set_content", "ps_new_item_force",
                        "ps_move_force", "ps_copy_force", "ps_rename_force"}
 
 
+def _nothing_else_acts(c: Classification) -> bool:
+    """Is the matched rule the ONLY reason this command was flagged?
+
+    The two creates-nothing corrections below clear is_destructive,
+    is_mutating AND matched_rule on the whole Classification. But
+    classify_pipeline sets matched_rule from the FIRST matching segment, so a
+    harmless new-file redirect in segment one erased every destructive
+    finding after it:
+
+        echo hi > new.txt && rm -rf src        -> ALLOW, receipt "safe"
+        echo hi > new.txt; rm src/main.py      -> ALLOW, receipt "safe"
+        echo hi > new.txt && git reset --hard  -> ALLOW, receipt "safe"
+        rm -rf src && echo hi > new.txt        -> ESCALATE  (order flipped)
+        echo hi > existing.txt && rm -rf src   -> ESCALATE  (target exists)
+
+    A correction about ONE segment must not speak for the others. Each clause
+    here is a separate way a later segment can act: a second destructive
+    rule, a non-recoverable surface (`docker volume rm`, which is not a
+    destructive SEGMENT and so escapes the count), a SQL mutation, an
+    in-place file writer, or opaque remote execution.
+    """
+    return (c.destructive_segments <= 1
+            and c.nonrecoverable_surface is None
+            and not c.is_sql_mutating
+            and not c.is_file_writer
+            and not c.remote_exec)
+
+
 @dataclass
 class GuardResult:
     command: str
@@ -237,7 +265,7 @@ class Guard:
             # effective, substituted segments the classifier judged, so the
             # two can no longer disagree about what the command touches.
             rt, resolved = recovery.resolve_redirect_target(command, dialect)
-            if resolved and not os.path.exists(rt):
+            if resolved and not os.path.exists(rt) and _nothing_else_acts(c):
                 c.is_destructive = False
                 c.is_mutating = False
                 c.matched_rule = None
@@ -247,7 +275,7 @@ class Guard:
             # $env:APPDATA\notes.txt, $(Get-Date).txt - used to come back as a
             # literal that os.path.exists denied, and was read as creation.
             named, resolved = recovery.ps_named_target(command, dialect)
-            if resolved and not os.path.exists(named):
+            if resolved and not os.path.exists(named) and _nothing_else_acts(c):
                 c.is_destructive = False
                 c.is_mutating = False
                 c.matched_rule = None
