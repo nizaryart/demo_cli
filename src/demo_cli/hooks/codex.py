@@ -367,6 +367,7 @@ def run_pretooluse(stdin, stdout) -> int:
     if not command:
         return 0
 
+    guard = None
     try:
         cfg = load_config(start=cwd)
         guard = Guard(config=cfg)
@@ -386,6 +387,10 @@ def run_pretooluse(stdin, stdout) -> int:
         # is about to touch. Escalating costs almost nothing - this happens
         # only when the directory is gone or unreadable - and proceeding would
         # mean guessing a base we already know is wrong.
+        if getattr(guard, "mode", None) != "enforce":
+            _stderr(f"demo_cli [shadow] would deny: the directory the agent "
+                    f"reported ({exc}) cannot be entered")
+            return 0
         _emit(stdout, "deny",
               f"the working directory the agent reported ({exc}) cannot be "
               f"entered, so a relative path in this command cannot be "

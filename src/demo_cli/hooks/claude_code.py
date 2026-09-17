@@ -68,7 +68,13 @@ def _loud_block(result) -> None:
     """Unmissable stderr for an escalate/block (enforce path)."""
     _stderr("")
     _stderr(f"demo_cli \u26d4 blocked: {result.decision.reason}")
-    _stderr("         nothing was captured, and nothing is claimed to be.")
+    entry = getattr(result, "recovery_entry", None)
+    if entry:
+        # Captured-then-refused. The snapshot is real; the command is not.
+        _stderr(f"         a recovery point ({entry.get('id', '')}) was captured before the")
+        _stderr("         refusal; the command did not run, so there is nothing to undo.")
+    else:
+        _stderr("         nothing was captured, and nothing is claimed to be.")
     try:
         from ..render import feedback_url_for
         url = feedback_url_for(result)
@@ -114,6 +120,7 @@ def run_pretooluse(stdin, stdout) -> int:
         # Beta scope: gate shell + file-write tools. Everything else passes.
         return 0
 
+    guard = None
     try:
         cfg = load_config(start=cwd)
         # WHAT THE FILESYSTEM LAYER DID, BEFORE ANYTHING ELSE.
@@ -161,6 +168,20 @@ def run_pretooluse(stdin, stdout) -> int:
                     agent_id=data.get("agent_id", "claude-code"),
                     session_id=data.get("session_id", "unknown"),
                 )
+    except AgentDirectoryUnreachable as exc:
+        # We cannot stand where the agent stands, so a relative path in this
+        # call cannot be resolved and nothing can be captured for it. Codex has
+        # denied here since 09-13; this host fell into the blanket handler below
+        # and stepped aside on the identical exception.
+        if getattr(guard, "mode", None) != "enforce":
+            _stderr(f"demo_cli [shadow] would deny: the directory the agent "
+                    f"reported ({exc}) cannot be entered")
+            return 0
+        _emit(stdout, "deny",
+              f"the working directory the agent reported ({exc}) cannot be "
+              f"entered, so a relative path in this call cannot be resolved "
+              f"and nothing can be captured for it")
+        return 0
     except Exception as exc:  # our bug must not block the user
         sys.stderr.write(f"demo_cli: internal error, stepping aside ({exc})\n")
         return 0
@@ -177,12 +198,15 @@ def run_pretooluse(stdin, stdout) -> int:
         return 0
 
     reason = result.decision.reason
-    if result.recovery_entry:
+    # Blocking is tested FIRST. The nonrecoverable-surface branch captures and
+    # then refuses, so the save arm would announce a recovery point for a
+    # command that never ran. The shadow block above already orders it this way.
+    if result.decision.is_blocking:
+        _loud_block(result)         # <-- make the block legible, with report link
+    elif result.recovery_entry:
         rid = result.recovery_entry.get("id", "")
         reason += f"  (recovery point {rid}; undo with `demo_cli undo {rid}`)"
         _loud_save(result)          # <-- make the save FELT, on stderr
-    elif result.decision.is_blocking:
-        _loud_block(result)         # <-- make the block legible, with report link
     if fs_note:
         # Also on the decision reason, not only stderr. Whether hook stderr
         # reaches the model is up to the host and its version; this field

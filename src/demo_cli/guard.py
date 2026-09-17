@@ -19,6 +19,7 @@ from typing import List, Optional, Tuple
 
 import contextlib
 import os
+import sys
 
 from . import approval, checkpoint, preview as preview_mod, recovery
 from .classify import (POSIX, Classification, classify_pipeline,
@@ -28,6 +29,19 @@ from .context import Context, Intent, build_context, compare_intent
 from .decide import (ALLOW, ASK, BLOCKING, CONTEXT_MISMATCH, DRY_RUN, ESCALATE,
                      REVERSIBLE, Decision, decide)
 from .receipts import Receipt, append_receipt
+
+
+def _record_receipt(path: str, receipt: Receipt) -> bool:
+    """Append a receipt without ever raising. The receipt is evidence, not a
+    precondition for a decision - and the adapters fail open on an exception,
+    so a failed write here would let the command run unguarded."""
+    try:
+        append_receipt(path, receipt)
+        return True
+    except Exception as exc:
+        sys.stderr.write(f"demo_cli: receipt not written ({exc}); "
+                         "the decision below still stands\n")
+        return False
 
 
 # PowerShell rules whose target is created rather than destroyed when the path
@@ -170,10 +184,7 @@ class Guard:
             matched_rule="config_unreadable", classification="safe",
             context=ctx.as_dict(), agent_id=agent_id, session_id=session_id,
         )
-        try:
-            append_receipt(self.config.receipts_path, receipt)
-        except Exception:
-            pass          # the receipt is evidence, not a precondition for refusing
+        _record_receipt(self.config.receipts_path, receipt)
         return GuardResult(command=command, classification=c, context=ctx,
                            decision=decision, mode=self.mode, receipt=receipt)
 
@@ -439,7 +450,7 @@ class Guard:
             agent_id=agent_id,
             session_id=session_id,
         )
-        append_receipt(self.config.receipts_path, receipt)
+        _record_receipt(self.config.receipts_path, receipt)
 
         return GuardResult(
             command=command, classification=c, context=ctx, decision=decision, mode=self.mode,
@@ -522,7 +533,7 @@ class Guard:
             agent_id=agent_id,
             session_id=session_id,
         )
-        append_receipt(self.config.receipts_path, receipt)
+        _record_receipt(self.config.receipts_path, receipt)
 
         return GuardResult(
             command=f"{tool_name} {ap}", classification=c, context=ctx,
