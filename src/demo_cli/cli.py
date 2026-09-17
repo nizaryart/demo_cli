@@ -388,58 +388,171 @@ def cmd_receipt(a) -> int:
 # `nested` distinguishes the two config shapes: Claude Code and Codex wrap
 # handlers in a group ({matcher, hooks:[{type, command}]}), Cursor lists them
 # flat ({command, failClosed}).
-#            label          directory   filename         event                   command                nested
+# `module` is the hooks submodule that owns that host's settings_snippet(), so
+# "what we would install today" is read from the installer itself rather than
+# retyped here. A retyped duplicate is how _walk_cost once measured a
+# different ignore set than the copy it was bounding.
+#            label          directory   filename         event                   command                nested  module
 _HOSTS = [
-    ("claude code", ".claude", "settings.json", "PreToolUse",            "demo_cli hook",        True),
-    ("cursor",      ".cursor", "hooks.json",    "beforeShellExecution",  "demo_cli hook-cursor", False),
-    ("codex",       ".codex",  "hooks.json",    "PreToolUse",            "demo_cli hook-codex",  True),
+    ("claude code", ".claude", "settings.json", "PreToolUse",            "demo_cli hook",        True,  "claude_code"),
+    ("cursor",      ".cursor", "hooks.json",    "beforeShellExecution",  "demo_cli hook-cursor", False, "cursor"),
+    ("codex",       ".codex",  "hooks.json",    "PreToolUse",            "demo_cli hook-codex",  True,  "codex"),
 ]
 
 
-def _hook_installed(path, event: str = "PreToolUse",
-                    command: str = "demo_cli hook", nested: bool = True) -> bool:
-    if not os.path.exists(path):
-        return False
-    try:
-        with open(path, encoding="utf-8-sig") as f:
-            data = json.load(f)
-    except Exception:
-        return False
-    for block in (data.get("hooks", {}) or {}).get(event, []) or []:
+def _our_entries(data, event: str, command: str, nested: bool):
+    """[(matcher_or_None, handler)] for every entry of OURS in `data`.
+
+    One traversal, used for the installed file and for settings_snippet()
+    alike - the two have the same shape, which is what lets doctor compare
+    them without a second description of either.
+    """
+    out = []
+    for block in ((data.get("hooks") if isinstance(data, dict) else None) or {}).get(event, []) or []:
         if not isinstance(block, dict):
             continue
         handlers = (block.get("hooks") or []) if nested else [block]
         for h in handlers:
             if isinstance(h, dict) and h.get("command") == command:
-                return True
-    return False
+                out.append((block.get("matcher") if nested else None, h))
+    return out
+
+
+def _read_host_config(path):
+    """The parsed file, or None. utf-8-sig: a BOM must not read as absent."""
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _hook_installed(path, event: str = "PreToolUse",
+                    command: str = "demo_cli hook", nested: bool = True) -> bool:
+    data = _read_host_config(path)
+    return bool(data is not None and _our_entries(data, event, command, nested))
+
+
+def _compare_entries(installed, expected, nested: bool):
+    """(stale, inert) - short phrases naming what does not match.
+
+    `stale` is a field we would write differently today; the fix is a re-run
+    of install-hook. `inert` is stronger: the entry is registered and cannot
+    fire, which is worse than not being installed at all because every other
+    signal reports it as present. codex.py documents the one case - a handler
+    without "type" is "accepted by the file parser and then SILENTLY IGNORED
+    - no error, no warning, no hook, no protection". Both nested hosts use
+    that handler shape; Cursor's flat entry has no "type" to miss.
+    """
+    stale, inert = [], []
+    by_matcher = {}
+    for matcher, handler in installed:
+        by_matcher.setdefault(matcher, handler)
+    for matcher, want in expected:
+        if matcher not in by_matcher:
+            stale.append(f"no entry for {matcher!r}" if matcher is not None
+                         else "no entry")
+            continue
+        got = by_matcher[matcher]
+        where = f" on {matcher!r}" if matcher is not None and len(expected) > 1 else ""
+        if nested and "type" in want and "type" not in got:
+            inert.append(f'handler{where} has no "type"')
+        for key, value in want.items():
+            if key in ("command", "type"):
+                continue        # the match key, and the inert case above
+            if key not in got:
+                stale.append(f"{key} absent{where}, current {value!r}")
+            elif got[key] != value:
+                stale.append(f"{key} {got[key]!r}{where}, current {value!r}")
+    return stale, inert
+
+
+def _expected_entries(module: str, event: str, command: str, nested: bool):
+    """What this version would install, read off the installer's own snippet."""
+    import importlib
+    mod = importlib.import_module(f".hooks.{module}", __package__)
+    return _our_entries(mod.settings_snippet(), event, command, nested)
+
+
+def _hook_check_rows(cfg):
+    """[(status, label, detail)] - doctor's hook rows.
+
+    Four states, where there used to be two. `inert` is a FAIL for the same
+    reason the PATH check is: every other signal reports such an entry as
+    present, so a soft row is how it stays broken.
+    """
+    rows = []
+    for label, path, stale, inert in _host_hook_audit(cfg):
+        flag = {"codex": " --codex", "cursor": " --cursor"}.get(label, "")
+        name = f"hook: {label}"
+        if path is None:
+            rows.append(("warn", name,
+                         f"not installed (demo_cli install-hook{flag})"))
+        elif inert:
+            rows.append(("fail", name,
+                         f"{path}  ->  REGISTERED BUT INERT: {'; '.join(inert)}"))
+        elif stale:
+            rows.append(("warn", name,
+                         f"{path}  ->  stale: {'; '.join(stale)}"
+                         f"  ->  re-run: demo_cli install-hook{flag}"))
+        else:
+            rows.append(("ok", name, path))
+    return rows
+
+
+def _host_hook_audit(cfg):
+    """[(label, path_or_None, stale, inert)] for every host.
+
+    doctor answered "am I protected" with presence: one string compared, and
+    `ok` printed. An entry written by an older version kept whatever it had -
+    the raised hook timeout never reached anyone already installed, and there
+    was no state between "not installed" and "ok" for doctor to say so in.
+    """
+    out = []
+    for label, directory, filename, event, command, nested, module in _HOSTS:
+        found, stale, inert = None, [], []
+        for base in (cfg.project_root, os.path.expanduser("~")):
+            path = os.path.join(base, directory, filename)
+            data = _read_host_config(path)
+            if data is None:
+                continue
+            installed = _our_entries(data, event, command, nested)
+            if not installed:
+                continue
+            found = path
+            stale, inert = _compare_entries(
+                installed, _expected_entries(module, event, command, nested), nested)
+            break
+        out.append((label, found, stale, inert))
+    return out
 
 
 def _host_hook_status(cfg):
-    """[(label, path_or_None)] - where each host's hook is registered, if it is.
+    """[(label, path_or_None)] - the view guarded.assess takes. One traversal
+    behind it, in _host_hook_audit.
 
     doctor used to report a single 'claude code hook' row and look only in
     .claude, so a machine with Codex fully wired up was told 'not installed' by
     the one command whose job is answering 'am I protected'."""
-    out = []
-    for label, directory, filename, event, command, nested in _HOSTS:
-        found = None
-        for base in (cfg.project_root, os.path.expanduser("~")):
-            path = os.path.join(base, directory, filename)
-            if _hook_installed(path, event, command, nested):
-                found = path
-                break
-        out.append((label, found))
-    return out
+    return [(label, path) for label, path, _stale, _inert in _host_hook_audit(cfg)]
 
 
 def _hook_selftest(tool_name: str, command: str) -> bool:
     """Run a harmless destructive command through the real hook entrypoint,
-    as the named tool (Bash or PowerShell), and confirm it comes back as a
-    real decision. This proves the wiring end to end, not just that files
-    exist - and running it once per shell tool is what catches a Windows
-    install where only the Bash matcher got registered (PowerShell commands
-    would otherwise silently skip the hook)."""
+    as the named tool (Bash or PowerShell), and confirm the ADAPTER turns it
+    into a real decision.
+
+    SCOPE, corrected 2026-09-17: this said it "proves the wiring end to end"
+    and "catches a Windows install where only the Bash matcher got
+    registered". It cannot. It builds its own payload and calls
+    run_pretooluse IN-PROCESS - it never opens settings.json and never
+    consults a matcher, so it passes identically whether PowerShell is
+    registered or not. The missing matcher is caught by _host_hook_audit,
+    which compares the file against settings_snippet(); this proves the
+    adapter, and the receipts row below is what proves the wiring.
+    """
     import contextlib
     import io
     import json
@@ -652,11 +765,7 @@ def cmd_doctor(a) -> int:
     from . import deps as deps_mod
     checks.extend(d.as_check() for d in deps_mod.check_all(cfg.project_root))
 
-    hosts = _host_hook_status(cfg)
-    for label, path in hosts:
-        flag = {"codex": " --codex", "cursor": " --cursor"}.get(label, "")
-        checks.append(("ok" if path else "warn", f"hook: {label}",
-                       path or f"not installed (demo_cli install-hook{flag})"))
+    checks.extend(_hook_check_rows(cfg))
     hook = _any_hook_installed(cfg)   # Claude Code specifically - gates the self-test below
 
     checks.extend(_mount_checks(cfg))
@@ -1339,7 +1448,7 @@ def _remove_hooks(project: str) -> List[str]:
     somebody running teardown is often already having a bad day.
     """
     removed = []
-    for label, directory, filename, event, command, nested in _HOSTS:
+    for label, directory, filename, event, command, nested, _module in _HOSTS:
         path = os.path.join(project, directory, filename)
         if not os.path.exists(path):
             continue
@@ -1450,7 +1559,7 @@ def cmd_setup(a) -> int:
 
     # 2. Hooks, for hosts that are actually present ------------------------
     installed = []
-    for label, directory, filename, event, command, nested in ([] if defer else _HOSTS):
+    for label, directory, filename, event, command, nested, _module in ([] if defer else _HOSTS):
         home_dir = os.path.join(os.path.expanduser("~"), directory)
         if not os.path.isdir(home_dir) and label != "claude code":
             continue                    # host not installed on this machine
