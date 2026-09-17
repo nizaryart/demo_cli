@@ -332,7 +332,16 @@ _REMOTE_EXEC = re.compile(
 _FILE_WRITERS = re.compile(
     r"\bprettier\b[^|;&]*--write"
     r"|\beslint\b[^|;&]*--fix"
-    r"|\b(?:black|isort|gofmt|rustfmt)\b"
+    # A CHECK IS NOT A WRITE. black, isort and rustfmt write by default;
+    # --check / --diff make them read-only, and treating those as mutating
+    # both over-blocked (no target resolved -> ESCALATE) and, once the
+    # operand extractor learned these verbs, snapshotted a file that was
+    # never going to change. gofmt is the other way round - it prints to
+    # stdout unless -w is given - so it needs the flag rather than lacking
+    # one. Measured 2026-09-17 via `black --check app.py`, which came back
+    # REVERSIBLE with a real snapshot of an unmodified file.
+    r"|\b(?:black|isort|rustfmt)\b(?![^|;&]*\s--?(?:check|diff))"
+    r"|\bgofmt\b[^|;&]*\s-w\b"
     r"|\b(?:npm|yarn|pnpm)\s+(?:install|add|remove|i)\b"
     r"|\bpip\s+install\b"
     r"|\b(?:npx|node)\b[^|;&]*(?:codegen|generate|migrate)\b",
@@ -427,6 +436,22 @@ _NONRECOVERABLE_SURFACES = [
      _CMD_PREFIX + r"(?:(?:npm|pnpm|yarn)\s+unpublish\b|cargo\s+yank\b|gem\s+yank\b)"),
 ]
 _NONRECOVERABLE = [(label, re.compile(rx, re.I)) for label, rx in _NONRECOVERABLE_SURFACES]
+
+# The writers that rewrite the file they are POINTED AT. A subset of
+# _FILE_WRITERS, and the distinction is the whole finding: that rule's
+# comment promises "snapshot the path first so the change is visible and
+# reversible", and for a third of the tools it covers there is no path in the
+# text at all. npm/yarn/pnpm/pip/npx name none - they rewrite node_modules or
+# site-packages - so nothing can be extracted for them and they keep
+# escalating (Nizar's call, 2026-09-17: fail-closed is the honest answer and
+# `checkpoint` stays the opt-in way to cover them).
+#
+# Shared with recovery.py rather than retyped there. The classifier says
+# "this mutates" and the extractor says "this is what it touches"; if the two
+# disagree about WHICH commands, one looks for a path in text the other never
+# flagged. Same lesson as the _SQL_*_RX constants on 09-15.
+FILE_WRITER_TARGET_VERBS = ("prettier", "eslint", "black", "isort",
+                            "gofmt", "rustfmt")
 
 _SQL_READ = re.compile(r"^\s*SELECT\b", re.I)
 
@@ -1232,6 +1257,17 @@ def classify_pipeline(cmd: str, dialect: str = POSIX) -> Classification:
         nonrecoverable_surface=surface,
         segments=[s.strip() for s in segments] or [cmd.strip()],
     )
+
+
+def is_file_writer_command(cmd: str) -> bool:
+    """Does `cmd` match the in-place-writer rule the classifier uses?
+
+    Exported so recovery.py can gate its operand extraction on the SAME test.
+    A looser one there would count a READ as an action - `prettier src/a.js`
+    with no --write prints to stdout - and a second acting segment turns a
+    snapshot into an escalation.
+    """
+    return bool(_FILE_WRITERS.search(cmd))
 
 
 def is_sql_preview_candidate(cmd: str) -> bool:

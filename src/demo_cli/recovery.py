@@ -25,10 +25,12 @@ import uuid
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-from .classify import (POSIX, POWERSHELL, PS_CLEAR_CONTENT_ALIASES,
+from .classify import (FILE_WRITER_TARGET_VERBS, POSIX, POWERSHELL,
+                       PS_CLEAR_CONTENT_ALIASES,
                        PS_COPY_ALIASES, PS_MOVE_ALIASES, PS_NEW_ITEM_ALIASES,
                        PS_REMOVE_ALIASES, PS_RENAME_ALIASES,
                        effective_command, effective_segments,
+                       is_file_writer_command,
                        join_continuations,
                        strip_ps_escapes,
                        redirect_target, split_segments,
@@ -131,6 +133,17 @@ def resolve_target(cmd: str, explicit_db: Optional[str] = None,
 # command word; allow them so the operand extractor still fires (#006).
 _ENV_ASSIGN = re.compile(r"^[A-Za-z_]\w*=")
 _RM_RE = re.compile(r"^\s*(?:[A-Za-z_]\w*=\S*\s+)*(?:sudo\s+)?rm\b", re.I)
+# An in-place writer POINTED AT a path. Two conditions, deliberately: the
+# command word must be one that takes a path (so npm/pip are excluded), AND
+# the segment must match the classifier's own writer rule (so a read without
+# --write is not counted as an action).
+_WRITER_CMD_RE = re.compile(
+    r"^\s*(?:[A-Za-z_]\w*=\S*\s+)*(?:sudo\s+)?(?:"
+    + "|".join(FILE_WRITER_TARGET_VERBS) + r")\b", re.I)
+
+
+def _writer_hit(seg: str, _dialect: str) -> bool:
+    return bool(_WRITER_CMD_RE.match(seg) and is_file_writer_command(seg))
 _MV_RE = re.compile(r"^\s*(?:[A-Za-z_]\w*=\S*\s+)*(?:sudo\s+)?mv\b", re.I)
 _PS_REMOVE_RE = re.compile(r"^\s*Remove-Item\b", re.I)
 # `ri` is Remove-Item in PowerShell and Ruby's documentation viewer on POSIX.
@@ -397,7 +410,18 @@ def _path_operands(cmd: str, base: Optional[str] = None) -> List[str]:
     # only the leading run is skipped - `rm X=1 f` still treats X=1 as an operand.)
     while i < len(toks) and (_ENV_ASSIGN.match(toks[i]) or toks[i] == "sudo"):
         i += 1
-    if i < len(toks) and toks[i] in ("rm", "mv"):
+    # DROPPING THE COMMAND WORD IS WHAT MAKES THE REST OF THIS WORK, and it
+    # was a two-element tuple. Everything else kept its verb as a phantom
+    # operand, so `black app.py` counted TWO paths and collapsed to a common
+    # root instead of naming the file - while the flag skipping below already
+    # handled --write and -w for free. The generic machinery was all here;
+    # this line was the gate.
+    #
+    # Only a BARE verb is recognised. `./node_modules/.bin/prettier a.js`
+    # keeps its command word and still collapses - a stated miss, not a
+    # claim.
+    if i < len(toks) and (toks[i] in ("rm", "mv")
+                          or toks[i].lower() in FILE_WRITER_TARGET_VERBS):
         i += 1
     out: List[str] = []
     for tok in toks[i:]:
@@ -994,8 +1018,13 @@ def extract_path_operand(cmd: str, dialect: str = POSIX) -> Optional[str]:
 
     # (does this segment act?, what is its target?). A matcher takes the
     # segment AND its dialect, because `ri` only means Remove-Item in one.
+    # The writer row reuses _rm UNCHANGED: one operand -> that path, several
+    # -> their common capture root. That is already exactly a formatter's
+    # semantics, so `prettier --write src/` snapshots src/ and
+    # `black a.py b.py` snapshots the directory holding both.
     _MATCHERS = ((_rx(_RM_RE), _rm),
                  (_rx(_MV_RE), _mv),
+                 (_writer_hit, _rm),
                  (_ps_remove_hit, _existing(_ps_remove_item_operand)),
                  (_ps_content_hit, _existing(_ps_write_target)),
                  (_ps_dest_hit, _existing(_ps_dest_target)))
