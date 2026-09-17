@@ -19,6 +19,7 @@ from .context import Intent, normalize_env
 from .decide import CONTEXT_MISMATCH, ESCALATE
 from .diff import diff_entry
 from .guard import Guard
+from .hooks import HostConfigUnreadable
 from .receipts import verify_chain, find_receipt, share_card, load_receipts
 from .version import __version__
 
@@ -778,6 +779,14 @@ def cmd_init(a) -> int:
 
 
 def cmd_install_hook(a) -> int:
+    try:
+        return _install_hook(a)
+    except HostConfigUnreadable as exc:
+        print(f"demo_cli: {exc}")
+        return 1
+
+
+def _install_hook(a) -> int:
     if getattr(a, "codex", False):
         from .hooks.codex import settings_snippet, install_into_hooks_json
         snippet = settings_snippet()

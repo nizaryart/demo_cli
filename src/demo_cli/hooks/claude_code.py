@@ -35,6 +35,7 @@ from ..classify import POSIX, POWERSHELL
 from ..config import load_config
 from ..context import Intent
 from ..guard import AgentDirectoryUnreachable, Guard, agent_directory
+from . import event_list, load_host_config
 
 _FILE_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 # Claude Code fires the same PreToolUse shape for both a POSIX shell (Bash) and
@@ -254,21 +255,15 @@ def settings_snippet() -> Dict:
 
 
 def install_into_settings(path: str) -> None:
+    settings = load_host_config(path)
+    pre = event_list(settings, "PreToolUse")
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    settings: Dict = {}
-    if os.path.exists(path):
-        try:
-            with open(path, encoding="utf-8") as f:
-                settings = json.load(f)
-        except Exception:
-            settings = {}
-    hooks = settings.setdefault("hooks", {})
-    pre = hooks.setdefault("PreToolUse", [])
 
     def _present(matcher: str) -> bool:
         return any(
             isinstance(b, dict) and b.get("matcher") == matcher
-            and any(h.get("command") == "demo_cli hook" for h in b.get("hooks", []))
+            and any(isinstance(h, dict) and h.get("command") == "demo_cli hook"
+                    for h in b.get("hooks") or [])
             for b in pre
         )
 

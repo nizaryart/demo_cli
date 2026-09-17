@@ -90,6 +90,7 @@ from ..config import load_config
 from ..context import Intent
 from ..decide import ASK, BLOCKING
 from ..guard import AgentDirectoryUnreachable, Guard, agent_directory
+from . import event_list, load_host_config
 
 # The command Codex invokes; also written into hooks.json on install.
 HOOK_COMMAND = "demo_cli hook-codex"
@@ -487,16 +488,9 @@ def _declares_our_hook(group) -> bool:
 def install_into_hooks_json(path: str) -> None:
     """Merge the PreToolUse hook into an existing `.codex/hooks.json`,
     preserving any other events the user already declared. Idempotent."""
+    settings = load_host_config(path)
+    pre = event_list(settings, "PreToolUse")
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    settings: Dict = {}
-    if os.path.exists(path):
-        try:
-            with open(path, encoding="utf-8") as f:
-                settings = json.load(f)
-        except Exception:
-            settings = {}
-    hooks = settings.setdefault("hooks", {})
-    pre = hooks.setdefault("PreToolUse", [])
 
     if not any(_declares_our_hook(g) for g in pre):
         pre.append(settings_snippet()["hooks"]["PreToolUse"][0])

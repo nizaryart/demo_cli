@@ -43,7 +43,7 @@ step aside instead. A true crash is still caught by ``failClosed: true``.
 """
 from __future__ import annotations
 
-from . import attributed
+from . import attributed, event_list, load_host_config
 
 import json
 import os
@@ -165,17 +165,10 @@ def install_into_hooks_json(path: str) -> None:
     """Merge the beforeShellExecution hook into an existing `.cursor/hooks.json`,
     preserving any other hooks the user already declared. Idempotent, and it
     keeps `failClosed: true` even if a prior entry omitted it."""
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    settings: Dict = {}
-    if os.path.exists(path):
-        try:
-            with open(path, encoding="utf-8") as f:
-                settings = json.load(f)
-        except Exception:
-            settings = {}
+    settings = load_host_config(path)
+    bse = event_list(settings, "beforeShellExecution")
     settings.setdefault("version", 1)
-    hooks = settings.setdefault("hooks", {})
-    bse = hooks.setdefault("beforeShellExecution", [])
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
 
     existing = [b for b in bse if isinstance(b, dict) and b.get("command") == HOOK_COMMAND]
     if existing:
