@@ -404,11 +404,31 @@ class Guard:
         reached = reached | recovery.ignored_dirs_under(blast)
         keep_out = (None if not reached
                     else frozenset(recovery.IGNORED_DIRS) - reached)
+        # Structural approval (only meaningful for the non-recoverable case).
+        approval_ok = False
+        key = self.config.approver_key
+        if approval_token and key:
+            approval_ok = approval.verify(command, approval_token, key)
+
+        # Snapshot eligibility:
+        # A snapshot is ONLY meaningful for a mutating action that can genuinely
+        # be recovered locally. Opaque remote execution (fetch-and-run) and
+        # non-recoverable surfaces (external infra/payment/cluster/managed DB)
+        # cannot truthfully be recovered by a local snapshot, so we refuse to
+        # capture phantom snapshots that would pollute the recovery index and
+        # falsely suggest an escalated or unrecoverable command was reversible.
+        is_snapshot_eligible = bool(
+            c.needs_recovery
+            and not c.remote_exec
+            and not c.nonrecoverable_surface
+            and not remote_pg
+        )
+
         snap_notes: dict = {}
         entry = (recovery.snapshot(target, self.config.recovery_dir, strategy,
                                    action=command, ignore_dirs=keep_out,
                                    notes=snap_notes)
-                 if (c.needs_recovery and not remote_pg) else None)
+                 if is_snapshot_eligible else None)
 
         # LAST RESORT, never a first choice. Reached only when the command
         # mutates something and no target could be resolved at all - `rm
@@ -432,12 +452,6 @@ class Guard:
         preview_count, preview_rows, preview_cols = None, [], []
         if recovery_captured and is_sql_preview_candidate(command):
             preview_count, preview_rows, preview_cols = preview_mod.preview(command, target)
-
-        # Structural approval (only meaningful for the non-recoverable case).
-        approval_ok = False
-        key = self.config.approver_key
-        if approval_token and key:
-            approval_ok = approval.verify(command, approval_token, key)
 
         decision = decide(
             c, ctx.environment, recovery_captured,

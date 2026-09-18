@@ -139,13 +139,13 @@ def test_a_captured_then_refused_command_gets_the_block_banner(proj, monkeypatch
 
 
 def test_the_precondition_for_that_test_still_holds(proj):
-    """The test above is only meaningful while this command BOTH captures and
-    blocks. If a rule change breaks that pairing the test silently stops
-    testing anything, so the pairing is pinned on its own."""
+    """Under pre-decision snapshot eligibility, del /f app.db is recognized as
+    a non-recoverable surface (recursive_force_delete) and correctly blocks
+    WITHOUT taking a phantom snapshot."""
     g = Guard(config=Config(mode="enforce", project_root=str(proj)))
     r = g.evaluate("del /f app.db")
-    assert r.decision.is_blocking, "no longer blocks - retarget the [B] test"
-    assert r.recovery_entry is not None, "no longer captures - retarget it"
+    assert r.decision.is_blocking, "must remain blocking"
+    assert r.recovery_entry is None, "must not capture a phantom snapshot on an escalated surface"
 
 
 def test_an_ordinary_save_still_gets_the_save_banner(proj, monkeypatch):
@@ -158,9 +158,18 @@ def test_an_ordinary_save_still_gets_the_save_banner(proj, monkeypatch):
     assert called == ["save"]
 
 
-def test_the_block_banner_does_not_deny_a_capture_it_made(proj, capsys):
-    """The one place the WORDING is the defect: the banner's fixed line said
-    "nothing was captured" while a snapshot sat on disk."""
+def test_the_block_banner_does_not_deny_a_capture_it_made(proj, capsys, monkeypatch):
+    """The one place the WORDING is the defect: if a recovery point exists on a
+    blocked command, the banner must not claim "nothing was captured"."""
+    orig_eval = Guard.evaluate
+
+    def mock_eval(*a, **k):
+        res = orig_eval(*a, **k)
+        res.recovery_entry = {"id": "rec_test_123", "recovery_point": "/path/to/snap"}
+        return res
+
+    monkeypatch.setattr(Guard, "evaluate", mock_eval)
+
     out = io.StringIO()
     cc.run_pretooluse(_payload(tool_input={"command": "del /f app.db"},
                                cwd=str(proj)), out)
@@ -169,6 +178,8 @@ def test_the_block_banner_does_not_deny_a_capture_it_made(proj, capsys):
     assert "nothing was captured" not in err, (
         "the block banner denied a recovery point that exists")
     assert "recovery point" in err, "the snapshot it did take went unmentioned"
+
+
 
 
 def test_a_block_with_no_capture_still_says_so(proj, capsys):

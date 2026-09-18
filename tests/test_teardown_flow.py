@@ -156,7 +156,7 @@ def test_teardown_removes_the_mount_record_it_leaves_behind(tmp_path):
         assert not os.path.exists(leftover), f"stale record survived at {leftover}"
 
 
-def test_a_stale_record_on_an_unprotected_project_is_a_warning_not_a_failure(tmp_path):
+def test_a_stale_record_on_an_unprotected_project_is_a_warning_not_a_failure(tmp_path, monkeypatch):
     """The distinction the old code missed.
 
     backing present + pid gone -> the project IS protected and unguarded. fail.
@@ -166,6 +166,10 @@ def test_a_stale_record_on_an_unprotected_project_is_a_warning_not_a_failure(tmp
     teardown; collapsing the first into the second would hide a genuinely
     unguarded project, so both directions matter.
     """
+    import shutil
+    orig_which = shutil.which
+    monkeypatch.setattr("shutil.which", lambda cmd: "/usr/local/bin/demo_cli" if cmd == "demo_cli" else orig_which(cmd))
+
     project = str(tmp_path / "proj")
     os.makedirs(os.path.join(project, ".demo_cli"))
     with open(os.path.join(project, ".demo_cli", "mount.json"), "w") as f:
@@ -180,3 +184,4 @@ def test_a_stale_record_on_an_unprotected_project_is_a_warning_not_a_failure(tmp
     st = mountstate.status(load_config(project))
     assert st.stale, "precondition: the record must look stale"
     assert rc == 0, "a torn-down project must not fail doctor"
+

@@ -144,7 +144,7 @@ def should_checkpoint(c: Classification, target, cfg: Config,
         return False
     if recovery_captured or target is not None:
         return False
-    return not c.nonrecoverable_surface
+    return not c.nonrecoverable_surface and not c.remote_exec
 
 
 def capture(cfg: Config, action: str) -> CheckpointResult:
