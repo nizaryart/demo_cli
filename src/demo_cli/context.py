@@ -18,6 +18,7 @@ import json
 import os
 import re
 import subprocess
+import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -80,6 +81,67 @@ def resolve_env(cmd: str, target_label: Optional[str] = None,
     return "unknown", "unknown"
 
 
+_GIT_CACHE: Dict[str, Tuple[Tuple[str, str, str], float]] = {}
+
+
+def _find_git_dir(start: str) -> Tuple[Optional[str], Optional[str]]:
+    """Return (repo_root, git_path) or (None, None) if not inside a git repo."""
+    try:
+        cur = os.path.abspath(start)
+        while True:
+            git_path = os.path.join(cur, ".git")
+            if os.path.exists(git_path):
+                return cur, git_path
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                return None, None
+            cur = parent
+    except Exception:
+        return None, None
+
+
+def _git_context(cwd: Optional[str] = None) -> Tuple[str, str, str]:
+    """Return (repo_root, branch, remote) with fast filesystem checks and TTL caching."""
+    target_cwd = os.path.abspath(cwd or os.getcwd())
+    now = time.time()
+    cached = _GIT_CACHE.get(target_cwd)
+    if cached and now < cached[1]:
+        return cached[0]
+
+    repo_root, git_path = _find_git_dir(target_cwd)
+    if not repo_root or not git_path:
+        res = ("unknown", "unknown", "unknown")
+        _GIT_CACHE[target_cwd] = (res, now + 2.0)
+        return res
+
+    branch = "unknown"
+    remote = "unknown"
+    try:
+        # Fast path: inspect .git/HEAD directly to avoid spawning subprocess
+        head_file = os.path.join(git_path, "HEAD") if os.path.isdir(git_path) else None
+        if head_file and os.path.exists(head_file):
+            try:
+                with open(head_file, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read().strip()
+                if content.startswith("ref: refs/heads/"):
+                    branch = content[len("ref: refs/heads/"):].strip()
+                elif content:
+                    branch = "HEAD"
+            except Exception:
+                pass
+
+        if branch == "unknown":
+            branch = _git_value("rev-parse", "--abbrev-ref", "HEAD", cwd=target_cwd)
+
+        remote = _git_value("config", "--get", "remote.origin.url", cwd=target_cwd)
+    except Exception:
+        pass
+
+    res = (repo_root, branch, remote)
+    _GIT_CACHE[target_cwd] = (res, now + 2.0)
+    return res
+
+
 def _git_value(*args, cwd=None) -> str:
     try:
         p = subprocess.run(
@@ -127,11 +189,12 @@ def build_context(cmd: str, target_label: Optional[str] = None,
                   cwd: Optional[str] = None) -> Context:
     cwd = cwd or os.getcwd()
     env, source = resolve_env(cmd, target_label, declared_env, config_env)
+    repo_root, branch, remote = _git_context(cwd)
     ctx = Context(
         cwd=cwd,
-        repo_root=_git_value("rev-parse", "--show-toplevel", cwd=cwd),
-        branch=_git_value("rev-parse", "--abbrev-ref", "HEAD", cwd=cwd),
-        remote=_git_value("config", "--get", "remote.origin.url", cwd=cwd),
+        repo_root=repo_root,
+        branch=branch,
+        remote=remote,
         target_label=redact(target_label) if target_label else "unknown",
         environment=env,
         environment_source=source,

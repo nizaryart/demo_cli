@@ -96,6 +96,9 @@ def files(tmp_path, monkeypatch):
     "cd . && rm a.txt",          # restored by step 2 of the cd fix
     "echo one; echo two; rm a.txt",
     "cat a.txt | grep x; rm a.txt",
+    "echo hi & rm a.txt",
+    "rm a.txt &",
+    "echo one & echo two & rm a.txt",
 ])
 def test_a_chained_rm_still_resolves_its_target(files, cmd):
     assert recovery.extract_path_operand(cmd, POSIX) == "a.txt"

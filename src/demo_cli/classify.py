@@ -971,8 +971,8 @@ def _effective_segments(cmd: str, dialect: str, substitute: bool,
 
 
 def split_segments(cmd: str, dialect: str = POSIX) -> List[str]:
-    """Split a command line on shell separators (| || && ; newline) while
-    respecting single and double quotes. Returns trimmed, non-empty segments.
+    """Split a command line on shell separators (| || && ; newline, and single & in POSIX)
+    while respecting single and double quotes. Returns trimmed, non-empty segments.
 
     This is a pragmatic splitter, not a full shell parser; it exists so a
     destructive step hidden after a safe one in a chain is still classified.
@@ -1009,6 +1009,37 @@ def split_segments(cmd: str, dialect: str = POSIX) -> List[str]:
             buf = []
             i += 1
             continue
+        if ch == "&" and dialect != POWERSHELL:
+            # Single & in POSIX is a command separator / background operator,
+            # UNLESS it is part of:
+            # 1. &> or &>> redirection (stdout+stderr redirect)
+            # 2. >& or <& redirection (fd duplication, e.g. 2>&1, >&2, <&0)
+            # 3. Escaped \&
+            is_redirect = False
+            if nxt == ">":
+                is_redirect = True
+            else:
+                for b in reversed(buf):
+                    if b.isspace():
+                        continue
+                    if b in (">", "<"):
+                        is_redirect = True
+                    break
+
+            num_slashes = 0
+            for b in reversed(buf):
+                if b == "\\":
+                    num_slashes += 1
+                else:
+                    break
+            is_escaped = (num_slashes % 2 == 1)
+
+            if not is_redirect and not is_escaped:
+                segments.append("".join(buf))
+                buf = []
+                i += 1
+                continue
+
         buf.append(ch)
         i += 1
     segments.append("".join(buf))

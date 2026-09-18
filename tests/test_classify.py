@@ -1,4 +1,10 @@
-from demo_cli.classify import classify_pipeline, is_sql_preview_candidate
+from demo_cli.classify import (
+    POSIX,
+    POWERSHELL,
+    classify_pipeline,
+    is_sql_preview_candidate,
+    split_segments,
+)
 
 
 def test_safe_read_is_not_mutating():
@@ -272,3 +278,35 @@ def test_gh_destructive_extensions():
     assert classify_pipeline("gh api -X DELETE /repos/x/y").nonrecoverable_surface == "vcs_remote_state"
     assert classify_pipeline("gh repo view owner/x").nonrecoverable_surface is None
     assert classify_pipeline("gh pr list").nonrecoverable_surface is None
+
+
+def test_ampersand_background_splits_segments():
+    assert split_segments("echo hi & rm file.txt", POSIX) == ["echo hi", "rm file.txt"]
+    assert split_segments("rm -rf ./build &", POSIX) == ["rm -rf ./build"]
+    assert split_segments("echo hi &> out.log & rm file.txt", POSIX) == ["echo hi &> out.log", "rm file.txt"]
+    assert split_segments("echo hi 2>&1 & rm file.txt", POSIX) == ["echo hi 2>&1", "rm file.txt"]
+    assert split_segments("echo hi >&2 & rm file.txt", POSIX) == ["echo hi >&2", "rm file.txt"]
+    assert split_segments('echo "a & b" & rm file.txt', POSIX) == ['echo "a & b"', 'rm file.txt']
+    assert split_segments(r"echo a\&b & rm file.txt", POSIX) == [r"echo a\&b", "rm file.txt"]
+
+
+def test_ampersand_background_destructive_command_detected():
+    c1 = classify_pipeline("echo hi & rm file.txt")
+    assert c1.is_destructive
+    assert c1.is_pipeline
+    assert c1.matched_rule == "rm_local"
+
+    c2 = classify_pipeline("sleep 1 & rm -rf ./build")
+    assert c2.is_destructive
+    assert c2.is_pipeline
+    assert c2.matched_rule == "rm_rf"
+
+    c3 = classify_pipeline("rm -rf ./build &")
+    assert c3.is_destructive
+    assert c3.matched_rule == "rm_rf"
+
+
+def test_powershell_call_operator_ampersand_not_split():
+    assert split_segments('& "C:\\Program Files\\app.exe" -arg', POWERSHELL) == ['& "C:\\Program Files\\app.exe" -arg']
+    assert split_segments("& git status", POWERSHELL) == ["& git status"]
+

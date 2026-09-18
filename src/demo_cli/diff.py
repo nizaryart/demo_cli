@@ -27,6 +27,20 @@ def _info(t):
     return DiffLine(t, "info")
 
 
+def _hash_file(path: str) -> str:
+    """Compute SHA256 of path by streaming in chunks, avoiding RAM exhaustion and descriptor leaks."""
+    try:
+        with open(path, "rb") as f:
+            if hasattr(hashlib, "file_digest"):
+                return hashlib.file_digest(f, "sha256").hexdigest()
+            h = hashlib.sha256()
+            while chunk := f.read(65536):
+                h.update(chunk)
+            return h.hexdigest()
+    except Exception:
+        return "unreadable"
+
+
 # ---- sqlite ----
 
 def _sqlite_tables(path: str) -> List[str]:
@@ -38,10 +52,11 @@ def _sqlite_tables(path: str) -> List[str]:
         con.close()
 
 
-def _sqlite_rows(path: str, table: str):
+def _sqlite_rows(path: str, table: str, max_rows: int = 50000):
     con = sqlite3.connect(path)
     try:
-        cur = con.execute(f"SELECT * FROM {table}")
+        safe_table = table.replace('"', '""')
+        cur = con.execute(f'SELECT * FROM "{safe_table}" LIMIT {max_rows}')
         rows = [tuple(r) for r in cur.fetchall()]
     finally:
         con.close()
@@ -92,11 +107,7 @@ def _manifest(root: str):
         for name in filenames:
             full = os.path.join(dirpath, name)
             rel = os.path.relpath(full, root)
-            try:
-                with open(full, "rb") as f:
-                    manifest[rel] = hashlib.sha256(f.read()).hexdigest()
-            except Exception:
-                manifest[rel] = "unreadable"
+            manifest[rel] = _hash_file(full)
     return manifest
 
 
@@ -140,10 +151,12 @@ def diff_file(snap: str, current: str) -> List[DiffLine]:
     out = _text_diff(snap, current, os.path.basename(current))
     if out:
         return out
-    h1 = hashlib.sha256(open(snap, "rb").read()).hexdigest()
-    h2 = hashlib.sha256(open(current, "rb").read()).hexdigest()
+    h1 = _hash_file(snap)
+    h2 = _hash_file(current)
     if h1 == h2:
         return [DiffLine("File is unchanged.", "info")]
+    if h1 == "unreadable" or h2 == "unreadable":
+        return [DiffLine("File unreadable for diff.", "del")]
     return [DiffLine(f"before sha256 {h1[:16]}", "meta"),
             DiffLine(f"after  sha256 {h2[:16]}", "meta"),
             DiffLine("Binary file changed.", "mod")]

@@ -136,7 +136,25 @@ def test_tokenizer_and_verb_intent():
 import os as _os
 import pytest
 
+from demo_cli import cli
+from demo_cli import egress
 from demo_cli.cli import egress_setup_lines
+
+
+def test_egress_cli_reexports():
+    exported = [
+        "_MITM_DIR",
+        "_CA_PEM_NAME",
+        "_CA_CER_NAME",
+        "_ca_path",
+        "egress_setup_lines",
+        "_trust_ca",
+        "cmd_egress",
+    ]
+    for sym in exported:
+        assert hasattr(egress, sym), f"egress missing {sym}"
+        assert hasattr(cli, sym), f"cli missing re-export {sym}"
+        assert getattr(cli, sym) is getattr(egress, sym), f"mismatch for {sym}"
 
 
 def _text(port=8080, windows=False):

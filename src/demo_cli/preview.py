@@ -10,15 +10,33 @@ import sqlite3
 import subprocess
 from typing import List, Optional, Tuple
 
+from .classify import is_sql_preview_candidate
+from .targets import _tokenize
+
 _TRUNCATE = re.compile(r"\bTRUNCATE\b", re.I)
 
 
+def _extract_sql(cmd: str) -> str:
+    """Extract embedded SQL query from CLI wrapper (sqlite3, psql) or return bare SQL."""
+    trimmed = cmd.strip()
+    first = trimmed.split(None, 1)[0].upper() if trimmed else ""
+    if first in {"DELETE", "UPDATE", "TRUNCATE"}:
+        return trimmed
+    try:
+        for tok in _tokenize(cmd):
+            if is_sql_preview_candidate(tok):
+                return tok
+    except Exception:
+        pass
+    return cmd
+
+
 def _parse_table_where(sql: str, verb: str) -> Tuple[Optional[str], Optional[str]]:
-    sql = sql.strip().rstrip(";")
+    sql = re.sub(r";\s*$", "", sql.strip())
     if verb == "DELETE":
-        m = re.search(r"^\s*DELETE\s+FROM\s+(\w+)\s*(?:WHERE\s+(.+))?$", sql, re.I | re.S)
+        m = re.search(r"^\s*DELETE\s+FROM\s+([\w.\"`\[\]]+)\s*(?:WHERE\s+(.+))?$", sql, re.I | re.S)
     elif verb == "UPDATE":
-        m = re.search(r"^\s*UPDATE\s+(\w+)\s+SET\s+.+?(?:\s+WHERE\s+(.+))?$", sql, re.I | re.S)
+        m = re.search(r"^\s*UPDATE\s+([\w.\"`\[\]]+)\s+SET\s+.+?(?:\s+WHERE\s+(.+))?$", sql, re.I | re.S)
     else:
         return None, None
     if not m:
@@ -27,11 +45,12 @@ def _parse_table_where(sql: str, verb: str) -> Tuple[Optional[str], Optional[str
 
 
 def _preview_queries(sql: str) -> Tuple[Optional[str], Optional[str]]:
-    sql = sql.strip().rstrip(";")
+    sql = _extract_sql(sql).strip()
+    sql = re.sub(r";\s*$", "", sql)
     parts = sql.split()
     verb = parts[0].upper() if parts else ""
     if _TRUNCATE.search(sql):
-        m = re.search(r"TRUNCATE\s+(?:TABLE\s+)?(\w+)", sql, re.I)
+        m = re.search(r"TRUNCATE\s+(?:TABLE\s+)?([\w.\"`\[\]]+)", sql, re.I)
         if not m:
             return None, None
         t = m.group(1)
