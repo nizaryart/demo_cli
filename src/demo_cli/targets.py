@@ -12,6 +12,7 @@ removed by construction.
 """
 from __future__ import annotations
 
+import functools
 import glob as _glob
 import ntpath
 import os
@@ -314,6 +315,18 @@ def _mv_target_dir(seg: str) -> Tuple[Optional[str], bool]:
     return None, False
 
 
+@functools.lru_cache(maxsize=512)
+def _tokenize_cached(cmd: str, windows_paths: bool) -> Tuple[str, ...]:
+    lex = shlex.shlex(cmd, posix=True)
+    lex.whitespace_split = True          # split on whitespace, not shell punctuation
+    if windows_paths:
+        lex.escape = ""                  # backslash is a path separator, not an escape
+    try:
+        return tuple(lex)
+    except ValueError:
+        return tuple(cmd.strip().split())
+
+
 def _tokenize(cmd: str, windows_paths: Optional[bool] = None) -> List[str]:
     """Split a command line into words the way a shell would - respecting quotes.
 
@@ -350,14 +363,7 @@ def _tokenize(cmd: str, windows_paths: Optional[bool] = None) -> List[str]:
     """
     if windows_paths is None:
         windows_paths = os.name == "nt"
-    lex = shlex.shlex(cmd, posix=True)
-    lex.whitespace_split = True          # split on whitespace, not shell punctuation
-    if windows_paths:
-        lex.escape = ""                  # backslash is a path separator, not an escape
-    try:
-        return list(lex)
-    except ValueError:
-        return cmd.strip().split()
+    return list(_tokenize_cached(cmd, bool(windows_paths)))
 
 
 def _path_operands(cmd: str, base: Optional[str] = None) -> List[str]:

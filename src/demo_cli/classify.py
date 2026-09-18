@@ -12,6 +12,7 @@ destructive step, formatters rewriting whole trees, curl | bash).
 """
 from __future__ import annotations
 
+import functools
 import re
 import shlex
 from dataclasses import dataclass, field
@@ -970,16 +971,8 @@ def _effective_segments(cmd: str, dialect: str, substitute: bool,
     return out
 
 
-def split_segments(cmd: str, dialect: str = POSIX) -> List[str]:
-    """Split a command line on shell separators (| || && ; newline, and single & in POSIX)
-    while respecting single and double quotes. Returns trimmed, non-empty segments.
-
-    This is a pragmatic splitter, not a full shell parser; it exists so a
-    destructive step hidden after a safe one in a chain is still classified.
-
-    Line continuations are folded first, so a command written across two lines
-    is judged as the single command it is.
-    """
+@functools.lru_cache(maxsize=512)
+def _split_segments_cached(cmd: str, dialect: str) -> Tuple[str, ...]:
     cmd = join_continuations(cmd, dialect)
     segments: List[str] = []
     buf: List[str] = []
@@ -1043,7 +1036,20 @@ def split_segments(cmd: str, dialect: str = POSIX) -> List[str]:
         buf.append(ch)
         i += 1
     segments.append("".join(buf))
-    return [s.strip() for s in segments if s.strip()]
+    return tuple(s.strip() for s in segments if s.strip())
+
+
+def split_segments(cmd: str, dialect: str = POSIX) -> List[str]:
+    """Split a command line on shell separators (| || && ; newline, and single & in POSIX)
+    while respecting single and double quotes. Returns trimmed, non-empty segments.
+
+    This is a pragmatic splitter, not a full shell parser; it exists so a
+    destructive step hidden after a safe one in a chain is still classified.
+
+    Line continuations are folded first, so a command written across two lines
+    is judged as the single command it is.
+    """
+    return list(_split_segments_cached(cmd, dialect))
 
 
 def redirect_target(cmd: str) -> Optional[str]:
