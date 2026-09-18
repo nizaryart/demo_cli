@@ -387,6 +387,21 @@ class Guard:
         # all - otherwise the snapshot silently omits part of the damage while
         # the entry looks complete. See recovery.unignorable_dirs.
         reached = recovery.unignorable_dirs(command, dialect)
+        # THE ANCESTOR CASE, which the name-based question above cannot see.
+        # `rm -rf proj` destroys proj/.git completely and names nothing
+        # ignored, so `reached` was empty, the ignore list held, and the
+        # capture was a subset reported REVERSIBLE (3 of 7 files, undo rc 0).
+        #
+        # The blast radius, not the capture root: scattered operands collapse
+        # to a common root they do not destroy, and lifting the ignore there
+        # would copy .git for a two-file delete.
+        #
+        # affected_paths is empty for anything that is not rm / mv, so a
+        # PowerShell `Remove-Item -Recurse -Force proj` falls back to the
+        # resolved directory target - the only other way this shape arrives.
+        blast = affected_paths or (
+            [target.ref] if target is not None and target.kind == "dir" else [])
+        reached = reached | recovery.ignored_dirs_under(blast)
         keep_out = (None if not reached
                     else frozenset(recovery.IGNORED_DIRS) - reached)
         snap_notes: dict = {}

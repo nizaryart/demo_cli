@@ -12,6 +12,8 @@ import sqlite3
 from dataclasses import dataclass
 from typing import List
 
+from . import recovery
+
 # tone: "add" | "del" | "mod" | "meta" | "info"
 
 
@@ -81,8 +83,12 @@ def diff_sqlite(before: str, after: str, limit: int = 8) -> List[DiffLine]:
 def _manifest(root: str):
     manifest = {}
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames
-                       if d not in (".git", "node_modules", "__pycache__", ".demo_cli", ".demo_cli_recovery")]
+        # The shared constant, not a fourth copy of it. IGNORED_DIRS' own
+        # comment: "Three separate copies had already drifted apart before
+        # this was unified; adding an entry must fix every platform at once."
+        # This was the fourth. No behaviour change today - the names were
+        # identical - which is precisely why it would have drifted unnoticed.
+        dirnames[:] = [d for d in dirnames if d not in recovery.IGNORED_DIRS]
         for name in filenames:
             full = os.path.join(dirpath, name)
             rel = os.path.relpath(full, root)

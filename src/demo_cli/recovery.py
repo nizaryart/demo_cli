@@ -1355,6 +1355,58 @@ def unignorable_dirs(cmd: str, dialect: str = POSIX) -> frozenset:
     return frozenset(hit - {".demo_cli", ".demo_cli_recovery"})
 
 
+def ignored_dirs_under(paths) -> frozenset:
+    """Ignored directory names that lie AT OR UNDER one of `paths`.
+
+    unignorable_dirs answers one direction - an operand INSIDE an ignored
+    directory, `rm proj/.git/config`. This answers the ANCESTOR direction,
+    which that question cannot see:
+
+        rm -rf proj        destroys proj/.git and proj/node_modules
+                           completely while naming nothing ignored at all
+
+    So the name-based set came back empty, the ignore list stayed in force,
+    and the capture was a strict SUBSET reported REVERSIBLE - 3 files of 7,
+    with no field on the entry recording the omission and `undo` exiting 0.
+    Exactly the failure unignorable_dirs was written to stop, arriving from
+    the opposite side. Measured 2026-09-17.
+
+    DELIBERATELY NOT "everything under the capture root". Several scattered
+    operands collapse to a common root they do NOT destroy -
+    `rm proj/src/a.py proj/other/c.py` resolves to `proj` - and lifting the
+    ignore there would copy .git on a two-file delete, which is the cost the
+    ignore list exists to avoid. Only a directory inside the actual blast
+    radius is lifted.
+
+    Never descends INTO an ignored directory: the NAME is the answer, not
+    the contents, and walking node_modules to discover it is node_modules
+    would cost what this is trying to bound. Stops early once every
+    candidate is found.
+
+    .demo_cli / .demo_cli_recovery are never returned, matching
+    unignorable_dirs.
+    """
+    candidates = IGNORED_DIRS - {".demo_cli", ".demo_cli_recovery"}
+    hit = set()
+    for path in paths or ():
+        try:
+            if not os.path.isdir(path):
+                continue
+            base = os.path.basename(os.path.abspath(path).rstrip(os.sep))
+            if base in candidates:
+                hit.add(base)
+            for _dirpath, dirnames, _files in os.walk(path):
+                hit |= candidates & set(dirnames)
+                dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS]
+                if hit == candidates:
+                    break
+        except OSError:
+            continue
+        if hit == candidates:
+            break
+    return frozenset(hit)
+
+
 def is_fs_delete(cmd: str, dialect: str = POSIX) -> bool:
     """True if cmd is a local filesystem delete/move whose target THIS module
     resolves by operand extraction (rm / mv / PowerShell Remove-Item). Used by
