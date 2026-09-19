@@ -979,4 +979,34 @@ def test_cmd_receipt_list_bounded(tmp_path, capsys):
     assert "cmd04" not in out
 
 
+def test_receipts_alias_lists_receipts(tmp_path, capsys):
+    from demo_cli import cli
+
+    main = str(tmp_path / ".demo_cli" / "receipts.jsonl")
+    os.makedirs(os.path.dirname(main), exist_ok=True)
+    r1 = append_receipt(main, _r("echo hello", timestamp="2026-09-01T10:00:00Z"))
+
+    parser = cli.build_parser()
+
+    # Invoking "receipts" subcommand defaults to listing receipts
+    args_receipts = parser.parse_args(["receipts", "--root", str(tmp_path)])
+    assert args_receipts.cmd == "receipts"
+    assert args_receipts.func == cli.cmd_receipt
+    ret = args_receipts.func(args_receipts)
+    assert ret == 0
+    out = capsys.readouterr().out
+    assert "echo hello" in out
+    assert "receipts" in out
+
+    # Invoking "receipt" prints share card for latest
+    args_receipt = parser.parse_args(["receipt", "--root", str(tmp_path)])
+    assert args_receipt.cmd == "receipt"
+    ret = args_receipt.func(args_receipt)
+    assert ret == 0
+    out = capsys.readouterr().out
+    assert "pre-execution receipt" in out
+    assert "echo hello" in out
+
+
+
 

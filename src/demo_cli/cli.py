@@ -367,11 +367,17 @@ def cmd_report(a) -> int:
 
 def cmd_receipt(a) -> int:
     """`demo_cli receipt --share [id]` — print a copy-pasteable proof card for a
-    single receipt (the latest, or one by id). `--list` shows recent receipt ids.
+    single receipt (the latest, or one by id). `--list` (or running `demo_cli receipts`)
+    shows recent receipt ids.
     """
     cfg = load_config(getattr(a, "root", None))
 
-    if getattr(a, "list", False):
+    is_list = getattr(a, "list", False)
+    # If invoked as `demo_cli receipts` without a specific receipt id or --share, default to listing receipts
+    if getattr(a, "cmd", None) == "receipts" and not getattr(a, "id", None) and not getattr(a, "share", False):
+        is_list = True
+
+    if is_list:
         rows = tail_all_receipts(cfg.receipts_path, n=20)
         if not rows:
             print("No receipts yet. Run some commands through the hook or `demo_cli check` first.")
@@ -392,7 +398,7 @@ def cmd_receipt(a) -> int:
     receipt = find_receipt(cfg.receipts_path, getattr(a, "id", None))
     if not receipt:
         if getattr(a, "id", None):
-            print(f"No receipt matched id '{a.id}'. Try `demo_cli receipt --list`.")
+            print(f"No receipt matched id '{a.id}'. Try `demo_cli receipts`.")
         else:
             print("No receipts yet. Run some commands through the hook or `demo_cli check` first.")
         return 1
@@ -1324,12 +1330,7 @@ def build_parser() -> argparse.ArgumentParser:
     df.add_argument("--target", default=None)
     df.set_defaults(func=cmd_diff)
 
-    # `receipts` is an ALIAS, not a second command. Two different agents have
-    # now guessed `demo_cli receipts` and got an argparse usage error - the
-    # workspace file is called receipts.jsonl and doctor talks about "agent
-    # receipts", so the name is one the tool teaches people. A guessable name
-    # that errors is a small failure the guard can simply not have.
-    lg = sub.add_parser("log", parents=[common], aliases=["receipts"],
+    lg = sub.add_parser("log", parents=[common],
                         help="list captured recovery points")
     lg.add_argument("--last", type=int, default=None, metavar="N",
                     help="show only the N most recent")
@@ -1343,12 +1344,15 @@ def build_parser() -> argparse.ArgumentParser:
     rp = sub.add_parser("report", parents=[common], help="summarise recorded decisions (shadow report)")
     rp.set_defaults(func=cmd_report)
 
-    rc = sub.add_parser("receipt", parents=[common],
-                        help="show a copy-pasteable proof card for a receipt")
+    # `receipts` is an ALIAS for `receipt`. A user running `demo_cli receipts` (plural)
+    # expects to view the recorded receipts ledger (`--list` by default).
+    # `demo_cli receipt` (singular) prints a shareable proof card for the latest (or by id).
+    rc = sub.add_parser("receipt", parents=[common], aliases=["receipts"],
+                        help="show a copy-pasteable proof card, or list receipts (`demo_cli receipts`)")
     rc.add_argument("id", nargs="?", default=None,
-                    help="receipt id (see `demo_cli receipt --list`); default: latest")
+                    help="receipt id (see `demo_cli receipts`); default: latest")
     rc.add_argument("--share", action="store_true",
-                    help="print the shareable proof card (default action)")
+                    help="print the shareable proof card (default action for `demo_cli receipt`)")
     rc.add_argument("--list", action="store_true",
                     help="list recent receipt ids instead of printing a card")
     rc.set_defaults(func=cmd_receipt)
