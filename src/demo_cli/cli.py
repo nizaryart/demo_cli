@@ -20,7 +20,7 @@ from .decide import CONTEXT_MISMATCH, ESCALATE
 from .diff import diff_entry
 from .guard import Guard
 from .hooks import HostConfigUnreadable
-from .receipts import verify_chain, find_receipt, share_card, load_receipts
+from .receipts import CHAIN_FS, chain_path, verify_chain, find_receipt, share_card, load_all_receipts, load_receipts
 from .version import __version__
 
 _EXIT = {ESCALATE: 2, CONTEXT_MISMATCH: 1}
@@ -319,29 +319,35 @@ def cmd_verify(a) -> int:
 
 def cmd_report(a) -> int:
     cfg = load_config(getattr(a, "root", None))
-    v = verify_chain(cfg.receipts_path)
-    if not os.path.exists(cfg.receipts_path):
+    main_path = cfg.receipts_path
+    fs_path = chain_path(main_path, CHAIN_FS)
+    v = verify_chain(main_path)
+    fs = verify_chain(fs_path) if os.path.exists(fs_path) else None
+
+    rows = load_all_receipts(main_path)
+    if not rows and not os.path.exists(main_path) and not os.path.exists(fs_path):
         print("No receipts yet. Run some commands through `demo_cli check` first.")
         return 0
-    total = 0
+
+    total = len(rows)
     by_decision = {}
     recovered = 0
-    with open(cfg.receipts_path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                r = json.loads(line)
-            except Exception:
-                continue
-            total += 1
-            by_decision[r.get("decision", "?")] = by_decision.get(r.get("decision", "?"), 0) + 1
-            if r.get("recovery_point"):
-                recovered += 1
+    for r in rows:
+        dec = r.get("decision", "?")
+        by_decision[dec] = by_decision.get(dec, 0) + 1
+        if r.get("recovery_point"):
+            recovered += 1
+
+    if not v.ok:
+        chain_desc = f"TAMPERED (main) at line {v.broken_at}"
+    elif fs and not fs.ok:
+        chain_desc = f"TAMPERED (fs) at line {fs.broken_at}"
+    else:
+        chain_desc = "intact"
+
     print(render.c(f"\ndemo_cli {__version__}  shadow report\n", "dim"))
     print(render.kv("receipts", total))
-    print(render.kv("chain", "intact" if v.ok else f"TAMPERED at line {v.broken_at}"))
+    print(render.kv("chain", chain_desc))
     print(render.kv("recovery points", recovered))
     for k, n in sorted(by_decision.items()):
         print(render.kv("  " + k, n))
@@ -356,7 +362,7 @@ def cmd_receipt(a) -> int:
     cfg = load_config(getattr(a, "root", None))
 
     if getattr(a, "list", False):
-        rows = load_receipts(cfg.receipts_path)
+        rows = load_all_receipts(cfg.receipts_path)
         if not rows:
             print("No receipts yet. Run some commands through the hook or `demo_cli check` first.")
             return 0
@@ -423,18 +429,37 @@ def cmd_prune(a) -> int:
 
 def cmd_status(a) -> int:
     cfg = load_config(getattr(a, "root", None))
-    v = verify_chain(cfg.receipts_path)
-    total = v.entries if v.ok else 0
-    if not v.ok and os.path.exists(cfg.receipts_path):
-        with open(cfg.receipts_path, encoding="utf-8") as f:
-            total = sum(1 for line in f if line.strip())
+    main_path = cfg.receipts_path
+    fs_path = chain_path(main_path, CHAIN_FS)
+
+    v = verify_chain(main_path)
+    fs = verify_chain(fs_path) if os.path.exists(fs_path) else None
+
+    total = 0
+    for p, ver in ((main_path, v), (fs_path, fs)):
+        if ver is None:
+            continue
+        if ver.ok:
+            total += ver.entries
+        elif os.path.exists(p):
+            with open(p, encoding="utf-8") as f:
+                total += sum(1 for line in f if line.strip())
+
+    if not v.ok:
+        chain_desc = f"TAMPERED (main) at line {v.broken_at}"
+    elif fs and not fs.ok:
+        chain_desc = f"TAMPERED (fs) at line {fs.broken_at}"
+    elif not os.path.exists(main_path) and not (fs and os.path.exists(fs_path)):
+        chain_desc = "none yet"
+    else:
+        chain_desc = "intact"
+
     info = {
         "mode": cfg.mode,
         "hook": _any_hook_installed(cfg),
         "config": cfg.source_path,
         "receipts": total,
-        "chain": "intact" if v.ok else (f"TAMPERED at line {v.broken_at}"
-                                        if os.path.exists(cfg.receipts_path) else "none yet"),
+        "chain": chain_desc,
         "recovery_points": len(recovery.load_entries(cfg.recovery_dir)),
         "workspace": cfg.workspace,
     }

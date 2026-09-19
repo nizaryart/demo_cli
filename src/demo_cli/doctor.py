@@ -19,7 +19,7 @@ from . import config as config_mod
 from .config import load_config
 from . import deps as deps_mod
 from . import fsmount, mountstate, render, protect as protect_mod
-from .receipts import load_receipts
+from .receipts import load_all_receipts, load_receipts
 from .version import __version__
 
 # Every host demo_cli can hook, and where each keeps its registration.
@@ -428,7 +428,7 @@ def cmd_doctor(a) -> int:
     # by an AGENT is evidence. Three separate times the failure mode has been
     # "installed, looks fine, protecting nothing" (Codex config shape, Codex
     # stale session, Windows BOM), and each time a receipt would have said so.
-    rows = load_receipts(cfg.receipts_path)
+    rows = load_all_receipts(cfg.receipts_path)
     by_agent = {}
     for r in rows:
         aid = r.get("agent_id", "unknown")

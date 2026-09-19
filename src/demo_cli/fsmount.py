@@ -398,6 +398,7 @@ def build_operations(config: Config, volume_label: str = "demo_cli",
                     context=ctx.as_dict(),
                     agent_id="fsguard",
                     session_id="mount",
+                    chain=CHAIN_FS,
                 ))
             except Exception as exc:                      # pragma: no cover
                 sys.stderr.write(f"demo_cli [fs] receipt error: {exc}\n")

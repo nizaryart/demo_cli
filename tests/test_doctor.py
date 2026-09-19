@@ -99,3 +99,26 @@ def test_read_host_config_valid_and_invalid(tmp_path):
     invalid_file.write_text("invalid json content", encoding="utf-8")
     assert doctor._read_host_config(str(invalid_file)) is None
 
+
+def test_doctor_detects_fsguard_activity(tmp_path, capsys):
+    """Doctor must detect activity from the filesystem guard (in receipts-fs.jsonl)."""
+    from types import SimpleNamespace
+    from demo_cli.receipts import CHAIN_FS, Receipt, append_receipt
+    cfg = Config(project_root=str(tmp_path))
+    append_receipt(cfg.receipts_path, Receipt(
+        action_raw="[fs] delete test.py",
+        action_type="filesystem",
+        target_environment="dev",
+        decision="REVERSIBLE",
+        reason="Snapshotted",
+        mode="enforce-fs",
+        agent_id="fsguard",
+        chain=CHAIN_FS,
+    ))
+    doctor.cmd_doctor(SimpleNamespace(root=str(tmp_path)))
+    out = capsys.readouterr().out
+    assert "ACTIVE (agent receipts)" in out
+    assert "fsguard" in out
+
+
+

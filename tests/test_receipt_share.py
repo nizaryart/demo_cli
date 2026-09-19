@@ -62,6 +62,26 @@ def test_share_card_reversible_claims_recovery():
         assert "reversible with one command" in card
 
 
+def test_share_card_for_fs_receipt():
+    with tempfile.TemporaryDirectory() as tmp:
+        p = _log(tmp)
+        from demo_cli.receipts import CHAIN_FS
+        r_fs = append_receipt(p, Receipt(
+            action_raw="[fs] delete config.json", action_type="filesystem",
+            target_environment="development", decision="REVERSIBLE",
+            reason="Snapshotted before cleanup.", mode="enforce-fs",
+            matched_rule="fs_delete", recovery_point="/x/.demo_cli/recovery/config.bak",
+            chain=CHAIN_FS))
+
+        found = find_receipt(p, r_fs.receipt_id[:8])
+        assert found is not None
+        assert found["chain"] == CHAIN_FS
+        card = share_card(found)
+        assert "[fs] delete config.json" in card
+        assert "recovery point captured" in card
+
+
+
 def test_feedback_line_only_on_wrong_call_worthy():
     from demo_cli.render import feedback_line
     from demo_cli.guard import Guard

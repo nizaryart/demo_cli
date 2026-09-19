@@ -228,3 +228,14 @@ def test_a_restore_that_cannot_write_reports_failure_instead_of_raising(tmp_path
         "notes.txt", b"original", str(tmp_path / "rec"),
         target=str(blocker / "notes.txt"))
     assert recovery.restore_entry(entry) is False
+
+
+def test_both_fsmount_stages_emit_fs_chain_receipts():
+    """Both Stage 1 (in-memory) and Stage 2 (passthrough) must emit receipts
+    with chain=CHAIN_FS to preserve the one-writer-per-file invariant."""
+    import inspect
+    s1 = inspect.getsource(fsmount.build_operations)
+    assert "chain=CHAIN_FS" in s1, "Stage 1 mount must specify chain=CHAIN_FS"
+    s2 = inspect.getsource(fsmount.build_passthrough_operations)
+    assert "chain=CHAIN_FS" in s2, "Stage 2 mount must specify chain=CHAIN_FS"
+

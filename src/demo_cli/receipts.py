@@ -900,13 +900,30 @@ def load_receipts(path: str) -> List[dict]:
     return rows
 
 
+def load_all_receipts(path: str) -> List[dict]:
+    """Return every receipt from both chains (main and fs), oldest first.
+
+    SPLIT ON WRITE, MERGED ON READ. The two files exist so that each is
+    written from only one side of the WinFsp mount; nothing that reads them
+    needs to know, so list, share, status and report see a single chronological
+    stream.
+    """
+    base = _base_path(path)
+    main_rows = load_receipts(base)
+    fs_p = chain_path(base, CHAIN_FS)
+    fs_rows = load_receipts(fs_p) if os.path.exists(fs_p) else []
+    merged = main_rows + fs_rows
+    return sorted(merged, key=lambda r: str(r.get("timestamp") or ""))
+
+
 def find_receipt(path: str, receipt_id: Optional[str] = None) -> Optional[dict]:
     """Pick a receipt: by (full or prefix) id if given, else the most recent.
 
     Matching by prefix mirrors how `log`/`undo` show short ids, so a user can
-    paste the 8-char id they see rather than the full uuid.
+    paste the 8-char id they see rather than the full uuid. Searches across
+    both main and filesystem receipt chains.
     """
-    rows = load_receipts(path)
+    rows = load_all_receipts(path)
     if not rows:
         return None
     if not receipt_id:

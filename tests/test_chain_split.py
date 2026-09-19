@@ -27,12 +27,13 @@ import pytest
 
 from demo_cli.receipts import (CHAIN_FS, CHAIN_MAIN, GENESIS, Receipt,
                                append_receipt, chain_path, peer_path,
-                               verify_chain, verify_cross_links)
+                               verify_chain, verify_cross_links,
+                               load_all_receipts, find_receipt)
 
 
-def _r(action="x", chain=CHAIN_MAIN, **kw):
+def _r(action="x", chain=CHAIN_MAIN, decision="ALLOW", **kw):
     return Receipt(action_raw=action, action_type="shell",
-                   target_environment="dev", decision="ALLOW",
+                   target_environment="dev", decision=decision,
                    reason="test", mode="enforce", chain=chain, **kw)
 
 
@@ -726,3 +727,68 @@ def test_find_and_latest_agree_with_the_filtered_view(tmp_path):
 
     assert recovery.latest(d)["id"] == "fs-new"
     assert recovery.find(d, "fs-old") is None
+
+
+def test_load_all_receipts_merges_chronologically(tmp_path):
+    """load_all_receipts merges both chains and sorts by timestamp."""
+    main = str(tmp_path / "receipts.jsonl")
+    r1 = append_receipt(main, _r("cmd1", chain=CHAIN_MAIN, timestamp="2026-09-01T10:00:00Z"))
+    r2 = append_receipt(main, _r("[fs] delete 1", chain=CHAIN_FS, timestamp="2026-09-01T11:00:00Z"))
+    r3 = append_receipt(main, _r("cmd2", chain=CHAIN_MAIN, timestamp="2026-09-01T12:00:00Z"))
+
+    all_from_main = load_all_receipts(main)
+    assert len(all_from_main) == 3
+    assert [r["action_raw"] for r in all_from_main] == ["cmd1", "[fs] delete 1", "cmd2"]
+
+    # Passing fs path also yields the exact same merged list
+    fs = chain_path(main, CHAIN_FS)
+    all_from_fs = load_all_receipts(fs)
+    assert [r["action_raw"] for r in all_from_fs] == ["cmd1", "[fs] delete 1", "cmd2"]
+
+
+def test_find_receipt_resolves_across_chains(tmp_path):
+    """find_receipt can locate entries from either chain and find latest across both."""
+    main = str(tmp_path / "receipts.jsonl")
+    r1 = append_receipt(main, _r("cmd1", chain=CHAIN_MAIN, timestamp="2026-09-01T10:00:00Z"))
+    r2 = append_receipt(main, _r("[fs] delete 1", chain=CHAIN_FS, timestamp="2026-09-01T11:00:00Z"))
+
+    # By prefix from FS chain
+    found_fs = find_receipt(main, r2.receipt_id[:8])
+    assert found_fs is not None
+    assert found_fs["action_raw"] == "[fs] delete 1"
+    assert found_fs["chain"] == CHAIN_FS
+
+    # Latest returns the newest entry across both
+    latest = find_receipt(main)
+    assert latest["receipt_id"] == r2.receipt_id
+
+
+def test_cmd_status_and_report_cover_dual_chains(tmp_path, capsys):
+    """cli.cmd_status and cmd_report report on both chains."""
+    from demo_cli import cli
+    from types import SimpleNamespace
+
+    main = str(tmp_path / ".demo_cli" / "receipts.jsonl")
+    os.makedirs(os.path.dirname(main), exist_ok=True)
+    append_receipt(main, _r("cmd1", chain=CHAIN_MAIN, decision="ALLOW"))
+    append_receipt(main, _r("[fs] delete 1", chain=CHAIN_FS, decision="REVERSIBLE",
+                            recovery_point="/tmp/bak.1"))
+
+    args = SimpleNamespace(root=str(tmp_path))
+
+    # cmd_status
+    ret = cli.cmd_status(args)
+    assert ret == 0
+    out = capsys.readouterr().out
+    assert "receipts" in out
+    # Both receipts accounted for
+    assert "2" in out
+
+    # cmd_report
+    ret = cli.cmd_report(args)
+    assert ret == 0
+    out = capsys.readouterr().out
+    assert "receipts" in out
+    assert "ALLOW" in out
+    assert "REVERSIBLE" in out
+
