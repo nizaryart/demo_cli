@@ -29,7 +29,9 @@ from demo_cli.receipts import (CHAIN_FS, CHAIN_MAIN, GENESIS, Receipt,
                                append_receipt, chain_path, peer_path,
                                verify_chain, verify_cross_links,
                                load_all_receipts, find_receipt,
-                               anchor_chains, peer_head)
+                               anchor_chains, peer_head,
+                               iter_receipts, iter_all_receipts,
+                               tail_receipts, tail_all_receipts, latest_receipt)
 
 
 def _r(action="x", chain=CHAIN_MAIN, decision="ALLOW", **kw):
@@ -847,5 +849,134 @@ def test_peer_cache_concurrent_access(tmp_path):
 
     assert all(r is not None for r in results)
     assert len(set(results)) == 1
+
+
+def test_iter_receipts_streaming_and_skips_torn_lines(tmp_path):
+    main = str(tmp_path / "receipts.jsonl")
+    r1 = append_receipt(main, _r("cmd1", timestamp="2026-09-01T10:00:00Z"))
+
+    # Inject a torn unparseable line and empty line
+    with open(main, "a", encoding="utf-8") as f:
+        f.write("\n{torn json line\n\n")
+
+    r2 = append_receipt(main, _r("cmd2", timestamp="2026-09-01T11:00:00Z"))
+
+    gen = iter_receipts(main)
+    assert hasattr(gen, "__next__")
+
+    rows = list(gen)
+    assert len(rows) == 2
+    assert [r["receipt_id"] for r in rows] == [r1.receipt_id, r2.receipt_id]
+
+    # Nonexistent file yields nothing
+    assert list(iter_receipts(str(tmp_path / "nonexistent.jsonl"))) == []
+
+
+def test_iter_all_receipts_merges_chronologically(tmp_path):
+    main = str(tmp_path / "receipts.jsonl")
+    r1 = append_receipt(main, _r("cmd1", chain=CHAIN_MAIN, timestamp="2026-09-01T10:00:00Z"))
+    r2 = append_receipt(main, _r("[fs] delete 1", chain=CHAIN_FS, timestamp="2026-09-01T11:00:00Z"))
+    r3 = append_receipt(main, _r("cmd2", chain=CHAIN_MAIN, timestamp="2026-09-01T12:00:00Z"))
+
+    merged = list(iter_all_receipts(main))
+    assert len(merged) == 3
+    assert [r["receipt_id"] for r in merged] == [r1.receipt_id, r2.receipt_id, r3.receipt_id]
+
+
+def test_tail_receipts_bounded(tmp_path):
+    main = str(tmp_path / "receipts.jsonl")
+
+    # Nonexistent or empty
+    assert tail_receipts(main, n=5) == []
+    assert tail_receipts(main, n=0) == []
+
+    # Append 10 receipts
+    recs = []
+    for i in range(10):
+        recs.append(append_receipt(main, _r(f"cmd{i}", timestamp=f"2026-09-01T10:{i:02d}:00Z")))
+
+    # Request tail 3 -> last 3 (cmd7, cmd8, cmd9) oldest first
+    tail3 = tail_receipts(main, n=3)
+    assert len(tail3) == 3
+    assert [r["receipt_id"] for r in tail3] == [recs[7].receipt_id, recs[8].receipt_id, recs[9].receipt_id]
+
+    # Request tail 50 (more than exist) -> all 10
+    tail50 = tail_receipts(main, n=50)
+    assert len(tail50) == 10
+    assert [r["receipt_id"] for r in tail50] == [r.receipt_id for r in recs]
+
+    # Add torn line at EOF, tail should skip it
+    with open(main, "a", encoding="utf-8") as f:
+        f.write("{torn line at end")
+    tail_after_tear = tail_receipts(main, n=2)
+    assert len(tail_after_tear) == 2
+    assert [r["receipt_id"] for r in tail_after_tear] == [recs[8].receipt_id, recs[9].receipt_id]
+
+
+def test_tail_all_receipts_and_latest_receipt(tmp_path):
+    main = str(tmp_path / "receipts.jsonl")
+    r1 = append_receipt(main, _r("cmd1", chain=CHAIN_MAIN, timestamp="2026-09-01T10:00:00Z"))
+    r2 = append_receipt(main, _r("[fs] delete 1", chain=CHAIN_FS, timestamp="2026-09-01T11:00:00Z"))
+    r3 = append_receipt(main, _r("cmd2", chain=CHAIN_MAIN, timestamp="2026-09-01T12:00:00Z"))
+    r4 = append_receipt(main, _r("[fs] delete 2", chain=CHAIN_FS, timestamp="2026-09-01T13:00:00Z"))
+
+    # tail_all_receipts(main, n=2) -> r3 (cmd2) and r4 ([fs] delete 2)
+    t2 = tail_all_receipts(main, n=2)
+    assert len(t2) == 2
+    assert [r["receipt_id"] for r in t2] == [r3.receipt_id, r4.receipt_id]
+
+    # latest_receipt -> r4
+    latest = latest_receipt(main)
+    assert latest is not None
+    assert latest["receipt_id"] == r4.receipt_id
+
+
+def test_find_receipt_exact_prefix_and_ambiguity(tmp_path):
+    main = str(tmp_path / "receipts.jsonl")
+    r1 = append_receipt(main, _r("cmd1", chain=CHAIN_MAIN, timestamp="2026-09-01T10:00:00Z"))
+    r2 = append_receipt(main, _r("[fs] delete 1", chain=CHAIN_FS, timestamp="2026-09-01T11:00:00Z"))
+
+    # None or whitespace finds latest
+    assert find_receipt(main, None)["receipt_id"] == r2.receipt_id
+    assert find_receipt(main, "   ")["receipt_id"] == r2.receipt_id
+
+    # Exact full match
+    assert find_receipt(main, r1.receipt_id)["receipt_id"] == r1.receipt_id
+    assert find_receipt(main, r2.receipt_id)["receipt_id"] == r2.receipt_id
+
+    # Prefix match
+    assert find_receipt(main, r1.receipt_id[:8])["receipt_id"] == r1.receipt_id
+
+    # Nonexistent ID
+    assert find_receipt(main, "00000000-0000-0000-0000-000000000000") is None
+
+    # Force ambiguous prefix
+    r_ambig1 = _r("ambig1", receipt_id="aaaa1111-1111-1111-1111-111111111111")
+    r_ambig2 = _r("ambig2", receipt_id="aaaa2222-2222-2222-2222-222222222222")
+    append_receipt(main, r_ambig1)
+    append_receipt(main, r_ambig2)
+
+    assert find_receipt(main, "aaaa") is None  # Ambiguous!
+    assert find_receipt(main, "aaaa1")["receipt_id"] == r_ambig1.receipt_id  # Unique!
+
+
+def test_cmd_receipt_list_bounded(tmp_path, capsys):
+    from demo_cli import cli
+    from types import SimpleNamespace
+
+    main = str(tmp_path / ".demo_cli" / "receipts.jsonl")
+    os.makedirs(os.path.dirname(main), exist_ok=True)
+    for i in range(25):
+        append_receipt(main, _r(f"cmd{i:02d}", timestamp=f"2026-09-01T10:{i:02d}:00Z"))
+
+    ret = cli.cmd_receipt(SimpleNamespace(root=str(tmp_path), list=True, id=None))
+    assert ret == 0
+    out = capsys.readouterr().out
+    assert "receipts" in out
+    # Only the last 20 entries (05 to 24) should appear
+    assert "cmd24" in out
+    assert "cmd05" in out
+    assert "cmd04" not in out
+
 
 

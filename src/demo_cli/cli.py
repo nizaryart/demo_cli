@@ -20,7 +20,10 @@ from .decide import CONTEXT_MISMATCH, ESCALATE
 from .diff import diff_entry
 from .guard import Guard
 from .hooks import HostConfigUnreadable
-from .receipts import CHAIN_FS, chain_path, verify_chain, find_receipt, share_card, load_all_receipts, load_receipts
+from .receipts import (
+    CHAIN_FS, chain_path, verify_chain, find_receipt, share_card,
+    load_all_receipts, load_receipts, iter_all_receipts, tail_all_receipts,
+)
 from .version import __version__
 
 _EXIT = {ESCALATE: 2, CONTEXT_MISMATCH: 1}
@@ -331,19 +334,19 @@ def cmd_report(a) -> int:
     v = verify_chain(main_path)
     fs = verify_chain(fs_path) if os.path.exists(fs_path) else None
 
-    rows = load_all_receipts(main_path)
-    if not rows and not os.path.exists(main_path) and not os.path.exists(fs_path):
-        print("No receipts yet. Run some commands through `demo_cli check` first.")
-        return 0
-
-    total = len(rows)
+    total = 0
     by_decision = {}
     recovered = 0
-    for r in rows:
+    for r in iter_all_receipts(main_path):
+        total += 1
         dec = r.get("decision", "?")
         by_decision[dec] = by_decision.get(dec, 0) + 1
         if r.get("recovery_point"):
             recovered += 1
+
+    if total == 0 and not os.path.exists(main_path) and not os.path.exists(fs_path):
+        print("No receipts yet. Run some commands through `demo_cli check` first.")
+        return 0
 
     if not v.ok:
         chain_desc = f"TAMPERED (main) at line {v.broken_at}"
@@ -369,13 +372,13 @@ def cmd_receipt(a) -> int:
     cfg = load_config(getattr(a, "root", None))
 
     if getattr(a, "list", False):
-        rows = load_all_receipts(cfg.receipts_path)
+        rows = tail_all_receipts(cfg.receipts_path, n=20)
         if not rows:
             print("No receipts yet. Run some commands through the hook or `demo_cli check` first.")
             return 0
         print(render.c(f"\ndemo_cli {__version__}  receipts\n", "dim"))
         print("  " + render.c(f"{'id':<10}{'when':<27}{'decision':<16}action", "dim"))
-        for r in rows[-20:]:
+        for r in rows:
             rid = str(r.get("receipt_id", "?"))[:8]
             ts = str(r.get("timestamp", "?"))[:25]
             dec = str(r.get("decision", "?"))[:15]

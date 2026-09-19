@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import datetime
 import hashlib
+import heapq
 import json
 import os
 import re
@@ -20,7 +21,7 @@ import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, Iterator, List, Optional
 
 from .context import redact
 from .decide import INVARIANT
@@ -860,31 +861,25 @@ def verify_cross_links(main_path: str, fs_path: str) -> CrossLinkResult:
 
 def _unanchored_after_last_peer_write(main_path: str, fs_path: str) -> int:
     """Entries in either chain written after the last receipt in the other."""
-    def stamps(path: str) -> List[str]:
-        out: List[str] = []
-        try:
-            with open(path, **_READ) as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        ts = json.loads(line).get("timestamp")
-                    except Exception:
-                        continue
-                    if ts:
-                        out.append(ts)
-        except OSError:
-            pass
-        return out
-
-    a, b = stamps(main_path), stamps(fs_path)
-    if not a or not b:
+    tail_a = tail_receipts(main_path, n=1)
+    tail_b = tail_receipts(fs_path, n=1)
+    r_a = tail_a[0] if tail_a else None
+    r_b = tail_b[0] if tail_b else None
+    if not r_a or not r_b:
         # One chain only: nothing anchors anything, so every entry is
         # unanchored. That is the Linux shape, and saying so is the point.
-        return len(a) + len(b)
-    return (sum(1 for t in a if t > max(b)) +
-            sum(1 for t in b if t > max(a)))
+        cnt_a = sum(1 for _ in iter_receipts(main_path))
+        cnt_b = sum(1 for _ in iter_receipts(fs_path))
+        return cnt_a + cnt_b
+
+    ts_a = str(r_a.get("timestamp") or "")
+    ts_b = str(r_b.get("timestamp") or "")
+
+    if ts_a > ts_b:
+        return sum(1 for r in iter_receipts(main_path) if str(r.get("timestamp") or "") > ts_b)
+    elif ts_b > ts_a:
+        return sum(1 for r in iter_receipts(fs_path) if str(r.get("timestamp") or "") > ts_a)
+    return 0
 
 
 def anchor_chains(path: str) -> bool:
@@ -936,21 +931,49 @@ def anchor_chains(path: str) -> bool:
     return True
 
 
-def load_receipts(path: str) -> List[dict]:
-    """Return every receipt in the log, oldest first. Read-only."""
-    rows: List[dict] = []
+def iter_receipts(path: str) -> Iterator[dict]:
+    """Yield every parseable receipt in the log, oldest first. Read-only, streaming."""
     if not os.path.exists(path):
-        return rows
+        return
     with open(path, **_READ) as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             try:
-                rows.append(json.loads(line))
+                yield json.loads(line)
             except Exception:
                 continue
-    return rows
+
+
+def load_receipts(path: str) -> List[dict]:
+    """Return every receipt in the log, oldest first. Read-only."""
+    return list(iter_receipts(path))
+
+
+def iter_all_receipts(path: str) -> Iterator[dict]:
+    """Yield every receipt from both chains (main and fs) merged chronologically.
+
+    SPLIT ON WRITE, MERGED ON READ. Streams from disk in O(1) memory by merging
+    the two sorted chain logs via heapq.merge.
+    """
+    base = _base_path(path)
+    fs_p = chain_path(base, CHAIN_FS)
+    has_base = os.path.exists(base)
+    has_fs = os.path.exists(fs_p)
+
+    if not has_fs:
+        yield from iter_receipts(base)
+        return
+    if not has_base:
+        yield from iter_receipts(fs_p)
+        return
+
+    yield from heapq.merge(
+        iter_receipts(base),
+        iter_receipts(fs_p),
+        key=lambda r: str(r.get("timestamp") or "")
+    )
 
 
 def load_all_receipts(path: str) -> List[dict]:
@@ -961,12 +984,81 @@ def load_all_receipts(path: str) -> List[dict]:
     needs to know, so list, share, status and report see a single chronological
     stream.
     """
+    return list(iter_all_receipts(path))
+
+
+def tail_receipts(path: str, n: int = 20, max_bytes: int = 65536) -> List[dict]:
+    """Return up to `n` receipts from the tail of the log at `path`, oldest first.
+    Reads backwards in windows from the file end to avoid loading the entire
+    file into memory.
+    """
+    if n <= 0:
+        return []
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return []
+    if size == 0:
+        return []
+
+    window = max(max_bytes, n * 1024)
+    while True:
+        start = max(0, size - window)
+        try:
+            with open(path, "rb") as f:
+                f.seek(start)
+                chunk = f.read()
+        except OSError:
+            return []
+
+        lines = chunk.decode("utf-8", errors="replace").splitlines()
+        if start > 0:
+            lines = lines[1:]  # drop partial line from mid-file seek
+
+        parsed = []
+        for line in reversed(lines):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                parsed.append(json.loads(line))
+                if len(parsed) == n:
+                    break
+            except Exception:
+                continue
+
+        if len(parsed) == n or start == 0:
+            parsed.reverse()
+            return parsed
+
+        window *= 4
+
+
+def tail_all_receipts(path: str, n: int = 20) -> List[dict]:
+    """Return up to `n` receipts across both chains (main and fs), oldest first.
+
+    Reads from the tail of each log with bounded memory, merges them,
+    and returns the latest `n` entries chronologically.
+    """
+    if n <= 0:
+        return []
     base = _base_path(path)
-    main_rows = load_receipts(base)
     fs_p = chain_path(base, CHAIN_FS)
-    fs_rows = load_receipts(fs_p) if os.path.exists(fs_p) else []
-    merged = main_rows + fs_rows
-    return sorted(merged, key=lambda r: str(r.get("timestamp") or ""))
+    main_tail = tail_receipts(base, n=n)
+    fs_tail = tail_receipts(fs_p, n=n) if os.path.exists(fs_p) else []
+    if not fs_tail:
+        return main_tail
+    if not main_tail:
+        return fs_tail
+    merged = main_tail + fs_tail
+    merged.sort(key=lambda r: str(r.get("timestamp") or ""))
+    return merged[-n:]
+
+
+def latest_receipt(path: str) -> Optional[dict]:
+    """Return the most recent receipt across both chains, or None."""
+    tail = tail_all_receipts(path, n=1)
+    return tail[0] if tail else None
 
 
 def find_receipt(path: str, receipt_id: Optional[str] = None) -> Optional[dict]:
@@ -976,25 +1068,36 @@ def find_receipt(path: str, receipt_id: Optional[str] = None) -> Optional[dict]:
     paste the 8-char id they see rather than the full uuid. Searches across
     both main and filesystem receipt chains.
     """
-    rows = load_all_receipts(path)
-    if not rows:
-        return None
-    if not receipt_id:
-        return rows[-1]
+    if not receipt_id or not receipt_id.strip():
+        return latest_receipt(path)
+
     rid = receipt_id.strip()
-    # exact first, then unique prefix
-    for r in rows:
-        if r.get("receipt_id") == rid:
-            return r
-    matches = [r for r in rows if str(r.get("receipt_id", "")).startswith(rid)]
-    # AMBIGUOUS MEANS AMBIGUOUS. The docstring said "unique prefix" and the
-    # code returned matches[-1] - the newest of however many matched - with no
-    # warning. With 60 receipts a one-character prefix matched nine and
-    # silently picked one (2026-09-09). `undo` and `receipt --share` both take
-    # an id from here, so guessing means restoring or publishing a receipt the
-    # user did not ask for. recovery.find() already refuses on an ambiguous
-    # prefix; this is the same rule applied to the other ledger.
-    return matches[0] if len(matches) == 1 else None
+    base = _base_path(path)
+    fs_p = chain_path(base, CHAIN_FS)
+    chains = [base]
+    if os.path.exists(fs_p):
+        chains.append(fs_p)
+
+    exact_match = None
+    prefix_match = None
+    prefix_count = 0
+
+    for cp in chains:
+        for r in iter_receipts(cp):
+            cid = str(r.get("receipt_id", ""))
+            if cid == rid:
+                exact_match = r
+                break
+            elif cid.startswith(rid):
+                prefix_count += 1
+                if prefix_count == 1:
+                    prefix_match = r
+        if exact_match is not None:
+            break
+
+    if exact_match is not None:
+        return exact_match
+    return prefix_match if prefix_count == 1 else None
 
 
 def _fence_safe(text: str) -> str:

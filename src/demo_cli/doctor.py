@@ -19,7 +19,7 @@ from . import config as config_mod
 from .config import load_config
 from . import deps as deps_mod
 from . import fsmount, mountstate, render, protect as protect_mod
-from .receipts import load_all_receipts, load_receipts
+from .receipts import load_all_receipts, load_receipts, iter_all_receipts
 from .version import __version__
 
 # Every host demo_cli can hook, and where each keeps its registration.
@@ -428,9 +428,10 @@ def cmd_doctor(a) -> int:
     # by an AGENT is evidence. Three separate times the failure mode has been
     # "installed, looks fine, protecting nothing" (Codex config shape, Codex
     # stale session, Windows BOM), and each time a receipt would have said so.
-    rows = load_all_receipts(cfg.receipts_path)
+    has_receipts = False
     by_agent = {}
-    for r in rows:
+    for r in iter_all_receipts(cfg.receipts_path):
+        has_receipts = True
         aid = r.get("agent_id", "unknown")
         by_agent[aid] = max(by_agent.get(aid, ""), r.get("timestamp", ""))
     agents = [a for a in by_agent if a not in ("cli", "unknown")]
@@ -444,7 +445,7 @@ def cmd_doctor(a) -> int:
             when = newest[:19]
         checks.append(("ok", "ACTIVE (agent receipts)",
                        f"{', '.join(sorted(agents))} - last {when}"))
-    elif rows:
+    elif has_receipts:
         checks.append(("warn", "ACTIVE (agent receipts)",
                        "receipts exist but only from the CLI - no agent has been "
                        "gated yet. Run one command through the agent to confirm."))
