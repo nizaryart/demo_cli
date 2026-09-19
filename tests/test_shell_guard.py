@@ -222,3 +222,8 @@ def test_an_allowing_guard_lets_the_command_through(guarded_shell):
 def test_the_snippet_carries_both_escape_hatches():
     assert "DEMO_CLI_DISABLE" in _SHELL_GUARD_SNIPPET
     assert "--version" in _SHELL_GUARD_SNIPPET, "the broken-vs-refused probe"
+
+
+def test_the_snippet_carries_egress_failsafe_probe():
+    assert "/dev/tcp/127.0.0.1/" in _SHELL_GUARD_SNIPPET
+    assert "unset HTTPS_PROXY" in _SHELL_GUARD_SNIPPET

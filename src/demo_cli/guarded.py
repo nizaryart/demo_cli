@@ -61,9 +61,33 @@ from typing import Dict, List, Optional
 
 from .config import Config
 
-# localhost must never be proxied: the agent talking to a local dev server, or
-# to the guard's own port, would otherwise loop back through the proxy.
-_NO_PROXY = "localhost,127.0.0.1,::1"
+# Hostnames that must never route through the egress proxy:
+#   1. Localhost and loopbacks: dev servers and the guard's own port.
+#   2. AI model inference endpoints: Anthropic, OpenAI, Google Gemini.
+#      The agent's own thinking/control stream must never be buffered, delayed,
+#      or broken by egress TLS interception.
+_DEFAULT_NO_PROXY_LIST = [
+    "localhost",
+    "127.0.0.1",
+    "::1",
+    "api.anthropic.com",
+    "api.openai.com",
+    "generativelanguage.googleapis.com",
+    "*.anthropic.com",
+    "*.openai.com",
+]
+_NO_PROXY = ",".join(_DEFAULT_NO_PROXY_LIST)
+
+
+def default_no_proxy(extra: Optional[List[str]] = None) -> str:
+    """Return the comma-separated NO_PROXY list, including localhost,
+    LLM provider API endpoints, and any extra hosts specified."""
+    hosts = list(_DEFAULT_NO_PROXY_LIST)
+    if extra:
+        for h in extra:
+            if h and h not in hosts:
+                hosts.append(h)
+    return ",".join(hosts)
 
 
 @dataclass
@@ -100,7 +124,8 @@ def shell_guard_script() -> Optional[str]:
     return path if os.path.exists(path) else None
 
 
-def child_env(base: Dict[str, str], port: int, egress_up: bool) -> Dict[str, str]:
+def child_env(base: Dict[str, str], port: int, egress_up: bool,
+              extra_no_proxy: Optional[List[str]] = None) -> Dict[str, str]:
     """The environment the agent is launched with.
 
     Only variables whose layer is ACTUALLY RUNNING are set. Pointing
@@ -114,7 +139,10 @@ def child_env(base: Dict[str, str], port: int, egress_up: bool) -> Dict[str, str
     if egress_up:
         env["HTTPS_PROXY"] = env["https_proxy"] = f"http://localhost:{port}"
         env["HTTP_PROXY"] = env["http_proxy"] = f"http://localhost:{port}"
-        env["NO_PROXY"] = env["no_proxy"] = _NO_PROXY
+        existing = [h.strip() for h in (base.get("NO_PROXY") or base.get("no_proxy") or "").split(",") if h.strip()]
+        all_extra = (existing or []) + (extra_no_proxy or [])
+        no_p = default_no_proxy(all_extra) if all_extra else _NO_PROXY
+        env["NO_PROXY"] = env["no_proxy"] = no_p
         ca = ca_bundle()
         if ca:
             # Python (requests/httpx) and Node respectively. Without these the

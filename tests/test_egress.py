@@ -201,3 +201,34 @@ def test_trust_ca_off_windows_explains_the_alternative(capsys):
     out = capsys.readouterr().out
     assert "Windows-only" in out
     assert "REQUESTS_CA_BUNDLE" in out, "point them at what DOES work here"
+
+
+def test_cmd_egress_fails_cleanly_when_port_already_in_use(monkeypatch, capsys):
+    from demo_cli.cli import cmd_egress
+    import types
+    monkeypatch.setattr("demo_cli.guarded.port_open", lambda p: True)
+    args = types.SimpleNamespace(port=8080, enforce=False, trust_ca=False, untrust_ca=False)
+    rc = cmd_egress(args)
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "already in use" in out
+
+
+def test_egress_non_interactive_stdin_falls_back_to_timeout_action(monkeypatch):
+    import asyncio
+    import types
+    from demo_cli import egress
+    monkeypatch.setattr("sys.stdin", None)
+    addons = egress._build_addon()
+    assert len(addons) == 1
+    addon = addons[0]
+    addon.timeout_action = "block"
+    req = types.SimpleNamespace(method="POST", pretty_host="api.atlassian.com", path="/wiki/rest/api")
+    v = egress.HttpVerdict(level="review", surface="test", operation="POST", reason="ambiguous write")
+
+    res = asyncio.run(addon._ask(req, v))
+    assert res is False
+
+    addon.timeout_action = "allow"
+    res2 = asyncio.run(addon._ask(req, v))
+    assert res2 is True

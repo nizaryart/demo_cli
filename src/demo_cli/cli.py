@@ -638,6 +638,25 @@ _SHELL_GUARD_SNIPPET = r'''# >>> demo_cli shell guard >>>
 #                        package that will not even import is the same class
 #                        of failure, just earlier.
 if [ -n "$BASH_VERSION" ] && [ -z "$DEMO_CLI_DISABLE" ] && command -v demo_cli >/dev/null 2>&1; then
+  # Fail-safe egress probe: if proxy is configured for localhost but nothing is listening,
+  # unset the proxy so child network commands do not fail with Connection Refused.
+  case "${HTTPS_PROXY:-$https_proxy}" in
+    *localhost:*|*127.0.0.1:*)
+      __demo_cli_p="${HTTPS_PROXY:-$https_proxy}"
+      __demo_cli_port="${__demo_cli_p##*:}"
+      __demo_cli_port="${__demo_cli_port%%/*}"
+      case "$__demo_cli_port" in
+        ''|*[!0-9]*) ;;
+        *)
+          if ! (echo > /dev/tcp/127.0.0.1/"$__demo_cli_port") >/dev/null 2>&1; then
+            unset HTTPS_PROXY HTTP_PROXY https_proxy http_proxy
+          fi
+          ;;
+      esac
+      unset __demo_cli_p __demo_cli_port
+      ;;
+  esac
+
   case $- in *i*) shopt -s extdebug 2>/dev/null ;; esac
   __demo_cli_shell_guard() {
     case "$BASH_COMMAND" in
@@ -1218,10 +1237,26 @@ def cmd_guarded(a) -> int:
                     [mitm, "-s", os.path.join(here, "egress_addon.py"),
                      "--listen-port", str(port), "-q"],
                     stdout=fh, stderr=fh, stdin=subprocess.DEVNULL, env=env, **kwargs)
-            for _ in range(20):                 # up to ~4s for the port to open
+            for _ in range(40):                 # up to ~8s for the port to open
                 if g.port_open(port):
                     break
+                if started_egress.poll() is not None:
+                    # Early failure: mitmdump exited or crashed
+                    break
                 time.sleep(0.2)
+            if started_egress and not g.port_open(port) and started_egress.poll() is not None:
+                err_tail = ""
+                try:
+                    if os.path.exists(log):
+                        with open(log, "r", encoding="utf-8", errors="replace") as ef:
+                            lines = ef.read().strip().splitlines()
+                            if lines:
+                                err_tail = "\n".join(lines[-3:])
+                except Exception:
+                    pass
+                print(render.c(f"demo_cli: egress proxy failed to start (exit code {started_egress.returncode}).", "yellow"))
+                if err_tail:
+                    print(render.c(f"         {err_tail}", "dim"))
 
     layers = g.assess(cfg, port, _host_hook_status(cfg))
     print(render.c(f"\ndemo_cli {__version__}  guarded  ->  {' '.join(argv)}\n", "dim"))
@@ -1237,7 +1272,10 @@ def cmd_guarded(a) -> int:
     # report, it is a log entry.
     sys.stdout.flush()
 
-    env = g.child_env(dict(os.environ), port, g.port_open(port))
+    extra_np = None
+    if getattr(cfg, "egress", None) and isinstance(cfg.egress, dict):
+        extra_np = cfg.egress.get("no_proxy")
+    env = g.child_env(dict(os.environ), port, g.port_open(port), extra_no_proxy=extra_np)
 
     # Resolve the executable OURSELVES. On Windows subprocess goes through
     # CreateProcess, which does not consult PATHEXT - so `claude`, installed

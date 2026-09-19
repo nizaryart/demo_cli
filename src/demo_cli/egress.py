@@ -393,6 +393,13 @@ def _build_addon():
                       f"   allow this request? [y/N]  "
                       f"(auto-{self.timeout_action} in {self.timeout}s): ")
             async with self._lock:                # serialise prompts across flows
+                # If stdin is not a TTY or is closed (e.g. background daemon with DEVNULL),
+                # prompting via readline() cannot succeed and immediately returns EOF ("").
+                # Fall back to timeout_action directly.
+                if not sys.stdin or sys.stdin.closed or not getattr(sys.stdin, "isatty", lambda: False)():
+                    sys.stderr.write(f"\ndemo_cli egress [non-interactive]: {req.method} {req.pretty_host}{req.path} -> auto-{self.timeout_action}\n")
+                    return self.timeout_action == "allow"
+
                 sys.stderr.write(prompt)
                 sys.stderr.flush()
                 try:
@@ -401,6 +408,11 @@ def _build_addon():
                 except asyncio.TimeoutError:
                     sys.stderr.write(f"\ndemo_cli egress: no answer -> {self.timeout_action}\n")
                     return self.timeout_action == "allow"
+
+                if not line:  # EOF reached
+                    sys.stderr.write(f"\ndemo_cli egress: stdin EOF -> auto-{self.timeout_action}\n")
+                    return self.timeout_action == "allow"
+
                 return line.strip().lower() in ("y", "yes")
 
         async def request(self, flow):
@@ -567,6 +579,13 @@ def cmd_egress(a) -> int:
     loader = os.path.join(here, "egress_addon.py")          # thin package-aware entry
     pkg_parent = os.path.dirname(here)                       # so `import demo_cli` works
     port = getattr(a, "port", 8080)
+    from .guarded import port_open
+    if port_open(port):
+        print(render.c(f"Error: port {port} is already in use.", "red"))
+        print(f"Another process or proxy is already listening on port {port}.")
+        print(f"Stop that process, or run egress on a different port: demo_cli egress --port <port>")
+        return 1
+
     mode = "enforce" if getattr(a, "enforce", False) else load_config().mode
 
     print(render.c(f"\ndemo_cli egress guard  (mode={mode}, port={port})\n", "dim"))

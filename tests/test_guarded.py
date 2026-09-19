@@ -95,6 +95,29 @@ def test_localhost_is_never_proxied():
     assert "localhost" in env["NO_PROXY"]
 
 
+def test_llm_endpoints_are_never_proxied():
+    """AI model endpoints (Anthropic, OpenAI, Gemini) must never route through
+    the proxy - the agent's control plane stream must not be buffered or broken."""
+    env = g.child_env({}, 8080, egress_up=True)
+    np = env["NO_PROXY"]
+    assert "api.anthropic.com" in np
+    assert "api.openai.com" in np
+    assert "generativelanguage.googleapis.com" in np
+    assert "*.anthropic.com" in np
+    assert "*.openai.com" in np
+
+
+def test_custom_and_existing_no_proxy_merged_cleanly():
+    base = {"NO_PROXY": "corp.internal,example.com"}
+    env = g.child_env(base, 8080, egress_up=True, extra_no_proxy=["custom.ai"])
+    np = env["NO_PROXY"]
+    assert "corp.internal" in np
+    assert "example.com" in np
+    assert "custom.ai" in np
+    assert "localhost" in np
+    assert "api.anthropic.com" in np
+
+
 def test_the_existing_environment_is_preserved():
     env = g.child_env({"PATH": "/usr/bin", "HOME": "/home/x"}, 8080, egress_up=True)
     assert env["PATH"] == "/usr/bin" and env["HOME"] == "/home/x"
