@@ -272,11 +272,14 @@ def cmd_log(a) -> int:
 
 
 def cmd_verify(a) -> int:
-    from .receipts import CHAIN_FS, chain_path
+    from .receipts import CHAIN_FS, chain_path, anchor_chains
 
     cfg = load_config(getattr(a, "root", None))
     main_path = cfg.receipts_path
     fs_path = chain_path(main_path, CHAIN_FS)
+
+    if getattr(a, "anchor", False):
+        anchor_chains(main_path)
 
     v = verify_chain(main_path)
     # Absent on a project that has never been mounted - not a failure, and not
@@ -286,6 +289,9 @@ def cmd_verify(a) -> int:
     from .receipts import verify_cross_links
     links = verify_cross_links(main_path, fs_path) if fs is not None else None
 
+    # Audit on-disk recovery artifacts
+    artifacts = recovery.audit_recovery_artifacts(cfg.recovery_dir)
+
     # No head for an empty ledger - GENESIS is not something to anchor, and
     # printing it as if it were a chain head would invite someone to record a
     # value that attests to nothing.
@@ -294,7 +300,7 @@ def cmd_verify(a) -> int:
         heads["main"] = v.head
     if fs is not None and fs.ok and not fs.absent:
         heads["fs"] = fs.head
-    render.render_verify(v, __version__, fs=fs, heads=heads or None, links=links)
+    render.render_verify(v, __version__, fs=fs, heads=heads or None, links=links, artifacts=artifacts)
 
     # DAMAGE DOES NOT FAIL THE COMMAND. A torn line is a write that did not
     # finish; the entries around it are intact and verified. Exiting non-zero
@@ -313,7 +319,8 @@ def cmd_verify(a) -> int:
     # and the answer is no: a project whose filesystem guard has never written
     # is an ordinary state, not evidence of anything.
     cross_ok = links.ok if (links and links.checked) else True
-    ok = v.ok and (fs.ok if fs else True) and cross_ok
+    artifacts_ok = artifacts.ok
+    ok = v.ok and (fs.ok if fs else True) and cross_ok and artifacts_ok
     return 0 if ok else 1
 
 
@@ -1326,6 +1333,8 @@ def build_parser() -> argparse.ArgumentParser:
     lg.set_defaults(func=cmd_log)
 
     vf = sub.add_parser("verify", parents=[common], help="verify the receipt hash-chain")
+    vf.add_argument("--anchor", action="store_true",
+                    help="seal unanchored tails across both chains before verifying")
     vf.set_defaults(func=cmd_verify)
 
     rp = sub.add_parser("report", parents=[common], help="summarise recorded decisions (shadow report)")

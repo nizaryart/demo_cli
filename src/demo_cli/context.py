@@ -100,8 +100,8 @@ def _find_git_dir(start: str) -> Tuple[Optional[str], Optional[str]]:
         return None, None
 
 
-def _git_context(cwd: Optional[str] = None) -> Tuple[str, str, str]:
-    """Return (repo_root, branch, remote) with fast filesystem checks and TTL caching."""
+def _git_context(cwd: Optional[str] = None) -> Tuple[str, str, str, str]:
+    """Return (repo_root, branch, remote, commit) with fast filesystem checks and TTL caching."""
     target_cwd = os.path.abspath(cwd or os.getcwd())
     now = time.time()
     cached = _GIT_CACHE.get(target_cwd)
@@ -110,12 +110,13 @@ def _git_context(cwd: Optional[str] = None) -> Tuple[str, str, str]:
 
     repo_root, git_path = _find_git_dir(target_cwd)
     if not repo_root or not git_path:
-        res = ("unknown", "unknown", "unknown")
+        res = ("unknown", "unknown", "unknown", "unknown")
         _GIT_CACHE[target_cwd] = (res, now + 2.0)
         return res
 
     branch = "unknown"
     remote = "unknown"
+    commit = "unknown"
     try:
         # Fast path: inspect .git/HEAD directly to avoid spawning subprocess
         head_file = os.path.join(git_path, "HEAD") if os.path.isdir(git_path) else None
@@ -125,19 +126,27 @@ def _git_context(cwd: Optional[str] = None) -> Tuple[str, str, str]:
                     content = f.read().strip()
                 if content.startswith("ref: refs/heads/"):
                     branch = content[len("ref: refs/heads/"):].strip()
+                    ref_path = os.path.join(git_path, "refs", "heads", branch)
+                    if os.path.exists(ref_path):
+                        with open(ref_path, "r", encoding="utf-8", errors="ignore") as rf:
+                            commit = rf.read().strip()
                 elif content:
                     branch = "HEAD"
+                    commit = content
             except Exception:
                 pass
 
         if branch == "unknown":
             branch = _git_value("rev-parse", "--abbrev-ref", "HEAD", cwd=target_cwd)
 
+        if commit == "unknown":
+            commit = _git_value("rev-parse", "HEAD", cwd=target_cwd)
+
         remote = _git_value("config", "--get", "remote.origin.url", cwd=target_cwd)
     except Exception:
         pass
 
-    res = (repo_root, branch, remote)
+    res = (repo_root, branch, remote, commit)
     _GIT_CACHE[target_cwd] = (res, now + 2.0)
     return res
 
@@ -165,6 +174,7 @@ class Context:
     aws_profile: str
     gcloud_project: str
     azure_subscription: str
+    commit: str = "unknown"
     fingerprint: str = ""
 
     def as_dict(self) -> Dict:
@@ -172,6 +182,7 @@ class Context:
             "cwd": self.cwd,
             "repo_root": self.repo_root,
             "branch": self.branch,
+            "commit": self.commit,
             "remote": self.remote,
             "target_label": self.target_label,
             "environment": self.environment,
@@ -189,11 +200,12 @@ def build_context(cmd: str, target_label: Optional[str] = None,
                   cwd: Optional[str] = None) -> Context:
     cwd = cwd or os.getcwd()
     env, source = resolve_env(cmd, target_label, declared_env, config_env)
-    repo_root, branch, remote = _git_context(cwd)
+    repo_root, branch, remote, commit = _git_context(cwd)
     ctx = Context(
         cwd=cwd,
         repo_root=repo_root,
         branch=branch,
+        commit=commit,
         remote=remote,
         target_label=redact(target_label) if target_label else "unknown",
         environment=env,

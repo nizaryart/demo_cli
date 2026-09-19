@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import re
+import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -333,6 +334,7 @@ def last_hash(path: str) -> str:
 # Neither does a single chain - same threat model, no regression. The answer
 # to that is an external anchor, which `verify` now prints the heads for.
 _PEER_CACHE: Dict[str, tuple] = {}   # path -> ((size, mtime_ns), head)
+_PEER_CACHE_LOCK = threading.Lock()
 
 
 def _tail_hash(path: str, max_bytes: int = 65536) -> str:
@@ -412,11 +414,13 @@ def peer_head(path: str, chain: str) -> Optional[str]:
     except OSError:
         return None                      # no peer chain yet: nothing to anchor
     key = (st.st_size, st.st_mtime_ns)
-    cached = _PEER_CACHE.get(other)
-    if cached and cached[0] == key:
-        return cached[1]
+    with _PEER_CACHE_LOCK:
+        cached = _PEER_CACHE.get(other)
+        if cached and cached[0] == key:
+            return cached[1]
     head = _tail_hash(other)
-    _PEER_CACHE[other] = (key, head)
+    with _PEER_CACHE_LOCK:
+        _PEER_CACHE[other] = (key, head)
     return head
 
 
@@ -881,6 +885,55 @@ def _unanchored_after_last_peer_write(main_path: str, fs_path: str) -> int:
         return len(a) + len(b)
     return (sum(1 for t in a if t > max(b)) +
             sum(1 for t in b if t > max(a)))
+
+
+def anchor_chains(path: str) -> bool:
+    """Explicitly anchor both chains against each other to close the unanchored tail.
+
+    Writes a mutual anchor checkpoint to both chains, binding them to their
+    current heads and reducing the unanchored count to 0.
+
+    Returns True if an anchor was written, False if either chain is missing or
+    there were no unanchored entries.
+    """
+    main_p = chain_path(path, CHAIN_MAIN)
+    fs_p = chain_path(path, CHAIN_FS)
+    if not (os.path.exists(main_p) and os.path.exists(fs_p)):
+        return False
+
+    if _unanchored_after_last_peer_write(main_p, fs_p) == 0:
+        return False
+
+    ts = _now()
+
+    append_receipt(main_p, Receipt(
+        action_raw="[fs] anchor checkpoint",
+        action_type="checkpoint",
+        target_environment="local",
+        decision="ALLOW",
+        reason="Mutual cross-chain anchor checkpoint.",
+        mode="enforce-fs",
+        matched_rule="fs_anchor",
+        agent_id="fsguard",
+        session_id="anchor",
+        chain=CHAIN_FS,
+        timestamp=ts,
+    ))
+
+    append_receipt(main_p, Receipt(
+        action_raw="[main] anchor checkpoint",
+        action_type="checkpoint",
+        target_environment="local",
+        decision="ALLOW",
+        reason="Mutual cross-chain anchor checkpoint.",
+        mode="enforce",
+        matched_rule="main_anchor",
+        agent_id="cli",
+        session_id="anchor",
+        chain=CHAIN_MAIN,
+        timestamp=ts,
+    ))
+    return True
 
 
 def load_receipts(path: str) -> List[dict]:

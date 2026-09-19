@@ -156,3 +156,42 @@ def test_a_safe_command_before_a_destructive_one_is_not_the_target(files):
 
 def test_a_command_with_no_destructive_segment_resolves_to_nothing(files):
     assert recovery.extract_path_operand("echo hi; ls -la", POSIX) is None
+
+
+def test_audit_recovery_artifacts_detects_missing_and_corrupt(tmp_path):
+    rec_dir = str(tmp_path / "rec")
+    os.makedirs(rec_dir, exist_ok=True)
+
+    e1 = recovery.snapshot_bytes("a.txt", b"hello world", rec_dir)
+    assert e1 is not None
+
+    e2 = recovery.snapshot_bytes("empty.txt", b"temp", rec_dir)
+    with open(e2["recovery_point"], "wb") as f:
+        pass
+
+    e3 = recovery.snapshot_bytes("missing.txt", b"will delete", rec_dir)
+    os.remove(e3["recovery_point"])
+
+    res = recovery.audit_recovery_artifacts(rec_dir)
+    assert not res.ok
+    assert res.total_active == 3
+    assert res.intact == 1
+    assert e2["id"] in res.corrupt
+    assert e3["id"] in res.missing
+
+
+def test_verify_fails_on_missing_artifact(tmp_path, capsys):
+    from demo_cli import cli
+    from types import SimpleNamespace
+    rec_dir = str(tmp_path / ".demo_cli" / "recovery")
+    os.makedirs(rec_dir, exist_ok=True)
+    e = recovery.snapshot_bytes("file.txt", b"bytes", rec_dir)
+    os.remove(e["recovery_point"])
+
+    ret = cli.cmd_verify(SimpleNamespace(root=str(tmp_path), anchor=False))
+    assert ret == 1
+    out = capsys.readouterr().out
+    assert "MISSING ARTIFACTS" in out
+    assert "snapshot(s) NOT on disk" in out
+    assert e["id"] in out
+

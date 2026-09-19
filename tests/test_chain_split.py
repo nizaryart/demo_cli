@@ -28,7 +28,8 @@ import pytest
 from demo_cli.receipts import (CHAIN_FS, CHAIN_MAIN, GENESIS, Receipt,
                                append_receipt, chain_path, peer_path,
                                verify_chain, verify_cross_links,
-                               load_all_receipts, find_receipt)
+                               load_all_receipts, find_receipt,
+                               anchor_chains, peer_head)
 
 
 def _r(action="x", chain=CHAIN_MAIN, decision="ALLOW", **kw):
@@ -791,4 +792,60 @@ def test_cmd_status_and_report_cover_dual_chains(tmp_path, capsys):
     assert "receipts" in out
     assert "ALLOW" in out
     assert "REVERSIBLE" in out
+
+
+def test_anchor_chains_drops_unanchored_to_zero(tmp_path):
+    main = str(tmp_path / "receipts.jsonl")
+    fs = chain_path(main, CHAIN_FS)
+
+    append_receipt(main, _r("cmd1", chain=CHAIN_MAIN, timestamp="2026-09-01T10:00:00Z"))
+    append_receipt(main, _r("[fs] delete 1", chain=CHAIN_FS, timestamp="2026-09-01T11:00:00Z"))
+    append_receipt(main, _r("cmd2", chain=CHAIN_MAIN, timestamp="2026-09-01T12:00:00Z"))
+
+    links_before = verify_cross_links(main, fs)
+    assert links_before.unanchored == 1
+
+    anchored = anchor_chains(main)
+    assert anchored is True
+
+    links_after = verify_cross_links(main, fs)
+    assert links_after.unanchored == 0
+    assert links_after.ok is True
+    assert verify_chain(main).ok is True
+    assert verify_chain(fs).ok is True
+
+
+def test_cmd_verify_anchor_flag(tmp_path):
+    from demo_cli import cli
+    from types import SimpleNamespace
+
+    main = str(tmp_path / ".demo_cli" / "receipts.jsonl")
+    os.makedirs(os.path.dirname(main), exist_ok=True)
+    fs = chain_path(main, CHAIN_FS)
+
+    append_receipt(main, _r("cmd1", chain=CHAIN_MAIN, timestamp="2026-09-01T10:00:00Z"))
+    append_receipt(main, _r("[fs] delete 1", chain=CHAIN_FS, timestamp="2026-09-01T11:00:00Z"))
+    append_receipt(main, _r("cmd2", chain=CHAIN_MAIN, timestamp="2026-09-01T12:00:00Z"))
+
+    ret = cli.cmd_verify(SimpleNamespace(root=str(tmp_path), anchor=True))
+    assert ret == 0
+
+    links = verify_cross_links(main, fs)
+    assert links.unanchored == 0
+
+
+def test_peer_cache_concurrent_access(tmp_path):
+    import concurrent.futures
+    main = str(tmp_path / "receipts.jsonl")
+    append_receipt(main, _r("cmd1", chain=CHAIN_MAIN))
+
+    def _read_peer():
+        return peer_head(main, CHAIN_FS)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
+        results = list(ex.map(lambda _: _read_peer(), range(20)))
+
+    assert all(r is not None for r in results)
+    assert len(set(results)) == 1
+
 

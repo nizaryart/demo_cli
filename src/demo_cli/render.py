@@ -281,13 +281,17 @@ def _verify_block(name: str, v: VerifyResult) -> List[str]:
 
 
 def render_verify(v: VerifyResult, version: str, fs: Optional[VerifyResult] = None,
-                  heads: Optional[dict] = None, links=None) -> None:
+                  heads: Optional[dict] = None, links=None,
+                  artifacts=None) -> None:
     """Report every chain. `fs` is the filesystem guard's own log; it is absent
     on a project that has never been mounted, and that is not a failure."""
-    ok = v.ok and (fs.ok if fs else True) and (links.ok if links else True)
+    artifacts_ok = artifacts.ok if artifacts is not None else True
+    ok = v.ok and (fs.ok if fs else True) and (links.ok if links else True) and artifacts_ok
     damaged = v.damaged or (fs.damaged if fs else False)
     reordered = v.reordered or (fs.reordered if fs else False)
-    if v.absent and (fs is None or fs.absent):
+    if not artifacts_ok:
+        label = "MISSING ARTIFACTS"
+    elif v.absent and (fs is None or fs.absent):
         label = "NO RECEIPTS"
     elif ok:
         label = "DAMAGED" if damaged else "VERIFIED"
@@ -304,6 +308,17 @@ def render_verify(v: VerifyResult, version: str, fs: Optional[VerifyResult] = No
     lines += _verify_block("main", v)
     if fs is not None:
         lines += _verify_block("fs", fs)
+    if artifacts is not None and artifacts.total_active > 0:
+        lines += ["", c("Recovery artifacts", "cyan")]
+        if artifacts.ok:
+            lines.append("  " + c(f"{'artifacts':<12} {artifacts.intact} verified on disk", "green"))
+        else:
+            if artifacts.missing:
+                lines.append("  " + c(f"{'missing':<12} {len(artifacts.missing)} snapshot(s) NOT on disk", "red"))
+                lines.append("             " + c(f"promised recovery points cannot be restored: {', '.join(artifacts.missing[:5])}", "red"))
+            if artifacts.corrupt:
+                lines.append("  " + c(f"{'corrupt':<12} {len(artifacts.corrupt)} snapshot(s) empty/unreadable", "red"))
+                lines.append("             " + c(f"snapshot file has 0 bytes: {', '.join(artifacts.corrupt[:5])}", "red"))
     if links is not None and links.checked:
         if links.ok:
             lines.append("  " + c(f"{'cross-links':<12} {links.verified} verified"

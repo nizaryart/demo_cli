@@ -12,7 +12,7 @@ import os
 import shutil
 import subprocess
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 from .classify import (
@@ -809,6 +809,54 @@ def prune(recovery_dir: str, keep: Optional[int] = None,
                     f.write(str(e.get("id", "")) + "\n")
 
     return doomed
+
+
+@dataclass
+class ArtifactAuditResult:
+    """Audit of on-disk recovery artifacts referenced by active index entries."""
+    total_active: int = 0
+    intact: int = 0
+    missing: List[str] = field(default_factory=list)
+    corrupt: List[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not self.missing and not self.corrupt
+
+
+def audit_recovery_artifacts(recovery_dir: str) -> ArtifactAuditResult:
+    """Verify that every active recovery entry in the ledger has an intact,
+    non-empty snapshot file or directory on disk.
+
+    Pruned entries are excluded because they were legitimately deleted and are
+    no longer advertised by load_entries(). A missing or empty file for an
+    active entry means the tool promises a recovery it cannot deliver.
+    """
+    entries = load_entries(recovery_dir)
+    res = ArtifactAuditResult(total_active=len(entries))
+    for e in entries:
+        eid = str(e.get("id", "?"))
+        kind = e.get("kind", "file")
+        rp = e.get("recovery_point")
+        if not rp:
+            res.missing.append(eid)
+            continue
+        try:
+            if kind == "dir":
+                if not os.path.isdir(rp):
+                    res.missing.append(eid)
+                else:
+                    res.intact += 1
+            else:
+                if not os.path.isfile(rp):
+                    res.missing.append(eid)
+                elif os.path.getsize(rp) == 0:
+                    res.corrupt.append(eid)
+                else:
+                    res.intact += 1
+        except OSError:
+            res.missing.append(eid)
+    return res
 
 
 @dataclass

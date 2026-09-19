@@ -34,11 +34,17 @@ def test_git_context_caching(tmp_path):
     _GIT_CACHE.clear()
 
     res1 = _git_context(d)
-    assert res1 == ("unknown", "unknown", "unknown")
+    assert res1 == ("unknown", "unknown", "unknown", "unknown")
     assert os.path.abspath(d) in _GIT_CACHE
 
     res2 = _git_context(d)
     assert res1 == res2
+
+
+def test_context_includes_commit(tmp_path):
+    ctx = build_context("echo hello", cwd=str(tmp_path))
+    assert hasattr(ctx, "commit")
+    assert "commit" in ctx.as_dict()
 
 
 def test_find_git_dir_ancestor(tmp_path):
