@@ -500,3 +500,104 @@ def test_relocate_refuses_to_merge_into_an_existing_backing(tmp_path):
 def test_relocate_refuses_a_missing_source(tmp_path):
     with pytest.raises(NotADirectoryError):
         Backing.relocate(str(tmp_path / "nothing"), str(tmp_path / "backing"))
+
+
+# --------------------------------------------------------------------------
+# VFS Cloaking - hiding sensitive files from directory listings and direct I/O
+# --------------------------------------------------------------------------
+
+@pytest.fixture
+def cloaked_backing(tmp_path):
+    root = tmp_path / "project.cloaked"
+    root.mkdir()
+    from demo_cli.config import DEFAULT_CLOAK_PATTERNS
+    return Backing(str(root), cloak_patterns=DEFAULT_CLOAK_PATTERNS)
+
+
+def test_cloaked_files_hidden_from_listdir(cloaked_backing):
+    cloaked_backing.make_file(r"\normal.txt")
+    real_env = os.path.join(cloaked_backing.root, ".env")
+    with open(real_env, "w") as f:
+        f.write("SECRET=1")
+    real_secrets = os.path.join(cloaked_backing.root, "secrets.env")
+    with open(real_secrets, "w") as f:
+        f.write("KEY=2")
+    real_toml = os.path.join(cloaked_backing.root, ".demo_cli.toml")
+    with open(real_toml, "w") as f:
+        f.write("mode = 'enforce'")
+
+    listing = cloaked_backing.listdir("\\")
+    assert "normal.txt" in listing
+    assert ".env" not in listing
+    assert "secrets.env" not in listing
+    assert ".demo_cli.toml" not in listing
+
+
+def test_cloaked_files_report_not_exists_and_not_dir(cloaked_backing):
+    real_env = os.path.join(cloaked_backing.root, ".env")
+    with open(real_env, "w") as f:
+        f.write("SECRET=1")
+
+    assert not cloaked_backing.exists(r"\.env")
+    assert not cloaked_backing.is_dir(r"\.env")
+
+
+def test_cloaked_files_raise_filenotfound_on_open_and_attrs(cloaked_backing):
+    real_env = os.path.join(cloaked_backing.root, ".env")
+    with open(real_env, "w") as f:
+        f.write("SECRET=1")
+
+    with pytest.raises(FileNotFoundError):
+        cloaked_backing.open_fd(r"\.env")
+
+    with pytest.raises(FileNotFoundError):
+        cloaked_backing.read_all(r"\.env")
+
+    with pytest.raises(FileNotFoundError):
+        cloaked_backing.attrs(r"\.env")
+
+
+def test_cloaked_files_anti_clobber_on_create(cloaked_backing):
+    real_env = os.path.join(cloaked_backing.root, ".env")
+    with open(real_env, "w") as f:
+        f.write("ORIGINAL_SECRET")
+
+    # Creating a cloaked file that exists on disk raises FileExistsError
+    with pytest.raises(FileExistsError):
+        cloaked_backing.make_file(r"\.env")
+
+    # Content on disk must NOT be clobbered
+    with open(real_env, "r") as f:
+        assert f.read() == "ORIGINAL_SECRET"
+
+
+def test_cloaked_files_refuse_creation_even_if_not_on_disk(cloaked_backing):
+    # If the cloaked file does not exist on disk, creating it raises PermissionError
+    with pytest.raises(PermissionError):
+        cloaked_backing.make_file(r"\new_secret.env")
+
+
+def test_example_and_template_files_not_cloaked(cloaked_backing):
+    cloaked_backing.make_file(r"\.env.example")
+    cloaked_backing.make_file(r"\app.template.env")
+    assert ".env.example" in cloaked_backing.listdir("\\")
+    assert "app.template.env" in cloaked_backing.listdir("\\")
+    assert cloaked_backing.exists(r"\.env.example")
+    assert cloaked_backing.attrs(r"\.env.example").size == 0
+
+
+def test_cloaked_files_refuse_remove_and_rename(cloaked_backing):
+    real_env = os.path.join(cloaked_backing.root, ".env")
+    with open(real_env, "w") as f:
+        f.write("SECRET=1")
+
+    with pytest.raises(FileNotFoundError):
+        cloaked_backing.remove(r"\.env")
+
+    with pytest.raises(FileNotFoundError):
+        cloaked_backing.rename(r"\.env", r"\new.txt")
+
+    cloaked_backing.make_file(r"\source.txt")
+    with pytest.raises(FileExistsError):
+        cloaked_backing.rename(r"\source.txt", r"\.env")
+

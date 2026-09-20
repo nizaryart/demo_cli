@@ -31,6 +31,14 @@ mode = "shadow"            # "shadow" observes only; "enforce" gates actions
 [workspace]
 dir = ".demo_cli"          # receipts + recovery points live here (per project)
 
+# [cloak]
+# enabled = true           # hides sensitive credential files from the virtual mount
+# patterns = ["*.env", ".env*", ".demo_cli.toml", "*.key"]
+
+# [env]
+# strip = ["AWS_*", "*_SECRET*", "*_TOKEN", "DATABASE_URL"]
+# preserve = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]
+
 # [approval]
 # key_env = "DEMO_CLI_APPROVER_KEY"   # env var holding the structural-approval key
 

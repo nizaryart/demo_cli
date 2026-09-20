@@ -43,10 +43,11 @@ matching, and nothing else in this module may join paths by hand.
 from __future__ import annotations
 
 import errno
+import fnmatch
 import os
 import shutil
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 
 class PathEscape(Exception):
@@ -111,12 +112,34 @@ class Backing:
     by the caller, so nothing here has to be reconciled after a crash.
     """
 
-    def __init__(self, root: str, create: bool = False):
+    def __init__(self, root: str, create: bool = False,
+                 cloak_patterns: Optional[Sequence[str]] = None):
         self.root = os.path.abspath(root)
+        self.cloak_patterns = [str(p) for p in cloak_patterns] if cloak_patterns is not None else None
         if create:
             os.makedirs(self.root, exist_ok=True)
         if not os.path.isdir(self.root):
             raise NotADirectoryError(f"backing directory does not exist: {self.root}")
+
+    def is_cloaked(self, virtual: Optional[str]) -> bool:
+        """True if the path matches a cloaking pattern and should be invisible in the mount."""
+        if not virtual or self.cloak_patterns is None:
+            return False
+        clean = normalize(virtual)
+        if not clean:
+            return False
+        base = os.path.basename(clean)
+        lower_base = base.lower()
+        # Refinement 2: Explicitly exempt example and template files
+        if (lower_base.endswith(".example")
+                or lower_base.endswith(".template")
+                or ".example." in lower_base
+                or ".template." in lower_base):
+            return False
+        for pattern in self.cloak_patterns:
+            if fnmatch.fnmatch(base, pattern) or fnmatch.fnmatch(clean, pattern):
+                return True
+        return False
 
     # ------------------------------------------------------------------
     # The single door
@@ -162,18 +185,24 @@ class Backing:
     # ------------------------------------------------------------------
 
     def exists(self, virtual: Optional[str]) -> bool:
+        if self.is_cloaked(virtual):
+            return False
         try:
             return os.path.lexists(self.resolve(virtual))
         except PathEscape:
             return False
 
     def is_dir(self, virtual: Optional[str]) -> bool:
+        if self.is_cloaked(virtual):
+            return False
         try:
             return os.path.isdir(self.resolve(virtual))
         except PathEscape:
             return False
 
     def attrs(self, virtual: Optional[str]) -> Attrs:
+        if self.is_cloaked(virtual):
+            raise FileNotFoundError(errno.ENOENT, "cloaked file", virtual)
         real = self.resolve(virtual)
         st = os.stat(real)
         is_dir = os.path.isdir(real)
@@ -188,28 +217,44 @@ class Backing:
         )
 
     def listdir(self, virtual: Optional[str]) -> List[str]:
-        """Entry names, sorted. Sorted because WinFsp pages through directory
-        listings with a marker: an unstable order makes entries appear twice or
-        not at all across pages, and that bug only shows up on big
-        directories."""
-        return sorted(os.listdir(self.resolve(virtual)))
+        """Entry names, sorted and filtered of cloaked files."""
+        if self.is_cloaked(virtual):
+            return []
+        prefix = normalize(virtual)
+        entries = sorted(os.listdir(self.resolve(virtual)))
+        if self.cloak_patterns is not None:
+            entries = [
+                name for name in entries
+                if not self.is_cloaked(f"{prefix}/{name}" if prefix else name)
+            ]
+        return entries
 
     # ------------------------------------------------------------------
     # Creating
     # ------------------------------------------------------------------
 
     def make_dir(self, virtual: str) -> str:
+        if self.is_cloaked(virtual):
+            real = self.resolve(virtual)
+            if os.path.lexists(real):
+                raise FileExistsError(errno.EEXIST, "directory exists (cloaked)", real)
+            raise PermissionError(errno.EACCES, "cannot create cloaked directory", real)
         real = self.resolve(virtual)
         os.mkdir(real)
         return real
 
     def make_file(self, virtual: str) -> str:
-        """Create an empty file, refusing to clobber an existing one.
+        """Create an empty file, refusing to clobber an existing or cloaked one.
 
         'x' rather than 'w': a create that silently truncates an existing file
         would destroy data BELOW the level the guard inspects, with no hook
         able to see it happen.
         """
+        if self.is_cloaked(virtual):
+            real = self.resolve(virtual)
+            if os.path.lexists(real):
+                raise FileExistsError(errno.EEXIST, "file exists (cloaked)", real)
+            raise PermissionError(errno.EACCES, "cannot create cloaked file", real)
         real = self.resolve(virtual)
         with open(real, "xb"):
             pass
@@ -230,6 +275,8 @@ class Backing:
         passthrough cannot perform the single most important operation it
         exists to guard.
         """
+        if self.is_cloaked(virtual):
+            raise FileNotFoundError(errno.ENOENT, "cloaked file", virtual)
         real = self.resolve(virtual)
         if os.name == "nt":
             return _open_fd_windows(real, write)
@@ -259,6 +306,8 @@ class Backing:
         """The whole file. Used by the guard to snapshot content that is about
         to be destroyed - the passthrough equivalent of reading FileObj.data
         out of the in-memory filesystem."""
+        if self.is_cloaked(virtual):
+            raise FileNotFoundError(errno.ENOENT, "cloaked file", virtual)
         with open(self.resolve(virtual), "rb") as f:
             return f.read()
 
@@ -274,6 +323,8 @@ class Backing:
         gets its own verdict. A recursive delete here would destroy files the
         guard never saw.
         """
+        if self.is_cloaked(virtual):
+            raise FileNotFoundError(errno.ENOENT, "cloaked file", virtual)
         real = self.resolve(virtual)
         if os.path.isdir(real):
             os.rmdir(real)
@@ -291,6 +342,13 @@ class Backing:
         DESTINATION's content is what dies here - fsguard.on_rename already
         knows that, and its snapshot has been taken before we are called.
         """
+        if self.is_cloaked(old_virtual):
+            raise FileNotFoundError(errno.ENOENT, "cloaked file", old_virtual)
+        if self.is_cloaked(new_virtual):
+            real_dst = self.resolve(new_virtual)
+            if os.path.lexists(real_dst):
+                raise FileExistsError(errno.EEXIST, "destination exists (cloaked)", real_dst)
+            raise PermissionError(errno.EACCES, "cannot move to cloaked destination", real_dst)
         src, dst = self.resolve(old_virtual), self.resolve(new_virtual)
         if replace_if_exists:
             os.replace(src, dst)

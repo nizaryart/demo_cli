@@ -125,7 +125,8 @@ def shell_guard_script() -> Optional[str]:
 
 
 def child_env(base: Dict[str, str], port: int, egress_up: bool,
-              extra_no_proxy: Optional[List[str]] = None) -> Dict[str, str]:
+              extra_no_proxy: Optional[List[str]] = None,
+              config: Optional[Config] = None) -> Dict[str, str]:
     """The environment the agent is launched with.
 
     Only variables whose layer is ACTUALLY RUNNING are set. Pointing
@@ -135,7 +136,7 @@ def child_env(base: Dict[str, str], port: int, egress_up: bool,
     child instead of written with setx - they cannot outlive the thing they
     describe.
     """
-    env = dict(base)
+    env = config.sanitized_env(base) if config else dict(base)
     if egress_up:
         env["HTTPS_PROXY"] = env["https_proxy"] = f"http://localhost:{port}"
         env["HTTP_PROXY"] = env["http_proxy"] = f"http://localhost:{port}"

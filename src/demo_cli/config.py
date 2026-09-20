@@ -22,9 +22,10 @@ Nothing here is required: with no config file the tool runs with safe defaults
 """
 from __future__ import annotations
 
+import fnmatch
 import os
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 def _read_toml_bytes(path):
     """Config file contents with any UTF-8 byte-order mark removed.
@@ -96,6 +97,41 @@ class TargetRule:
         return bool(ref) and self.match.lower() in str(ref).lower()
 
 
+DEFAULT_CLOAK_PATTERNS = [
+    "*.env",
+    ".env*",
+    "*.key",
+    ".demo_cli.toml",
+]
+
+DEFAULT_STRIP_ENV_PATTERNS = [
+    "AWS_*",
+    "*_SECRET*",
+    "*_TOKEN",
+    "DATABASE_URL",
+    "DB_PASS*",
+    "DEMO_CLI_APPROVER_KEY",
+]
+
+DEFAULT_PRESERVE_ENV = [
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "GEMINI_API_KEY",
+    "PATH",
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+    "HOME",
+    "LANG",
+    "LC_*",
+    "TERM",
+    "SHELL",
+    "COMSPEC",
+    "PATHEXT",
+]
+
+
 @dataclass
 class Config:
     mode: str = "shadow"
@@ -104,6 +140,8 @@ class Config:
     approval_key_env: Optional[str] = None
     targets: List[TargetRule] = field(default_factory=list)
     egress: dict = field(default_factory=dict)  # [egress] table for the egress guard
+    cloak: dict = field(default_factory=dict)   # [cloak] table for VFS file cloaking
+    env_policy: dict = field(default_factory=dict)  # [env] table for environment scrubbing
     # [checkpoint] table. Off by default: copying the workspace before a
     # command is a real cost, and a guard that becomes slow without being asked
     # is a guard that gets uninstalled. See checkpoint.py.
@@ -134,6 +172,65 @@ class Config:
         if not self.approval_key_env:
             return None
         return os.environ.get(self.approval_key_env) or None
+
+    @property
+    def cloak_enabled(self) -> bool:
+        if isinstance(self.cloak, dict):
+            return bool(self.cloak.get("enabled", True))
+        return True
+
+    @property
+    def cloak_patterns(self) -> List[str]:
+        if not self.cloak_enabled:
+            return []
+        if isinstance(self.cloak, dict) and "patterns" in self.cloak:
+            p = self.cloak["patterns"]
+            if isinstance(p, list):
+                return [str(x) for x in p]
+        return list(DEFAULT_CLOAK_PATTERNS)
+
+    def is_cloaked(self, path: Optional[str]) -> bool:
+        """Is `path` cloaked (hidden from VFS directory listings and direct access)?
+
+        Exempts *.example and *.template files so the agent retains structural context.
+        """
+        if not path or not self.cloak_enabled:
+            return False
+        clean = path.replace("\\", "/").rstrip("/")
+        base = os.path.basename(clean)
+        lower_base = base.lower()
+        if (lower_base.endswith(".example")
+                or lower_base.endswith(".template")
+                or ".example." in lower_base
+                or ".template." in lower_base):
+            return False
+        patterns = self.cloak_patterns
+        # Match both basename and full relative path
+        for pattern in patterns:
+            if fnmatch.fnmatch(base, pattern) or fnmatch.fnmatch(clean, pattern):
+                return True
+        return False
+
+    def sanitized_env(self, base_env: Optional[dict] = None) -> dict:
+        """Produce an environment scrubbed of sensitive secrets for child agent processes."""
+        source = dict(os.environ if base_env is None else base_env)
+        strip_patterns = list(DEFAULT_STRIP_ENV_PATTERNS)
+        preserve_patterns = list(DEFAULT_PRESERVE_ENV)
+        if isinstance(self.env_policy, dict):
+            if "strip" in self.env_policy and isinstance(self.env_policy["strip"], list):
+                strip_patterns = [str(x) for x in self.env_policy["strip"]]
+            if "preserve" in self.env_policy and isinstance(self.env_policy["preserve"], list):
+                preserve_patterns += [str(x) for x in self.env_policy["preserve"]]
+
+        out = {}
+        for k, v in source.items():
+            if any(fnmatch.fnmatch(k, p) for p in preserve_patterns):
+                out[k] = v
+                continue
+            if any(fnmatch.fnmatch(k, p) for p in strip_patterns):
+                continue
+            out[k] = v
+        return out
 
     def match_target(self, ref: Optional[str]) -> Optional[TargetRule]:
         for t in self.targets:
@@ -281,6 +378,14 @@ def load_config(start: Optional[str] = None) -> Config:
     eg = data.get("egress", {})
     if isinstance(eg, dict):
         cfg.egress = eg
+
+    cl = data.get("cloak", {})
+    if isinstance(cl, dict):
+        cfg.cloak = cl
+
+    ep = data.get("env", {})
+    if isinstance(ep, dict):
+        cfg.env_policy = ep
 
     ck = data.get("checkpoint", {})
     if isinstance(ck, dict):

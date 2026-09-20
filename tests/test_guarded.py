@@ -255,3 +255,78 @@ def test_a_layer_that_disappears_from_the_report_is_not_a_drop():
     before = [g.Layer("shell guard", True, "installed"), g.Layer("egress", True, "up")]
     after = [g.Layer("egress", True, "up")]
     assert g.dropped(before, after) == []
+
+
+# --------------------------------------------------------------------------
+# Environment scrubbing & VFS Cloaking configuration
+# --------------------------------------------------------------------------
+
+def test_child_env_strips_sensitive_variables(cfg):
+    base = {
+        "AWS_SECRET_ACCESS_KEY": "AKIA...",
+        "AWS_REGION": "us-east-1",
+        "DATABASE_URL": "postgres://user:pass@localhost/db",
+        "DB_PASSWORD": "secretpassword",
+        "DEMO_CLI_APPROVER_KEY": "structural_key_123",
+        "GITHUB_TOKEN": "ghp_xxxx",
+        "MY_SECRET_KEY": "supersecret",
+        "SAFE_VAR": "harmless",
+    }
+    env = g.child_env(base, 8080, egress_up=False, config=cfg)
+    assert env["SAFE_VAR"] == "harmless"
+    assert "AWS_SECRET_ACCESS_KEY" not in env
+    assert "DATABASE_URL" not in env
+    assert "DB_PASSWORD" not in env
+    assert "DEMO_CLI_APPROVER_KEY" not in env
+    assert "GITHUB_TOKEN" not in env
+    assert "MY_SECRET_KEY" not in env
+
+
+def test_child_env_preserves_agent_keys(cfg):
+    base = {
+        "ANTHROPIC_API_KEY": "sk-ant-...",
+        "OPENAI_API_KEY": "sk-proj-...",
+        "GEMINI_API_KEY": "AIza...",
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/home/user",
+    }
+    env = g.child_env(base, 8080, egress_up=False, config=cfg)
+    assert env["ANTHROPIC_API_KEY"] == "sk-ant-..."
+    assert env["OPENAI_API_KEY"] == "sk-proj-..."
+    assert env["GEMINI_API_KEY"] == "AIza..."
+    assert env["PATH"] == "/usr/bin:/bin"
+    assert env["HOME"] == "/home/user"
+
+
+def test_custom_env_policy_strip_and_preserve():
+    from demo_cli.config import Config
+    custom_cfg = Config(
+        env_policy={
+            "strip": ["CUSTOM_SECRET_*"],
+            "preserve": ["CUSTOM_SECRET_ALLOWED"],
+        }
+    )
+    base = {
+        "CUSTOM_SECRET_FOO": "123",
+        "CUSTOM_SECRET_ALLOWED": "456",
+        "OTHER_VAR": "789",
+    }
+    env = custom_cfg.sanitized_env(base)
+    assert "CUSTOM_SECRET_FOO" not in env
+    assert env["CUSTOM_SECRET_ALLOWED"] == "456"
+    assert env["OTHER_VAR"] == "789"
+
+
+def test_config_is_cloaked():
+    from demo_cli.config import Config
+    c = Config()
+    assert c.is_cloaked(".env") is True
+    assert c.is_cloaked(".env.production") is True
+    assert c.is_cloaked("secrets.env") is True
+    assert c.is_cloaked(".demo_cli.toml") is True
+    assert c.is_cloaked("secret.key") is True
+    assert c.is_cloaked(".env.example") is False
+    assert c.is_cloaked(".env.template") is False
+    assert c.is_cloaked("README.md") is False
+    assert c.is_cloaked("main.py") is False
+

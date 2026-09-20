@@ -1276,7 +1276,7 @@ def cmd_guarded(a) -> int:
     extra_np = None
     if getattr(cfg, "egress", None) and isinstance(cfg.egress, dict):
         extra_np = cfg.egress.get("no_proxy")
-    env = g.child_env(dict(os.environ), port, g.port_open(port), extra_no_proxy=extra_np)
+    env = g.child_env(dict(os.environ), port, g.port_open(port), extra_no_proxy=extra_np, config=cfg)
 
     # Resolve the executable OURSELVES. On Windows subprocess goes through
     # CreateProcess, which does not consult PATHEXT - so `claude`, installed

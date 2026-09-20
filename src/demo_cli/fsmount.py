@@ -619,6 +619,8 @@ def build_passthrough_operations(config: Config, backing_dir: str,
                 raise NTStatusObjectNameNotFound()
             except NotADirectoryError:
                 raise NTStatusNotADirectory()
+            except PermissionError:
+                raise NTStatusAccessDenied()
 
         @guarded
         def open(self, file_name, create_options, granted_access):
@@ -921,8 +923,10 @@ def build_passthrough_operations(config: Config, backing_dir: str,
             except Exception as exc:                      # pragma: no cover
                 sys.stderr.write(f"demo_cli [fs] receipt error: {exc}\n")
 
-    return PassthroughOperations(volume_label, Backing(backing_dir), config,
-                                 mountpoint)
+    cloak_pats = getattr(config, "cloak_patterns", None) if config else None
+    return PassthroughOperations(volume_label,
+                                 Backing(backing_dir, cloak_patterns=cloak_pats),
+                                 config, mountpoint)
 
 
 def mount(mountpoint: str, config: Optional[Config] = None,
