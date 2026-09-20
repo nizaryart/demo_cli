@@ -24,6 +24,7 @@ def test_doctor_reexports_in_cli():
         "_SELFTEST_PAYLOADS",
         "_any_hook_installed",
         "_mount_checks",
+        "_egress_checks",
         "cmd_doctor",
     ]
     for sym in exported_symbols:
@@ -119,6 +120,123 @@ def test_doctor_detects_fsguard_activity(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "ACTIVE (agent receipts)" in out
     assert "fsguard" in out
+
+
+def test_egress_checks_quiet_when_tool_missing_and_closed(monkeypatch, tmp_path):
+    """When mitmdump is absent and port is closed, doctor suppresses egress checks."""
+    import shutil
+    from demo_cli import guarded
+    cfg = Config(project_root=str(tmp_path))
+    monkeypatch.setattr(shutil, "which", lambda cmd: None)
+    monkeypatch.setattr(guarded, "port_open", lambda port: False)
+
+    checks = doctor._egress_checks(cfg)
+    assert checks == []
+
+
+def test_egress_checks_listener_states(monkeypatch, tmp_path):
+    """Doctor correctly reports listening and non-listening states."""
+    import shutil
+    from demo_cli import guarded
+    cfg = Config(project_root=str(tmp_path))
+    monkeypatch.setattr(shutil, "which", lambda cmd: "/usr/bin/mitmdump" if cmd == "mitmdump" else None)
+
+    # 1. Listening
+    monkeypatch.setattr(guarded, "port_open", lambda port: True)
+    checks = doctor._egress_checks(cfg)
+    proxy_check = next(c for c in checks if c[1] == "egress proxy")
+    assert proxy_check[0] == "ok"
+    assert "listening on :8080" in proxy_check[2]
+
+    # 2. Not running
+    monkeypatch.setattr(guarded, "port_open", lambda port: False)
+    checks = doctor._egress_checks(cfg)
+    proxy_check = next(c for c in checks if c[1] == "egress proxy")
+    assert proxy_check[0] == "warn"
+    assert "not running on :8080" in proxy_check[2]
+
+
+def test_egress_checks_ca_bundle_states(monkeypatch, tmp_path):
+    """Doctor reports generated and missing CA certificate bundles."""
+    import shutil
+    from demo_cli import guarded
+    cfg = Config(project_root=str(tmp_path))
+    monkeypatch.setattr(shutil, "which", lambda cmd: "/usr/bin/mitmdump")
+    monkeypatch.setattr(guarded, "port_open", lambda port: True)
+
+    # Missing CA
+    monkeypatch.setattr(guarded, "ca_bundle", lambda: str(tmp_path / "nonexistent.pem"))
+    checks = doctor._egress_checks(cfg)
+    ca_check = next(c for c in checks if c[1] == "egress CA")
+    assert ca_check[0] == "warn"
+    assert "not generated yet" in ca_check[2]
+
+    # Present CA
+    ca_file = tmp_path / "mitmproxy-ca-cert.pem"
+    ca_file.write_text("CERT DATA")
+    monkeypatch.setattr(guarded, "ca_bundle", lambda: str(ca_file))
+    checks = doctor._egress_checks(cfg)
+    ca_check = next(c for c in checks if c[1] == "egress CA")
+    assert ca_check[0] == "ok"
+    assert str(ca_file) in ca_check[2]
+
+
+def test_egress_checks_no_proxy_audit(monkeypatch, tmp_path):
+    """Doctor audits shell NO_PROXY to verify model endpoints are protected."""
+    import shutil
+    from demo_cli import guarded
+    cfg = Config(project_root=str(tmp_path))
+    monkeypatch.setattr(shutil, "which", lambda cmd: "/usr/bin/mitmdump")
+    monkeypatch.setattr(guarded, "port_open", lambda port: True)
+
+    # Case 1: No HTTPS_PROXY set
+    monkeypatch.delenv("HTTPS_PROXY", raising=False)
+    monkeypatch.delenv("https_proxy", raising=False)
+    checks = doctor._egress_checks(cfg)
+    np_check = next(c for c in checks if c[1] == "egress NO_PROXY")
+    assert np_check[0] == "ok"
+    assert "defaults protect" in np_check[2]
+
+    # Case 2: HTTPS_PROXY set, NO_PROXY missing endpoints
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:8080")
+    monkeypatch.setenv("NO_PROXY", "")
+    checks = doctor._egress_checks(cfg)
+    np_check = next(c for c in checks if c[1] == "egress NO_PROXY")
+    assert np_check[0] == "warn"
+    assert "api.anthropic.com" in np_check[2]
+
+    # Case 3: HTTPS_PROXY set, NO_PROXY correctly bypassing
+    monkeypatch.setenv("NO_PROXY", "localhost,127.0.0.1,api.anthropic.com,api.openai.com")
+    checks = doctor._egress_checks(cfg)
+    np_check = next(c for c in checks if c[1] == "egress NO_PROXY")
+    assert np_check[0] == "ok"
+    assert "configured in shell" in np_check[2]
+
+
+def test_egress_checks_policy_reflection(monkeypatch, tmp_path):
+    """Doctor reflects configured [egress] policy details."""
+    import shutil
+    from demo_cli import guarded
+    cfg = Config(project_root=str(tmp_path))
+    cfg.egress = {
+        "port": 8888,
+        "mode": "audit",
+        "strict_unknown_hosts": True,
+        "saas_hosts": ["github.com", "slack.com"],
+    }
+    monkeypatch.setattr(shutil, "which", lambda cmd: "/usr/bin/mitmdump")
+    monkeypatch.setattr(guarded, "port_open", lambda port: True)
+
+    checks = doctor._egress_checks(cfg)
+    proxy_check = next(c for c in checks if c[1] == "egress proxy")
+    assert "listening on :8888" in proxy_check[2]
+
+    policy_check = next(c for c in checks if c[1] == "egress policy")
+    assert policy_check[0] == "ok"
+    assert "mode=audit" in policy_check[2]
+    assert "strict_unknown=true" in policy_check[2]
+    assert "2 SaaS host(s)" in policy_check[2]
+
 
 
 

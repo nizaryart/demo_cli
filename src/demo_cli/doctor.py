@@ -348,6 +348,101 @@ def _mount_checks(cfg) -> List[tuple]:
     return out
 
 
+def _egress_checks(cfg) -> List[tuple]:
+    """Is the egress proxy running, is the CA bundle available, and is NO_PROXY sane?
+
+    Provides visibility into the wire-level network guard:
+      - Is mitmproxy listening on the egress port?
+      - Is the root CA cert generated (and on Windows, trusted in the user store)?
+      - If HTTPS_PROXY is active in the environment, does NO_PROXY correctly
+        bypass localhost and model provider endpoints?
+    """
+    from . import guarded
+
+    port = 8080
+    if getattr(cfg, "egress", None) and isinstance(cfg.egress, dict):
+        try:
+            port = int(cfg.egress.get("port", 8080))
+        except (ValueError, TypeError):
+            port = 8080
+
+    mitm_installed = bool(shutil.which("mitmdump"))
+    up = guarded.port_open(port)
+
+    # If mitmdump is missing and no proxy is listening, keep doctor focused
+    # (deps.py already emits the single mitmdump install line).
+    if not mitm_installed and not up:
+        return []
+
+    rows: List[tuple] = []
+
+    # 1. Proxy listener
+    if up:
+        rows.append(("ok", "egress proxy", f"listening on :{port}"))
+    else:
+        rows.append(("warn", "egress proxy",
+                     f"not running on :{port} (start: demo_cli egress --port {port}, "
+                     f"or demo_cli guarded <agent>)"))
+
+    # 2. CA Certificate & Trust Store
+    ca = guarded.ca_bundle()
+    if ca and os.path.isfile(ca):
+        if os.name == "nt":
+            cer = os.path.normpath(
+                os.path.join(os.path.expanduser("~/.mitmproxy"), "mitmproxy-ca-cert.cer"))
+            trusted = False
+            if os.path.isfile(cer):
+                try:
+                    import subprocess
+                    r = subprocess.run(["certutil", "-user", "-viewstore", "Root", "mitmproxy"],
+                                       capture_output=True, text=True, timeout=2)
+                    trusted = (r.returncode == 0 and "mitmproxy" in (r.stdout or "").lower())
+                except Exception:
+                    pass
+            if trusted:
+                rows.append(("ok", "egress CA", f"trusted in Windows user store ({cer})"))
+            else:
+                rows.append(("warn", "egress CA",
+                             f"present ({ca}) but not trusted in Windows store (demo_cli egress --trust-ca)"))
+        else:
+            rows.append(("ok", "egress CA", f"generated ({ca})"))
+    else:
+        rows.append(("warn", "egress CA",
+                     "not generated yet (run demo_cli egress once to generate)"))
+
+    # 3. Shell NO_PROXY environment
+    hp = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+    np = os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
+    if hp:
+        missing = [h for h in ("api.anthropic.com", "api.openai.com") if h not in np]
+        missing_lh = [h for h in ("localhost", "127.0.0.1") if h not in np]
+        all_missing = missing + missing_lh
+        if all_missing:
+            rows.append(("warn", "egress NO_PROXY",
+                         f"HTTPS_PROXY active but NO_PROXY missing {', '.join(all_missing)} "
+                         "(model streams may be intercepted)"))
+        else:
+            rows.append(("ok", "egress NO_PROXY",
+                         "configured in shell, localhost and model endpoints bypassed"))
+    else:
+        rows.append(("ok", "egress NO_PROXY",
+                     "defaults protect localhost and model endpoints (anthropic, openai, gemini)"))
+
+    # 4. Configured Policy Reflection (if [egress] is defined in .demo_cli.toml)
+    if getattr(cfg, "egress", None) and isinstance(cfg.egress, dict) and cfg.egress:
+        emode = cfg.egress.get("mode", cfg.mode)
+        strict = cfg.egress.get("strict_unknown_hosts", False)
+        saas = cfg.egress.get("saas_hosts") or []
+        detail = f"mode={emode}"
+        if strict:
+            detail += ", strict_unknown=true"
+        if saas:
+            detail += f", {len(saas)} SaaS host(s)"
+        rows.append(("ok", "egress policy", detail))
+
+    return rows
+
+
 def cmd_doctor(a) -> int:
     cfg = load_config(getattr(a, "root", None))
     checks = []
@@ -396,6 +491,7 @@ def cmd_doctor(a) -> int:
     hook = _any_hook_installed(cfg)   # Claude Code specifically - gates the self-test below
 
     checks.extend(_mount_checks(cfg))
+    checks.extend(_egress_checks(cfg))
 
     # THE check that actually predicts protection: is `demo_cli` resolvable on
     # PATH? Claude Code launches the hook as a bare `demo_cli hook` command in a
@@ -472,6 +568,7 @@ __all__ = [
     "_SELFTEST_PAYLOADS",
     "_any_hook_installed",
     "_mount_checks",
+    "_egress_checks",
     "cmd_doctor",
 ]
 

@@ -424,6 +424,7 @@ from .doctor import (
     _SELFTEST_PAYLOADS,
     _any_hook_installed,
     _mount_checks,
+    _egress_checks,
     cmd_doctor,
 )
 
