@@ -87,6 +87,22 @@ VALID_MODES = ("shadow", "enforce")
 VALID_RECOVERY = ("snapshot", "attest", "none")
 
 
+VALID_TARGET_ENVS = ("production", "staging", "development", "test", "sandbox", "unknown")
+TARGET_ENV_ALIASES = {
+    "prod": "production", "prd": "production", "production": "production",
+    "stage": "staging", "stg": "staging", "staging": "staging",
+    "dev": "development", "development": "development", "local": "development",
+    "test": "test", "sandbox": "sandbox",
+}
+
+
+def normalize_target_env(value: Optional[str]) -> str:
+    if not value:
+        return "unknown"
+    v = str(value).strip().lower()
+    return TARGET_ENV_ALIASES.get(v, v)
+
+
 @dataclass
 class TargetRule:
     match: str
@@ -94,7 +110,22 @@ class TargetRule:
     recovery: str = "snapshot"
 
     def matches(self, ref: Optional[str]) -> bool:
-        return bool(ref) and self.match.lower() in str(ref).lower()
+        if not ref or not self.match:
+            return False
+        pat = self.match.replace("\\", "/").strip().lower()
+        target_ref = str(ref).replace("\\", "/").strip().lower()
+
+        # Wildcard glob match if pattern contains * or ?
+        if "*" in pat or "?" in pat:
+            if fnmatch.fnmatch(target_ref, pat) or fnmatch.fnmatch(target_ref, f"*/{pat}"):
+                return True
+            base = os.path.basename(target_ref)
+            if fnmatch.fnmatch(base, pat):
+                return True
+            return False
+
+        # Direct substring match
+        return pat in target_ref
 
 
 DEFAULT_CLOAK_PATTERNS = [
@@ -139,6 +170,7 @@ class Config:
     workspace_dir: str = ".demo_cli"
     approval_key_env: Optional[str] = None
     targets: List[TargetRule] = field(default_factory=list)
+    target_errors: List[str] = field(default_factory=list)
     egress: dict = field(default_factory=dict)  # [egress] table for the egress guard
     cloak: dict = field(default_factory=dict)   # [cloak] table for VFS file cloaking
     env_policy: dict = field(default_factory=dict)  # [env] table for environment scrubbing
@@ -244,6 +276,38 @@ class Config:
 
     def resolve_egress_port(self, cli_port: Optional[int] = None) -> Tuple[Optional[int], Optional[str]]:
         return resolve_egress_port(self, cli_port)
+
+    def resolve_egress_mode(self, cli_enforce: bool = False, cli_mode: Optional[str] = None) -> str:
+        return resolve_egress_mode(self, cli_enforce=cli_enforce, cli_mode=cli_mode)
+
+
+def resolve_egress_mode(cfg: Optional[Config],
+                        cli_enforce: bool = False,
+                        cli_mode: Optional[str] = None) -> str:
+    """Resolve the egress proxy mode with precedence:
+      1. Explicit CLI --enforce flag (forces 'enforce')
+      2. Explicit CLI --mode <mode>
+      3. Config file [egress] mode = <mode>
+      4. Root config mode = <mode>
+      5. Default 'shadow'
+    """
+    if cli_enforce:
+        return "enforce"
+    if cli_mode and str(cli_mode).strip():
+        m = str(cli_mode).strip().lower()
+        if m in VALID_MODES:
+            return m
+    if cfg and getattr(cfg, "egress", None) and isinstance(cfg.egress, dict):
+        raw_emode = cfg.egress.get("mode")
+        if raw_emode is not None and str(raw_emode).strip():
+            m = str(raw_emode).strip().lower()
+            if m in VALID_MODES:
+                return m
+    if cfg and getattr(cfg, "mode", None) and str(cfg.mode).strip():
+        m = str(cfg.mode).strip().lower()
+        if m in VALID_MODES:
+            return m
+    return "shadow"
 
 
 def resolve_egress_port(cfg: Optional[Config],
@@ -429,15 +493,72 @@ def load_config(start: Optional[str] = None) -> Config:
     if isinstance(ck, dict):
         cfg.checkpoint = ck
 
-    for raw in data.get("target", []) or []:
-        if not isinstance(raw, dict) or "match" not in raw:
+    raw_list = []
+    for key in ("target", "targets"):
+        val = data.get(key)
+        if val is None:
             continue
-        recovery = str(raw.get("recovery", "snapshot")).strip().lower()
-        if recovery not in VALID_RECOVERY:
+        if isinstance(val, dict):
+            raw_list.append(val)
+        elif isinstance(val, list):
+            raw_list.extend(val)
+
+    for raw in raw_list:
+        if not isinstance(raw, dict):
+            cfg.target_errors.append(f"target entry must be a table, got {type(raw).__name__}")
+            continue
+        match_val = raw.get("match")
+        if not match_val or not str(match_val).strip():
+            cfg.target_errors.append("target rule missing required 'match' field")
+            continue
+        recovery_raw = str(raw.get("recovery", "snapshot")).strip().lower()
+        if recovery_raw not in VALID_RECOVERY:
+            cfg.target_errors.append(
+                f"invalid recovery '{recovery_raw}' for target '{match_val}' (must be one of {', '.join(VALID_RECOVERY)})"
+            )
             recovery = "snapshot"
+        else:
+            recovery = recovery_raw
+
+        env = normalize_target_env(raw.get("env", "unknown"))
+
         cfg.targets.append(TargetRule(
-            match=str(raw["match"]),
-            env=str(raw.get("env", "unknown")).strip().lower(),
+            match=str(match_val).strip(),
+            env=env,
             recovery=recovery,
         ))
     return cfg
+
+
+def append_target_rule(
+    root: Optional[str],
+    match: str,
+    env: str = "production",
+    recovery: str = "snapshot",
+) -> Tuple[str, str]:
+    """Append a target rule to the nearest .demo_cli.toml file."""
+    if not match or not str(match).strip():
+        raise ValueError("target match pattern cannot be empty")
+
+    match_str = str(match).strip()
+    norm_env = normalize_target_env(env)
+    rec = str(recovery).strip().lower()
+    if rec not in VALID_RECOVERY:
+        raise ValueError(f"invalid recovery '{recovery}': must be one of {', '.join(VALID_RECOVERY)}")
+
+    proj_root = redirect_to_mount(find_project_root(root))
+    cfg_path = os.path.join(proj_root, CONFIG_NAME)
+
+    entry = f"\n[[target]]\nmatch = \"{match_str}\"\nenv = \"{norm_env}\"\nrecovery = \"{rec}\"\n"
+
+    mode = "a" if os.path.exists(cfg_path) else "w"
+    header = ""
+    if mode == "w":
+        header = '# demo_cli configuration\nmode = "enforce"\n\n[workspace]\ndir = ".demo_cli"\n'
+
+    with open(cfg_path, mode, encoding="utf-8") as f:
+        if header:
+            f.write(header)
+        f.write(entry)
+
+    return cfg_path, f"target '{match_str}' (env: {norm_env}, recovery: {rec})"

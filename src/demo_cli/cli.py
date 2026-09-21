@@ -1219,7 +1219,8 @@ def cmd_guarded(a) -> int:
             log = os.path.join(cfg.workspace, "egress.log")
             config_mod.ensure_workspace(cfg)
             here = os.path.dirname(os.path.abspath(__file__))
-            env = dict(os.environ, DEMO_CLI_EGRESS_MODE=cfg.mode,
+            egress_mode = cfg.resolve_egress_mode()
+            env = dict(os.environ, DEMO_CLI_EGRESS_MODE=egress_mode,
                        PYTHONPATH=os.path.dirname(here) + os.pathsep
                        + os.environ.get("PYTHONPATH", ""))
             # SAME FLAGS AS _mount_detached, and for the same reason. This
@@ -1321,6 +1322,50 @@ def cmd_run(a) -> int:
     except RuntimeError as exc:  # e.g. non-Linux
         print(f"demo_cli run: {exc}")
         return 1
+
+
+def cmd_target(a) -> int:
+    target_action = getattr(a, "target_action", None)
+    if target_action == "add":
+        pattern = getattr(a, "pattern", None)
+        env = getattr(a, "env", "production")
+        recovery = getattr(a, "recovery", "snapshot")
+        root = getattr(a, "root", None)
+        try:
+            cfg_path, summary = config_mod.append_target_rule(
+                root=root,
+                match=pattern,
+                env=env,
+                recovery=recovery,
+            )
+            print(f"demo_cli: added {summary} to {cfg_path}")
+            return 0
+        except ValueError as exc:
+            sys.stderr.write(f"demo_cli: error: {exc}\n")
+            return 1
+        except Exception as exc:
+            sys.stderr.write(f"demo_cli: error: could not add target rule: {exc}\n")
+            return 1
+
+    # Default or "list"
+    cfg = load_config(getattr(a, "root", None))
+    if cfg.target_errors:
+        print("Warning: errors in configured target rules:")
+        for err in cfg.target_errors:
+            print(f"  - {err}")
+        print()
+
+    if not cfg.targets:
+        print("No target rules declared in .demo_cli.toml.")
+        print("To declare a target, run:")
+        print('  demo_cli target add "<pattern>" --env production')
+        return 0
+
+    cfg_name = cfg.source_path or CONFIG_NAME
+    print(f"Declared target rules ({cfg_name}):")
+    for t in cfg.targets:
+        print(f"  - match: {t.match!r:<25} env: {t.env:<12} recovery: {t.recovery}")
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1564,6 +1609,25 @@ def build_parser() -> argparse.ArgumentParser:
     eg.add_argument("--untrust-ca", action="store_true",
                     help="[Windows] remove it again. Do this when you are done")
     eg.set_defaults(func=cmd_egress)
+
+    tg = sub.add_parser("target", parents=[common], aliases=["targets"],
+                        help="manage declared environment & recovery targets")
+    tg_sub = tg.add_subparsers(dest="target_action")
+
+    tg_add = tg_sub.add_parser("add", parents=[common], help="add a target rule to .demo_cli.toml")
+    tg_add.add_argument("pattern", help="path substring, glob (*.db), or connection URL pattern")
+    tg_add.add_argument("--env", default="production",
+                        choices=["production", "staging", "development", "test", "sandbox"],
+                        help="environment this target belongs to (default: production)")
+    tg_add.add_argument("--recovery", default="snapshot",
+                        choices=["snapshot", "none", "attest"],
+                        help="recovery strategy for this target (default: snapshot)")
+    tg_add.set_defaults(func=cmd_target)
+
+    tg_list = tg_sub.add_parser("list", parents=[common], help="list declared target rules")
+    tg_list.set_defaults(func=cmd_target)
+
+    tg.set_defaults(func=cmd_target)
 
     return p
 

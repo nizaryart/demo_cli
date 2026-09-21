@@ -312,3 +312,56 @@ def test_doctor_reports_fail_on_invalid_egress_port():
     assert label == "egress port"
     assert "between 1 and 65535" in detail
 
+
+def test_resolve_egress_mode_precedence():
+    from demo_cli.config import Config, resolve_egress_mode
+
+    # 1. Default when unconfigured
+    assert resolve_egress_mode(Config()) == "shadow"
+
+    # 2. Root config mode takes effect if no [egress] mode
+    cfg_enforce = Config(mode="enforce")
+    assert resolve_egress_mode(cfg_enforce) == "enforce"
+
+    # 3. [egress] mode overrides root mode
+    cfg_egress_override = Config(mode="enforce", egress={"mode": "shadow"})
+    assert resolve_egress_mode(cfg_egress_override) == "shadow"
+
+    cfg_egress_enforce = Config(mode="shadow", egress={"mode": "enforce"})
+    assert resolve_egress_mode(cfg_egress_enforce) == "enforce"
+
+    # 4. CLI --enforce flag overrides both [egress] mode and root mode
+    assert resolve_egress_mode(cfg_egress_override, cli_enforce=True) == "enforce"
+
+    # 5. CLI --mode overrides both
+    assert resolve_egress_mode(cfg_egress_override, cli_mode="enforce") == "enforce"
+    assert resolve_egress_mode(cfg_egress_enforce, cli_mode="shadow") == "shadow"
+
+    # 6. Invalid mode falls back safely
+    cfg_bad_mode = Config(mode="enforce", egress={"mode": "bogus"})
+    assert resolve_egress_mode(cfg_bad_mode) == "enforce"
+
+    cfg_all_bad = Config(mode="bogus", egress={"mode": "bogus"})
+    assert resolve_egress_mode(cfg_all_bad) == "shadow"
+
+    assert resolve_egress_mode(cfg_egress_enforce, cli_mode="bogus") == "enforce"
+    assert resolve_egress_mode(None) == "shadow"
+
+    # 7. Case-insensitivity and whitespace trimming
+    cfg_case = Config(mode="ENFORCE", egress={"mode": "  SHADOW  "})
+    assert resolve_egress_mode(cfg_case) == "shadow"
+
+
+def test_cmd_egress_respects_config_egress_mode(monkeypatch):
+    import types
+    from demo_cli.cli import cmd_egress
+    from demo_cli.config import Config
+
+    monkeypatch.setattr("shutil.which", lambda cmd: "/usr/bin/mitmdump" if cmd == "mitmdump" else None)
+    monkeypatch.setattr("demo_cli.guarded.port_open", lambda port: True)
+    monkeypatch.setattr("demo_cli.egress.load_config", lambda: Config(mode="enforce", egress={"mode": "shadow"}))
+
+    cfg = Config(mode="enforce", egress={"mode": "shadow"})
+    assert cfg.resolve_egress_mode() == "shadow"
+    assert cfg.resolve_egress_mode(cli_enforce=True) == "enforce"
+

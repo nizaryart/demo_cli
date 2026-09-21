@@ -427,7 +427,7 @@ def _egress_checks(cfg) -> List[tuple]:
 
     # 4. Configured Policy Reflection (if [egress] is defined in .demo_cli.toml)
     if getattr(cfg, "egress", None) and isinstance(cfg.egress, dict) and cfg.egress:
-        emode = cfg.egress.get("mode", cfg.mode)
+        emode = cfg.egress.get("mode") or cfg.resolve_egress_mode()
         strict = cfg.egress.get("strict_unknown_hosts", False)
         saas = cfg.egress.get("saas_hosts") or []
         detail = f"mode={emode}"
@@ -457,6 +457,16 @@ def cmd_doctor(a) -> int:
         checks.append(("ok", "config parses", cfg.source_path))
     else:
         checks.append(("warn", "config", "using defaults (run: demo_cli init)"))
+
+    if getattr(cfg, "target_errors", None):
+        checks.append(("fail", "target rules", f"INVALID: {'; '.join(cfg.target_errors)}"))
+    elif cfg.targets:
+        rules_summary = ", ".join(f"{t.match} -> {t.env} [{t.recovery}]" for t in cfg.targets[:3])
+        if len(cfg.targets) > 3:
+            rules_summary += f", ... (+{len(cfg.targets) - 3} more)"
+        checks.append(("ok", "target rules", f"{len(cfg.targets)} declared ({rules_summary})"))
+    else:
+        checks.append(("ok", "target rules", "none declared (heuristic detection)"))
 
     ws = cfg.workspace
     # This check used to CREATE the workspace, parents and all. On a protected

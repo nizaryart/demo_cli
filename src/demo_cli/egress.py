@@ -352,7 +352,7 @@ def _build_addon():
     class DemoCliEgress:
         def __init__(self):
             self.cfg = load_config()
-            self.mode = os.environ.get("DEMO_CLI_EGRESS_MODE") or self.cfg.mode
+            self.mode = os.environ.get("DEMO_CLI_EGRESS_MODE") or self.cfg.resolve_egress_mode()
             eg = getattr(self.cfg, "egress", {}) or {}
             self.strict = bool(eg.get("strict_unknown_hosts", False))
             self.timeout = int(eg.get("review_timeout_seconds", 30))
@@ -590,7 +590,10 @@ def cmd_egress(a) -> int:
         print(f"Stop that process, or run egress on a different port: demo_cli egress --port <port>")
         return 1
 
-    mode = "enforce" if getattr(a, "enforce", False) else cfg.mode
+    mode = cfg.resolve_egress_mode(
+        cli_enforce=getattr(a, "enforce", False),
+        cli_mode=getattr(a, "mode", None),
+    )
 
     print(render.c(f"\ndemo_cli egress guard  (mode={mode}, port={port})\n", "dim"))
     for line in egress_setup_lines(port, windows=os.name == "nt"):

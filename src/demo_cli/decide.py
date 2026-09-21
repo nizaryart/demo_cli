@@ -153,6 +153,10 @@ def decide(
                 "Mutating action did not match the declared context; a recovery point "
                 "was captured first and the mismatch is surfaced for review.",
                 recoverable=True,
+                next_steps=[
+                    "Verify the target environment / branch / account is the intended one.",
+                    "To declare this target's environment: demo_cli target add <pattern> --env <env>",
+                ],
             )
         return Decision(
             ESCALATE,
@@ -162,6 +166,7 @@ def decide(
             next_steps=[
                 "Verify the target environment / branch / account is the intended one.",
                 "Provide a snapshot target (--target / --db / --db-url) or back up first.",
+                "To declare this target's environment: demo_cli target add <pattern> --env <env>",
             ],
         )
 
@@ -193,5 +198,6 @@ def decide(
         next_steps=[
             "Add --db / --db-url / --target so a recovery point can be captured.",
             "Or create an independent backup before proceeding.",
+            "To declare target recovery policy: demo_cli target add <pattern> --recovery none|snapshot",
         ],
     )
