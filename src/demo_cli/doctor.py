@@ -359,12 +359,9 @@ def _egress_checks(cfg) -> List[tuple]:
     """
     from . import guarded
 
-    port = 8080
-    if getattr(cfg, "egress", None) and isinstance(cfg.egress, dict):
-        try:
-            port = int(cfg.egress.get("port", 8080))
-        except (ValueError, TypeError):
-            port = 8080
+    port, err = cfg.resolve_egress_port()
+    if err:
+        return [("fail", "egress port", err)]
 
     mitm_installed = bool(shutil.which("mitmdump"))
     up = guarded.port_open(port)

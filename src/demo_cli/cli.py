@@ -1204,7 +1204,10 @@ def cmd_guarded(a) -> int:
         return 1
 
     cfg = load_config(getattr(a, "root", None))
-    port = getattr(a, "port", 8080)
+    port, err = cfg.resolve_egress_port(getattr(a, "port", None))
+    if err:
+        print(render.c(f"demo_cli guarded: {err}", "red"))
+        return 1
     started_egress = None
 
     # Start the proxy if it is not already up. Nothing else is auto-started:
@@ -1492,7 +1495,8 @@ def build_parser() -> argparse.ArgumentParser:
     st.add_argument("--mode", choices=["shadow", "enforce"], default="enforce")
     st.add_argument("--no-protect", action="store_true",
                     help="skip relocating the project (no filesystem guard)")
-    st.add_argument("--port", type=int, default=8080)
+    st.add_argument("--port", type=int, default=None,
+                    help="egress proxy port (default: 8080 or [egress] in config)")
     st.add_argument("--yes", action="store_true", help="skip confirmations")
     st.set_defaults(func=cmd_setup)
 
@@ -1536,7 +1540,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     gd = sub.add_parser("guarded", parents=[common],
                         help="launch an agent with every layer that can be started, started")
-    gd.add_argument("--port", type=int, default=8080, help="egress proxy port (default 8080)")
+    gd.add_argument("--port", type=int, default=None,
+                    help="egress proxy port (default: 8080 or [egress] in config)")
     gd.add_argument("--no-egress", action="store_true",
                     help="do not start or use the egress proxy")
     gd.add_argument("--heartbeat", type=int, default=60, metavar="SECONDS",
@@ -1548,8 +1553,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     eg = sub.add_parser("egress", parents=[common],
                         help="gate destructive external/SaaS API calls via an HTTP proxy (needs mitmdump)")
-    eg.add_argument("--port", type=int, default=8080, help="proxy listen port (default 8080)")
+    eg.add_argument("--port", type=int, default=None,
+                    help="proxy listen port (default: 8080 or [egress] in config)")
     eg.add_argument("--enforce", action="store_true", help="block/review destructive calls (else shadow)")
+
     eg.add_argument("--trust-ca", action="store_true",
                     help="[Windows] add mitmproxy's CA to your USER certificate "
                          "store, so Invoke-WebRequest/.NET/curl.exe can be "

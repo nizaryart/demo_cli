@@ -578,7 +578,11 @@ def cmd_egress(a) -> int:
     here = os.path.dirname(os.path.abspath(__file__))       # .../<pkgparent>/demo_cli
     loader = os.path.join(here, "egress_addon.py")          # thin package-aware entry
     pkg_parent = os.path.dirname(here)                       # so `import demo_cli` works
-    port = getattr(a, "port", 8080)
+    cfg = load_config()
+    port, err = cfg.resolve_egress_port(getattr(a, "port", None))
+    if err:
+        print(render.c(f"demo_cli egress: {err}", "red"))
+        return 1
     from .guarded import port_open
     if port_open(port):
         print(render.c(f"Error: port {port} is already in use.", "red"))
@@ -586,7 +590,7 @@ def cmd_egress(a) -> int:
         print(f"Stop that process, or run egress on a different port: demo_cli egress --port <port>")
         return 1
 
-    mode = "enforce" if getattr(a, "enforce", False) else load_config().mode
+    mode = "enforce" if getattr(a, "enforce", False) else cfg.mode
 
     print(render.c(f"\ndemo_cli egress guard  (mode={mode}, port={port})\n", "dim"))
     for line in egress_setup_lines(port, windows=os.name == "nt"):

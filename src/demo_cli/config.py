@@ -25,7 +25,7 @@ from __future__ import annotations
 import fnmatch
 import os
 from dataclasses import dataclass, field
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 
 def _read_toml_bytes(path):
     """Config file contents with any UTF-8 byte-order mark removed.
@@ -241,6 +241,44 @@ class Config:
     def declared_env(self, ref: Optional[str]) -> Optional[str]:
         t = self.match_target(ref)
         return t.env if t else None
+
+    def resolve_egress_port(self, cli_port: Optional[int] = None) -> Tuple[Optional[int], Optional[str]]:
+        return resolve_egress_port(self, cli_port)
+
+
+def resolve_egress_port(cfg: Optional[Config],
+                        cli_port: Optional[int] = None) -> Tuple[Optional[int], Optional[str]]:
+    """Resolve the egress proxy port from CLI args or .demo_cli.toml [egress] table.
+
+    Precedence:
+      1. Explicit CLI argument (--port <port>)
+      2. Config file [egress] port = <port>
+      3. Default 8080
+
+    Returns:
+      (port, None) if valid (1..65535)
+      (None, error_message) if invalid
+    """
+    if cli_port is not None:
+        try:
+            p = int(cli_port)
+            if not (1 <= p <= 65535):
+                return None, f"invalid port {cli_port}: port must be between 1 and 65535."
+            return p, None
+        except (ValueError, TypeError):
+            return None, f"invalid port {cli_port!r}: port must be an integer between 1 and 65535."
+
+    if cfg and getattr(cfg, "egress", None) and isinstance(cfg.egress, dict) and "port" in cfg.egress:
+        raw = cfg.egress["port"]
+        try:
+            p = int(raw)
+            if not (1 <= p <= 65535):
+                return None, f"invalid port {raw!r} in {CONFIG_NAME}: port must be between 1 and 65535."
+            return p, None
+        except (ValueError, TypeError):
+            return None, f"invalid port {raw!r} in {CONFIG_NAME}: port must be an integer between 1 and 65535."
+
+    return 8080, None
 
 
 def ensure_workspace(cfg) -> Optional[str]:

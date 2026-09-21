@@ -668,7 +668,10 @@ def cmd_setup(a) -> int:
 
     # 7. What is actually on right now ------------------------------------
     cfg = load_config(project)
-    port = getattr(a, "port", 8080)
+    port, err = cfg.resolve_egress_port(getattr(a, "port", None))
+    if err:
+        print(render.c(f"  demo_cli setup: {err}", "red"))
+        return 1
     print(render.c("\n  coverage\n", "dim"))
     for layer in g.assess(cfg, port, _host_hook_status(cfg)):
         mark = render.c("[+]", "green") if layer.ok else render.c("[!]", "yellow")

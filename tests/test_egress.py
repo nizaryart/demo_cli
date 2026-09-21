@@ -232,3 +232,83 @@ def test_egress_non_interactive_stdin_falls_back_to_timeout_action(monkeypatch):
     addon.timeout_action = "allow"
     res2 = asyncio.run(addon._ask(req, v))
     assert res2 is True
+
+
+# --------------------------------------------------------------------------
+# Egress port precedence and validation
+# --------------------------------------------------------------------------
+
+def test_resolve_egress_port_precedence():
+    from demo_cli.config import Config, resolve_egress_port
+
+    # 1. Default when neither CLI nor config provides a port
+    cfg = Config()
+    port, err = resolve_egress_port(cfg, None)
+    assert port == 8080 and err is None
+
+    # 2. Config overrides default when CLI is None
+    cfg_custom = Config(egress={"port": 8888})
+    port, err = resolve_egress_port(cfg_custom, None)
+    assert port == 8888 and err is None
+
+    # 3. CLI flag overrides config
+    port, err = resolve_egress_port(cfg_custom, 9090)
+    assert port == 9090 and err is None
+
+
+def test_resolve_egress_port_validation():
+    from demo_cli.config import Config, resolve_egress_port
+
+    # Invalid CLI ports
+    for invalid in (0, -1, 65536, 100000):
+        port, err = resolve_egress_port(Config(), invalid)
+        assert port is None
+        assert "between 1 and 65535" in err
+
+    # Invalid config ports (out of range or non-integer)
+    cfg_bad_range = Config(egress={"port": 70000})
+    port, err = resolve_egress_port(cfg_bad_range, None)
+    assert port is None
+    assert "between 1 and 65535" in err
+
+    cfg_bad_type = Config(egress={"port": "invalid_port"})
+    port, err = resolve_egress_port(cfg_bad_type, None)
+    assert port is None
+    assert "integer" in err
+
+
+def test_cmd_egress_fails_cleanly_on_invalid_port(capsys):
+    from demo_cli.cli import cmd_egress
+    import types
+
+    args = types.SimpleNamespace(port=99999, enforce=False, trust_ca=False, untrust_ca=False)
+    rc = cmd_egress(args)
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "invalid port" in out.lower()
+    assert "between 1 and 65535" in out
+
+
+def test_cmd_guarded_fails_cleanly_on_invalid_port(capsys):
+    from demo_cli.cli import cmd_guarded
+    import types
+
+    args = types.SimpleNamespace(argv=["claude"], root=None, port=0, no_egress=False, heartbeat=0)
+    rc = cmd_guarded(args)
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "invalid port" in out.lower()
+
+
+def test_doctor_reports_fail_on_invalid_egress_port():
+    from demo_cli.config import Config
+    from demo_cli.doctor import _egress_checks
+
+    cfg = Config(egress={"port": -10})
+    rows = _egress_checks(cfg)
+    assert len(rows) == 1
+    status, label, detail = rows[0]
+    assert status == "fail"
+    assert label == "egress port"
+    assert "between 1 and 65535" in detail
+
