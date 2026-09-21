@@ -31,21 +31,32 @@ mode = "shadow"            # "shadow" observes only; "enforce" gates actions
 [workspace]
 dir = ".demo_cli"          # receipts + recovery points live here (per project)
 
+# [egress]
+# port = 8080              # network proxy listen port (default: 8080 or [egress] in config)
+# mode = "shadow"          # "shadow" logs SaaS calls; "enforce" blocks destructive calls
+# strict_unknown_hosts = false  # block writes to unlisted external SaaS hosts
+# saas_hosts = ["api.stripe.com", "api.github.com"]  # hosts treated as SaaS APIs
+# no_proxy = ["localhost", "127.0.0.1"]               # hosts bypassing the egress proxy
+
 # [cloak]
 # enabled = true           # hides sensitive credential files from the virtual mount
 # patterns = ["*.env", ".env*", ".demo_cli.toml", "*.key"]
 
 # [env]
 # strip = ["AWS_*", "*_SECRET*", "*_TOKEN", "DATABASE_URL"]
-# preserve = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]
+# preserve = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY"]
+
+# [checkpoint]
+# enabled = false          # take whole-workspace checkpoints when targets cannot be resolved
 
 # [approval]
 # key_env = "DEMO_CLI_APPROVER_KEY"   # env var holding the structural-approval key
 
 # Declare your real targets so environment is known, not guessed.
+# Tip: You can also manage targets with `demo_cli target add <pattern> --env production`
 # [[target]]
-# match = "production"     # substring matched against the resolved target ref
-# env = "production"
+# match = "production"     # substring or glob (*.db) matched against the resolved target ref
+# env = "production"       # production | staging | development
 # recovery = "snapshot"    # snapshot | none   (attest is reserved)
 """
 _CONFIG_TEMPLATE = CONFIG_TEMPLATE

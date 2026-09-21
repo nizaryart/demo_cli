@@ -482,17 +482,40 @@ Start in shadow. Move to enforce on a project once you trust what it's doing.
 Run `demo_cli init` to scaffold `.demo_cli.toml` at the project root.
 
 ```toml
-mode = "shadow"
+mode = "shadow"            # "shadow" observes only; "enforce" gates actions
 
 [workspace]
 dir = ".demo_cli"          # receipts + recovery points (gitignored)
 
+# Optional: gate SaaS / external API calls on the wire
+# [egress]
+# port = 8080              # proxy listen port (default: 8080)
+# mode = "shadow"          # "shadow" logs SaaS calls; "enforce" blocks destructive calls
+# strict_unknown_hosts = false
+# saas_hosts = ["api.stripe.com", "api.github.com"]
+# no_proxy = ["localhost", "127.0.0.1"]
+
+# Optional: hide sensitive credential files from VFS directory listings and direct reads
+# [cloak]
+# enabled = true
+# patterns = ["*.env", ".env*", ".demo_cli.toml", "*.key"]
+
+# Optional: scrub child environment variables when running guarded subshells
+# [env]
+# strip = ["AWS_*", "*_SECRET*", "*_TOKEN", "DATABASE_URL"]
+# preserve = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY"]
+
+# Optional: whole-workspace checkpoint fallback when targets cannot be resolved
+# [checkpoint]
+# enabled = false
+
 [approval]
 key_env = "DEMO_CLI_APPROVER_KEY"
 
+# Declare targets manually or via: demo_cli target add <pattern> --env production
 [[target]]
-match = "production"       # substring matched against the resolved target ref
-env = "production"
+match = "production"       # substring or glob (*.db) matched against the resolved target ref
+env = "production"         # production | staging | development
 recovery = "snapshot"      # snapshot | none
 ```
 
@@ -508,6 +531,7 @@ A production database is reached via a connection string, not by a file called
 | Command | What it does |
 |---|---|
 | `check "<cmd>"` | evaluate a command; flags: `--db`, `--db-url`, `--target`, `--mode`, `--intent-env`, `--actual-env`, `--reason`, `--approval-token`, `--json`, `--quiet` |
+| `target` (alias `targets`) | manage declared environment targets; subcommands: `add <pattern>`, `list` |
 | `log` (alias `receipts`) | list captured recovery points (id, when, kind, size, action); `--last N` |
 | `undo [id]` | restore a recovery point by id, or the latest |
 | `diff [id]` | show what changed since a recovery point |

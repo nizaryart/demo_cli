@@ -105,3 +105,41 @@ def test_protected_children_detection(tmp_path):
     found = lifecycle._protected_children(str(tmp_path))
     assert found == [str(tmp_path / "my_project")]
 
+
+def test_config_template_is_valid_toml_and_fully_functional(tmp_path):
+    """Verify CONFIG_TEMPLATE parses as valid TOML both as-is and with all commented sections enabled."""
+    from demo_cli.config import load_config
+
+    # 1. As-is template
+    cfg_file = tmp_path / ".demo_cli.toml"
+    cfg_file.write_text(lifecycle.CONFIG_TEMPLATE, encoding="utf-8")
+    cfg = load_config(start=str(tmp_path))
+    assert cfg.config_error is None
+    assert cfg.mode == "shadow"
+    assert cfg.workspace_dir == ".demo_cli"
+
+    # 2. Fully uncommented template
+    uncommented_lines = []
+    for line in lifecycle.CONFIG_TEMPLATE.splitlines():
+        if line.startswith("# Docs:") or line.startswith("# Tip:") or line.startswith("# demo_cli configuration") or line.startswith("# Declare"):
+            continue
+        if line.startswith("# "):
+            uncommented_lines.append(line[2:])
+        else:
+            uncommented_lines.append(line)
+
+    uncommented_toml = "\n".join(uncommented_lines)
+    cfg_file.write_text(uncommented_toml, encoding="utf-8")
+    cfg2 = load_config(start=str(tmp_path))
+    assert cfg2.config_error is None
+    assert cfg2.mode == "shadow"
+    assert cfg2.egress.get("port") == 8080
+    assert cfg2.egress.get("mode") == "shadow"
+    assert cfg2.cloak.get("enabled") is True
+    assert "ANTHROPIC_API_KEY" in cfg2.env_policy.get("preserve", [])
+    assert "GEMINI_API_KEY" in cfg2.env_policy.get("preserve", [])
+    assert cfg2.checkpoint.get("enabled") is False
+    assert len(cfg2.targets) == 1
+    assert cfg2.targets[0].match == "production"
+    assert cfg2.targets[0].env == "production"
+
