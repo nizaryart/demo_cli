@@ -40,3 +40,4 @@ def test_hidden_commands_still_parse_correctly():
     assert args_rt.cmd == "_register-task"
     assert args_rt.project == "my_proj"
     assert callable(args_rt.func)
+
