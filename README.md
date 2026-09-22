@@ -428,6 +428,7 @@ would otherwise skip protection silently.
 # inside your project
 demo_cli init            # write .demo_cli.toml (shadow mode by default)
 demo_cli install-hook    # register the PreToolUse hook in .claude/settings.json
+demo_cli completion --install  # enable Tab auto-completion in your terminal
 demo_cli status          # confirm: hook installed, mode shadow, 0 receipts
 ```
 
@@ -532,15 +533,16 @@ A production database is reached via a connection string, not by a file called
 |---|---|
 | `check "<cmd>"` | evaluate a command; flags: `--db`, `--db-url`, `--target`, `--mode`, `--intent-env`, `--actual-env`, `--reason`, `--approval-token`, `--json`, `--quiet` |
 | `target` (alias `targets`) | manage declared environment targets; subcommands: `add <pattern>`, `list` |
-| `log` (alias `receipts`) | list captured recovery points (id, when, kind, size, action); `--last N` |
+| `log` | list captured recovery points (id, when, kind, size, action); `--last N` |
 | `undo [id]` | restore a recovery point by id, or the latest |
 | `diff [id]` | show what changed since a recovery point |
 | `verify` | walk both receipt chains and their cross-links → VERIFIED, DAMAGED, OUT OF ORDER, TAMPERED, or NO RECEIPTS |
 | `report` | summarise recorded decisions |
-| `receipt [id]` | print a copy-pasteable proof card for a receipt (latest, or by id); `--list` shows recent receipt ids |
+| `receipt [id]` (alias `receipts`) | print a copy-pasteable proof card for a receipt (latest, or by id); `--list` shows recent receipt ids |
 | `status` | mode, hook state, receipts, chain integrity, recovery count |
 | `doctor` | every prerequisite with the command that fixes it (git, pg tools, mitmdump, the WinFsp driver and the winfspy binding *separately*), config, workspace, hook registration per host, PATH, an end-to-end hook self-test, the backing ACL, and whether an agent has ever actually been gated here |
 | `prune` | delete old recovery artefacts (`--keep N`, `--older-than DAYS`); receipts are never pruned |
+| `completion [shell]` | generate tab-completion script for `bash`, `zsh`, `fish`, or `powershell`; `--install` auto-detects shell and installs to user profile |
 | `init` | scaffold `.demo_cli.toml` |
 | `install-hook` | write PreToolUse entries into `.claude/settings.json` (add `--cursor` for `.cursor/hooks.json`) |
 | `hook` | (internal) called by Claude Code; reads tool JSON on stdin, writes permission decision on stdout |
