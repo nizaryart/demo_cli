@@ -645,6 +645,27 @@ def cmd_install_shell_guard(a) -> int:
     return 0
 
 
+def cmd_completion(a) -> int:
+    """Generate or install shell tab-completion scripts (Bash, Zsh, Fish, PowerShell)."""
+    from .completion import generate_completion, install_completion, detect_shell
+    if getattr(a, "install", False):
+        success, message = install_completion(shell=a.shell)
+        if success:
+            print(message)
+            return 0
+        sys.stderr.write(f"demo_cli: {message}\n")
+        return 1
+
+    shell = a.shell or detect_shell() or "bash"
+    try:
+        script = generate_completion(shell)
+        sys.stdout.write(script)
+        return 0
+    except Exception as exc:
+        sys.stderr.write(f"demo_cli: completion error: {exc}\n")
+        return 1
+
+
 def cmd_mount(a) -> int:
     """Mount the Windows filesystem guard - the behavioural layer for Windows,
     where ptrace does not exist. Everything written through the mount is
@@ -1401,6 +1422,14 @@ def build_parser() -> argparse.ArgumentParser:
     tg_list.set_defaults(func=cmd_target)
 
     tg.set_defaults(func=cmd_target)
+
+    cp = sub.add_parser("completion", parents=[common],
+                        help="generate or install shell tab-completion scripts")
+    cp.add_argument("shell", nargs="?", choices=["bash", "zsh", "fish", "powershell"], default=None,
+                    help="target shell (default: auto-detect from $SHELL or OS)")
+    cp.add_argument("--install", action="store_true",
+                    help="install completion script to user's shell configuration directory")
+    cp.set_defaults(func=cmd_completion)
 
     return p
 
