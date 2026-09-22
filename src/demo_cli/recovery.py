@@ -108,25 +108,8 @@ _IGNORE = shutil.ignore_patterns(*sorted(IGNORED_DIRS))
 # Override with DEMO_CLI_MAX_SNAPSHOT_MB.
 _DEFAULT_MAX_SNAPSHOT_MB = 256
 
-# The byte cap bounds DISK SPACE. This one bounds TIME, and they are not the
-# same instrument. Measured 2026-09-16 on Windows NTFS with Defender live:
-#
-#     2,000 files   131.1 MB   copytree 2.041s
-#     2,000 files     1.0 MB   copytree 1.878s     131x the data, 9% the time
-#    20,000 files    10.2 MB   copytree 21.794s
-#
-# 991 us per file, essentially independent of size, so a 256 MB cap of 1 KB
-# files is 262,144 files and about 260 seconds. WSL2 measures 183 us/file -
-# five times faster - which is why this has to be configurable rather than a
-# constant someone guessed on a Linux box.
-#
-# The budget it has to fit inside is the HOOK timeout, and exceeding that is
-# not a slow snapshot. It is a kill: the hook dies with no verdict, the host
-# runs the command unguarded, and - measured on Claude Code the same day - it
-# says NOTHING to the user. A crashed hook is announced; a timed-out one is
-# silent. So this is refused in advance, never discovered afterwards.
-#
-# Override with DEMO_CLI_MAX_SNAPSHOT_FILES.
+# File-count cap bounds traversal time so deep directory snapshots complete within
+# hook execution timeouts. Override with DEMO_CLI_MAX_SNAPSHOT_FILES.
 _DEFAULT_MAX_SNAPSHOT_FILES = 25_000
 
 
@@ -139,59 +122,19 @@ def _index_path(recovery_dir: str) -> str:
 
 
 def _index_fs_path(recovery_dir: str) -> str:
-    """The filesystem guard's own index.
+    """Path to the filesystem guard's private recovery index (index-fs.jsonl).
 
-    Same reason the receipt chain is split: this process writes in the backing
-    directory while the hook writes through the mount, and WinFsp does not
-    carry byte-range locks between them. The receipt file was visibly torn by
-    that on 2026-09-02; the index was not, but only because the hook happens
-    to snapshot rarely - one write on the whole labubu run against fsguard's
-    206. Low contention is not a property to rely on.
-
-    The index failing is WORSE than the receipt file failing, which is why it
-    is fixed at the same time rather than later. A torn receipt line makes
-    `verify` shout. A torn index line is skipped by load_entries, so a
-    recovery point that exists on disk becomes unreachable - the tool silently
-    loses a recovery it already told you it had.
+    Separated from the main index so the background VFS guard process writes to its
+    own log without contending for locks across the WinFsp mount boundary.
     """
     return os.path.join(recovery_dir, "index-fs.jsonl")
 
 
 def _pruned_fs_path(recovery_dir: str) -> str:
-    """Ids pruned out of the filesystem guard's index, one per line.
+    """Path to tombstone list for filesystem guard entries (index-fs.pruned).
 
-    WHY A SECOND FILE INSTEAD OF EDITING THE FIRST
-    ----------------------------------------------
-    The split exists so each index has exactly ONE writer: the guard writes
-    index-fs.jsonl in the backing, everything else writes index.jsonl through
-    the mount, and WinFsp does not carry byte-range locks between the two. A
-    lock taken on one side is not the lock taken on the other.
-
-    `prune` broke that rule in the worst possible way. It computed doomed
-    entries from the MERGED view, deleted their artefacts - fs ones included -
-    and then rewrote index.jsonl only. So the fs index kept advertising
-    recovery points whose bytes were gone, and fs survivors got a second copy
-    written into the main index. Found by review 2026-09-07.
-
-    The obvious repair - have prune rewrite index-fs.jsonl too - is worse than
-    the bug. It truncates a file the guard may be appending to, across a lock
-    boundary that does not compose: today's failure leaves stale entries in an
-    intact file, that one can lose the file. Prefer a lie you can detect to a
-    loss you cannot.
-
-    So prune never touches the guard's file. It appends the pruned ids here,
-    to a file the CLI side owns outright, and load_entries filters them out.
-    Single writer per file, everywhere, and no truncation of anything another
-    process holds open.
-
-    Both files stay small - a few hundred bytes of ids - and the disk space
-    was never here anyway: prune frees it by deleting the recovery ARTEFACTS,
-    which it already does for both chains. This file only settles what the
-    ledger is allowed to claim.
-
-    A future mount can compact: at startup the guard is the sole writer of its
-    own index and can drop tombstoned lines and clear this file safely. Not
-    built, and not needed until the line count matters.
+    Appends pruned IDs here rather than rewriting index-fs.jsonl, ensuring the
+    VFS guard remains the sole writer of its own index file.
     """
     return os.path.join(recovery_dir, "index-fs.pruned")
 
@@ -223,29 +166,9 @@ def in_backing() -> bool:
 
 
 def _record(recovery_dir: str, entry: dict) -> None:
-    """Append one entry to the recovery index, durably and under a lock.
+    """Append one entry to the recovery index under an OS file lock with flush/fsync.
 
-    This used to be a bare `open(..., "a")` and one `write`. Two ways that
-    fails, both observed on 2026-08-25 in a real index:
-
-    * A write interrupted before its newline (Ctrl+C on the filesystem guard)
-      leaves a partial line. The NEXT append then lands on that same line,
-      producing `{"id": "a", ..., "rec{"id": "b", ...}` - and load_entries
-      silently drops both records, because it skips anything that will not
-      parse. A recovery point that exists on disk becomes unreachable through
-      the ledger, which is indistinguishable from never having taken it.
-    * winfspy dispatches filesystem operations from a THREAD POOL, so two
-      snapshots really can append at the same moment.
-
-    receipts.py solved exactly this problem for the receipt chain - lock, then
-    flush, then fsync. Reusing its lock rather than writing a second one is
-    deliberate: two implementations of "append safely" is how they drift, and
-    the ledger that finds your files deserves the same care as the ledger that
-    proves what happened.
-
-    The newline-first check HEALS a previously truncated line instead of
-    compounding it: the broken record is left as its own unparseable line and
-    only it is lost, rather than taking the next record down with it.
+    Checks and repairs any trailing unterminated line before appending.
     """
     from .receipts import _chain_lock          # local: avoids an import cycle
 
@@ -278,23 +201,9 @@ def _new_id() -> str:
 
 
 def _max_snapshot_bytes() -> int:
-    """The directory-capture cap, in bytes. Never raises, never negative.
+    """Directory-capture cap in bytes from DEMO_CLI_MAX_SNAPSHOT_MB.
 
-    `float()` was guarded and `int()` was not, which is the gap:
-
-        DEMO_CLI_MAX_SNAPSHOT_MB=nan   float() fine, int() -> ValueError
-        DEMO_CLI_MAX_SNAPSHOT_MB=inf   float() fine, int() -> OverflowError
-
-    Neither is an OSError, and this runs BEFORE the try/except around the copy,
-    so both escaped Guard.evaluate. The Claude Code adapter fails open on its
-    own errors, so a typo in one environment variable turned every directory
-    capture into an unguarded delete (2026-09-08).
-
-    A NEGATIVE value was accepted silently and is worse than a crash: every
-    tree exceeds a cap of -5 MB, so directory recovery is switched off with no
-    message at all. Nonsense values fall back to the default rather than to
-    "capture nothing", because silently disabling recovery is the dangerous
-    direction. Zero is left alone - it is a coherent way to say "files only".
+    Safely parses floats/ints; falls back to default on negative, NaN, or non-finite inputs.
     """
     default = int(_DEFAULT_MAX_SNAPSHOT_MB * 1024 * 1024)
     raw = os.environ.get("DEMO_CLI_MAX_SNAPSHOT_MB")
@@ -313,10 +222,7 @@ def _max_snapshot_bytes() -> int:
 
 
 def _max_snapshot_files() -> int:
-    """The file-count cap, parsed as defensively as the byte cap above and for
-    the same reason: this runs before the try/except around the copy, and a
-    typo in one environment variable must not turn every directory capture into
-    an unguarded delete."""
+    """File-count cap from DEMO_CLI_MAX_SNAPSHOT_FILES, defaulting to _DEFAULT_MAX_SNAPSHOT_FILES."""
     raw = os.environ.get("DEMO_CLI_MAX_SNAPSHOT_FILES")
     if raw is None:
         return _DEFAULT_MAX_SNAPSHOT_FILES
@@ -345,18 +251,9 @@ def _contains(outer: str, inner: str) -> bool:
 
 def _walk_cost(path: str, byte_cap: int, file_cap: Optional[int] = None,
                ignore_dirs=None, skip_path=None) -> Tuple[int, int]:
-    """(bytes, files) under `path`, skipping the same directories the copy will.
+    """Compute (bytes, files) under `path`, skipping directories in `ignore_dirs`.
 
-    ONE walk, two budgets. Short-circuits as soon as either cap is exceeded, so
-    a huge tree is never walked to the end just to find out it is huge.
-
-    `ignore_dirs` MUST be whatever the copy will skip. If the measurement
-    excludes a directory the copy then includes, neither cap bounds anything -
-    which is how a "256 MB cap" quietly copies gigabytes. checkpoint.py keeps
-    .git, so it passes its own set.
-
-    Until 2026-08-24 this held a hardcoded duplicate of IGNORED_DIRS, exactly
-    the drift the comment on that constant warns about.
+    Short-circuits early as soon as either `byte_cap` or `file_cap` is exceeded.
     """
     ignore = IGNORED_DIRS if ignore_dirs is None else frozenset(ignore_dirs)
     total = files = 0
@@ -446,27 +343,7 @@ def snapshot(target: Optional[Target], recovery_dir: str, strategy: str = "snaps
     if kind == "dir":
         if not os.path.isdir(ref):
             return None
-        # Honesty + safety: refuse to "recover" a tree we cannot copy quickly.
-        # The measurement and the copy must skip the SAME directories, or the
-        # cap does not bound anything - see _dir_size.
-        # NEVER COPY A TREE INTO ITSELF.
-        #
-        # The destination lives in recovery_dir. When the target IS the
-        # workspace - `rm -rf .demo_cli`, an ordinary-looking command an agent
-        # can issue - recovery_dir sits INSIDE ref, and copytree copies the
-        # tree it is growing. Observed 2026-08-29: fifteen levels of
-        # .demo_cli/recovery/....snapdir/recovery/....snapdir, stopped only by
-        # Windows MAX_PATH, and `rm -rf` could not reach the bottom to clean it.
-        #
-        # _IGNORE does not cover this. It skips directories NAMED .demo_cli;
-        # here .demo_cli is the source and the child being copied is named
-        # `recovery`. The name-based list cannot see the collision - only the
-        # absolute path can.
-        #
-        # The size cap does not cover it either: _dir_size measures BEFORE the
-        # copy, and the growth happens during it. A guard whose recovery path
-        # is a denial of service against itself is worse than one that
-        # declines, so this is checked, not bounded.
+        # Prevent self-copy recursion: refuse if recovery_dir is inside ref or ref is inside recovery_dir.
         if _contains(recovery_dir, ref):
             return None          # snapshotting a backup into the backup store
         names = IGNORED_DIRS if ignore_dirs is None else frozenset(ignore_dirs)
@@ -490,9 +367,6 @@ def snapshot(target: Optional[Target], recovery_dir: str, strategy: str = "snaps
                     f"DEMO_CLI_MAX_SNAPSHOT_MB or name a narrower target.")
             return None
         if file_cap is not None and nfiles > file_cap:
-            # TIME, not space. Capture is ~1 ms per file on Windows, so this
-            # many files would outlast the hook's timeout - and a hook killed
-            # mid-copy is a SILENT unguarded command, not a slow one.
             if notes is not None:
                 notes["refused"] = (
                     f"{os.path.basename(ref) or ref} holds more than "
@@ -504,31 +378,8 @@ def snapshot(target: Optional[Target], recovery_dir: str, strategy: str = "snaps
                     f"host sees the new budget. Or name a narrower target.")
             return None
         snap = os.path.join(recovery_dir, f"{os.path.basename(ref.rstrip('/'))}.{ts}.{rid}.snapdir")
-        # symlinks=True, AND NOT ONLY TO AVOID A CRASH.
-        #
-        # The default is False, which FOLLOWS every symlink and copies what it
-        # points at. Two consequences, both found by review 2026-09-08:
-        #
-        #   * a DANGLING link raised shutil.Error straight out of
-        #     Guard.evaluate. The Claude Code adapter fails open on its own
-        #     errors, so the hook printed "internal error, stepping aside" and
-        #     let the delete run UNGUARDED. One broken symlink anywhere in a
-        #     project silently disabled recovery for every directory capture -
-        #     and build trees and node_modules are full of them.
-        #
-        #   * the size cap stopped bounding anything. _dir_size walks with
-        #     os.walk, which does NOT descend symlinked directories, so a link
-        #     to a 2 MB tree measured as nothing and copied as 2 MB. Measured
-        #     at 4x a 0.5 MB cap. Exactly what _dir_size's own docstring warns
-        #     about, arriving from the copy side instead of the ignore list.
-        #
-        # Preserving the link is also the more faithful capture: `rm link`
-        # destroys the link, not its target, so restoring a link is right and
-        # restoring a regular file full of the target's bytes was wrong.
-        #
-        # The try/except stays regardless. "Degrade, never crash" is the
-        # contract, and returning None here means no recovery point, which
-        # makes the caller escalate - loudly, and without a claim.
+        # symlinks=True preserves symlinks as links without following them,
+        # preventing infinite loops, broken target exceptions, and cap bypasses.
         try:
             shutil.copytree(ref, snap, dirs_exist_ok=True, ignore=ignore,
                             symlinks=True)
@@ -542,7 +393,7 @@ def snapshot(target: Optional[Target], recovery_dir: str, strategy: str = "snaps
         dump = os.path.join(recovery_dir, f"pg.{ts}.{rid}.dump")
         try:
             r = subprocess.run(["pg_dump", "-Fc", "-f", dump, ref],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
             if r.returncode != 0 or not os.path.exists(dump):
                 return None
         except Exception:
@@ -584,28 +435,10 @@ def snapshot_bytes(name: str, data: bytes, recovery_dir: str,
 
 def snapshot_before_restore(entry: Optional[dict],
                             recovery_dir: str) -> Optional[dict]:
-    """Preserve what `undo` is about to overwrite.
+    """Snapshot the current on-disk target before 'undo' overwrites it (files/sqlite only).
 
-    UNDO WAS THE ONE MUTATION THE TOOL DID NOT GATE. Everything an agent does
-    is snapshotted before it destroys anything; `undo` overwrote a file with
-    no recovery point of its own. The failure that exposed it: restore a file,
-    do new work on it, then restore again out of habit - and the new work is
-    gone, with nothing to go back to.
-
-    Blocking a repeated id would not have fixed that. A DIFFERENT recovery
-    point for the same file does identical damage and has never been used, so
-    a once-only rule lets it straight through. The hazard is overwriting live
-    content, not reusing an id, so the guard belongs on the overwrite.
-
-    Returns the new entry, or None when there is nothing worth keeping: no
-    target on disk, or bytes already identical to what is being restored -
-    a recovery point recording no change is noise in the log, and noise is
-    how a real one gets missed.
-
-    FILES ONLY. A 'dir' entry restores by copytree overlay, which can clobber
-    modified files the same way; capturing a whole tree here needs snapshot()
-    and a Target, and is left as known work rather than half-done. Every
-    recovery point the filesystem guard writes is a file.
+    Returns the backup entry, or None if the target is missing or its contents
+    are already identical to the recovery point being restored.
     """
     if not entry or entry.get("kind") not in ("file", "sqlite"):
         return None
@@ -689,10 +522,7 @@ def load_entries(recovery_dir: str) -> List[dict]:
     #
     # Invisible on Linux and on Windows before a mount, because an empty fs
     # index leaves append order intact and the result is correct by accident.
-    # Found by review on 2026-09-07; no test wrote both indexes.
-    #
-    # _ts() is "%Y%m%d-%H%M%S" - fixed width, zero padded - so lexicographic
-    # order is chronological and no parsing is needed.
+    # Sort chronologically by fixed-width zero-padded timestamp ("ts").
     return sorted(entries, key=lambda e: str(e.get("ts") or ""))
 
 
@@ -772,25 +602,13 @@ def prune(recovery_dir: str, keep: Optional[int] = None,
             except OSError:
                 pass
 
-    # WHICH FILE EACH ENTRY CAME FROM DECIDES HOW IT IS REMOVED.
-    #
-    # This used to rewrite index.jsonl with every survivor and stop there, so
-    # fs survivors were duplicated into the main index while still present in
-    # their own, and doomed fs entries stayed listed with their artefacts
-    # already deleted - the ledger advertising recovery that is gone. When
-    # index.jsonl did not exist at all (a freshly mounted Windows project,
-    # before any CLI-side snapshot) the rewrite was skipped entirely and
-    # NOTHING was de-listed.
-    #
-    # The guard's index is never rewritten from here; see _pruned_fs_path.
+    # Main index is rewritten in place; filesystem guard entries are tombstoned.
     from .receipts import _chain_lock          # local: avoids an import cycle
 
     fs_ids = {e.get("id") for e in _read_index(_index_fs_path(recovery_dir))[0]}
     doomed_fs = [e for e in doomed if e.get("id") in fs_ids]
 
-    # The main index, rewritten in place - now UNDER THE LOCK. _record has
-    # always locked its appends; this rewrite never did, so a truncate could
-    # land in the middle of one. Two writers, one file, one lock.
+    # Rewrite the main index under the chain lock.
     idx = _index_path(recovery_dir)
     if os.path.exists(idx):
         with _chain_lock(idx):
@@ -861,21 +679,10 @@ def audit_recovery_artifacts(recovery_dir: str) -> ArtifactAuditResult:
 
 @dataclass
 class RestoreResult:
-    """Whether the restore happened, and if not, WHY NOT.
+    """Detailed result of a restore operation.
 
-    restore_entry() used to collapse every OSError into False, and the caller
-    then printed a fixed guess: "check the target path is reachable". On
-    2026-08-29 that guess was wrong in the one case that matters most.
-
-    A filesystem-layer recovery point lives in the ACL-locked backing, so an
-    unelevated shell cannot READ it. Undo failed, and the user was told
-    "No recovery point could be restored" about a file sitting intact on
-    disk - a FALSE NEGATIVE from the command someone runs precisely when they
-    have already lost something. An unearned "REVERSIBLE" and an unearned
-    "unrecoverable" break the same invariant; only the direction differs.
-
-    `denied` is the distinction worth carrying: it means an elevated retry
-    would work, which is actionable, where "gone" is not.
+    Tracks whether restore succeeded (`ok`), and if refused due to permissions,
+    sets `denied=True` with a diagnostic explanation in `problem`.
     """
     ok: bool
     denied: bool = False
@@ -921,14 +728,7 @@ def _readable_parent(path: str) -> bool:
 
 
 def _why_restore_failed(entry: dict):
-    """Re-attempt the two file operations to learn which one was refused.
-
-    Deliberately a SECOND look rather than plumbing the exception out of
-    restore_entry: that function is called from thirteen places and from the
-    syscall guard, and widening its contract to carry an error would touch all
-    of them. The cost is one extra open on a path that already failed - only
-    ever on the failure path, never in the normal one.
-    """
+    """Inspect recovery point and target permissions to explain restore failure."""
     rp, target = entry.get("recovery_point"), entry.get("target")
     try:
         with open(rp, "rb"):
@@ -949,24 +749,8 @@ def restore_entry(entry: dict) -> bool:
     if kind in ("sqlite", "file"):
         if not rp or not os.path.exists(rp):
             return False
-        # Recreate the parent directory. A recursive delete removes the files
-        # first and the directory afterwards, so by the time anyone runs undo
-        # the file's parent is gone and copy2 has nowhere to write. The bytes
-        # were captured perfectly and were still unrestorable - confirmed live
-        # on 2026-08-25, where `undo` on tree/a.txt escalated for no reason
-        # other than tree/ no longer existing.
-        #
-        # Making the directory is not a liberty: the entry records an ABSOLUTE
-        # path, and putting a file back at that path means the path has to
-        # exist. Nothing else is created and nothing existing is touched.
+        # Recreate the parent directory if missing so the file can be restored.
         parent = os.path.dirname(os.path.abspath(target))
-        # A failed copy must REPORT failure, not raise. cmd_undo has no
-        # try/except, so an exception here becomes a traceback and the caller
-        # learns nothing about whether their file came back. Returning False
-        # renders as ESCALATE, which is the honest answer.
-        # ValueError as well as OSError: a path carrying an embedded null byte
-        # raises ValueError from os, not OSError, and a target string comes
-        # out of a ledger file that a bad write can corrupt.
         try:
             if parent:
                 os.makedirs(parent, exist_ok=True)
@@ -977,17 +761,8 @@ def restore_entry(entry: dict) -> bool:
     if kind == "dir":
         if not rp or not os.path.isdir(rp):
             return False
-        # Coarse by design: copytree overlays the snapshot back onto the target,
-        # bringing deleted files back and reverting modified ones to their
-        # snapshot state, while leaving files created after the snapshot in
-        # place. For a multi-path rm captured as its common directory this
-        # restores the whole directory, which is exactly what makes the recovery
-        # a provable superset - and also why an edit made to an unrelated file in
-        # that directory after the snapshot would be rolled back here.
+        # Overlay the snapshot tree back onto the target with symlinks preserved.
         try:
-            # symlinks=True to match the snapshot: a captured link is restored
-            # as a link. Without it, restore would follow the link, write a
-            # regular file over it, and fail outright on a dangling one.
             shutil.copytree(rp, target, dirs_exist_ok=True, symlinks=True)
         except OSError:
             return False        # same reasoning as the file branch above

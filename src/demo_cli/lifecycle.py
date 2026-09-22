@@ -66,12 +66,7 @@ WAIT_UNMOUNT = 120.0      # a guard letting go
 
 
 def _show_plan(plan, title: str, next_steps: List[str]) -> int:
-    """Print what is about to happen, then require the word 'yes'.
-
-    This command MOVES SOMEBODY'S PROJECT. It prints the exact before and after
-    paths and waits, every time, unless --yes is passed deliberately. A y/N
-    prompt is too easy to hit by reflex for an operation this size.
-    """
+    """Print the relocation plan and require explicit confirmation unless --yes is passed."""
     print(render.c(f"\ndemo_cli {__version__}  {title}\n", "dim"))
     print(render.kv("project", plan.source))
     print(render.kv("files move to", plan.backing))
@@ -99,16 +94,8 @@ def _step(n: int, text: str) -> None:
 def _protected_children(directory: str) -> List[str]:
     """Protected projects directly inside `directory`.
 
-    Both setup and teardown default to the current directory, and a protected
-    project is very often one level down - you stand in `lab` and the guarded
-    thing is `lab\\myproj`. Naming what we found beats reporting "not
-    protected" while the backing directory sits in plain view.
-
-    Searched by looking for BACKING directories, not for projects. When the
-    mount is not running the project path does not exist at all - it is a
-    reparse point served by a dead process, or gone entirely - so scanning for
-    projects finds nothing precisely when you most need the answer. The
-    backing directory is the durable half; it is always there.
+    Identifies protected projects by inspecting for backing directories
+    (which persist even when the virtual mount is unmounted or offline).
     """
     suffix = protect_mod.BACKING_SUFFIX
     found = []
@@ -125,9 +112,7 @@ def _protected_children(directory: str) -> List[str]:
 
 
 def _install_hook_for(project: str, label: str) -> None:
-    """Install one host's hook into `project`, reusing that host's own
-    installer rather than writing its config shape here - the Codex adapter
-    already learned once that a hand-built config is silently ignored."""
+    """Install one host's hook into `project`, delegating to each host's native installer."""
     if label == "claude code":
         from .hooks.claude_code import install_into_settings
         install_into_settings(os.path.join(project, ".claude", "settings.json"))
@@ -140,11 +125,7 @@ def _install_hook_for(project: str, label: str) -> None:
 
 
 def _remove_hooks(project: str) -> List[str]:
-    """Delete our entries from each host's config, leaving anything else in it.
-
-    Removing the whole file would take the user's own settings with it - and
-    somebody running teardown is often already having a bad day.
-    """
+    """Delete our entries from each host's config while preserving other settings."""
     removed = []
     for label, directory, filename, event, command, nested, _module in _HOSTS:
         path = os.path.join(project, directory, filename)
@@ -197,35 +178,11 @@ def _strip_hook_entries(data, event: str, command: str) -> bool:
 
 def _wait_until(check: Callable[[], bool], timeout: float = WAIT_MOUNT, interval: float = 0.5,
                 label: Optional[str] = None) -> bool:
-    """Poll until check() is true. Returns whether it happened in time.
+    """Poll until check() returns True or timeout expires.
 
-    --------------------------------------------------------------------
-    THE SAME BUG IN THREE PLACES
-    --------------------------------------------------------------------
-    Every one of these assumed a state transition had completed because the
-    call that started it returned:
-
-      _mount_detached          sleep(2), then assume the child started
-      setup step 5             schtasks /run returned, so assume the guard is up
-      teardown step 1 -> 3     the kill returned, so assume the mount is gone
-
-    All three are wrong, and on 2026-08-29 all three fired on the same machine
-    in one evening. Setup reported "protected but not mounted" about a guard
-    that came up three minutes later; teardown's rename hit ERROR_ACCESS_DENIED
-    because WinFsp still held the directory a fraction of a second after the
-    kill - and that error code is indistinguishable from a permissions
-    failure, so the message blamed the ACL.
-
-    Starting something is not the same as it having started. The only honest
-    test is to look at the thing itself.
-
-    WHY IT PRINTS. Setup's old wait was 15 x 0.4s - six seconds, silent. The
-    machine needed four minutes, and silence is what made a slow success read
-    as a failure to both of us for an hour. A progress line costs nothing and
-    removes the whole class of misreading.
-
-    The timeout is a CEILING, not a wait: a fast machine returns on the first
-    poll. It is generous because a slow one is not broken.
+    Explicitly verifies state transitions rather than assuming immediate
+    completion upon process invocation or signaling. Displays progress
+    at regular intervals when `label` is provided.
     """
     start = time.monotonic()
     shown = 0.0
@@ -245,13 +202,10 @@ def _wait_until(check: Callable[[], bool], timeout: float = WAIT_MOUNT, interval
 
 
 def _teardown_admin_steps(project: str, cfg) -> List[dict]:
-    """The three teardown steps that need Administrator, as data.
+    """The three teardown steps that require Administrator privileges, returned as structured data.
 
-    Returned rather than printed, because on Windows these run inside an
-    ELEVATED CHILD whose console closes with it. The parent renders them into
-    the shell the person is actually looking at. Same problem `undo` has, and
-    the same reason mount.log exists: anything that runs where you cannot see
-    it must write down what it did.
+    Allows execution inside an elevated child process on Windows while rendering
+    results in the parent process console.
     """
     out: List[dict] = []
 
@@ -260,11 +214,7 @@ def _teardown_admin_steps(project: str, cfg) -> List[dict]:
         try:
             os.kill(st.pid, signal.SIGTERM)
             mountstate.clear(cfg)
-            # WinFsp does not let go the instant the process is signalled, and
-            # step 3's rename of a directory it still holds fails with
-            # ERROR_ACCESS_DENIED - the same code as a permissions failure, so
-            # the message blamed the ACL and told the user to do what they
-            # were already doing (2026-08-29).
+            # Wait for WinFsp to fully release the mount point before unprotect renames the directory.
             gone = _wait_until(
                 lambda: not mountstate.pid_alive(st.pid)
                 and not os.path.lexists(st.mountpoint or project),
@@ -274,9 +224,7 @@ def _teardown_admin_steps(project: str, cfg) -> List[dict]:
                                 + ("" if gone else " - it has not released the "
                                    "mount point yet; re-run teardown")})
         except Exception as exc:
-            # DO NOT clear the record. The guard is still running; erasing our
-            # note of it would leave a live process nobody can see - doctor
-            # would report "not recorded" while a filesystem is being served.
+            # Retain mount record so the running guard remains visible to doctor diagnostics.
             out.append({"n": 1, "ok": False,
                         "text": f"could not stop the filesystem guard (pid {st.pid})",
                         "detail": [str(exc), "The record is KEPT so the guard stays visible."],
@@ -286,8 +234,7 @@ def _teardown_admin_steps(project: str, cfg) -> List[dict]:
         mountstate.clear(cfg)
         out.append({"n": 1, "ok": True, "text": "filesystem guard not running"})
 
-    # "Absent" and "removed" are different facts, and reporting the first as
-    # the second is how a teardown looks complete while leaving things behind.
+    # Check whether the task is currently registered before attempting removal.
     had = schedule.status(project).exists
     if not had:
         out.append({"n": 2, "ok": True, "text": "no logon task was registered for this project"})
@@ -297,11 +244,6 @@ def _teardown_admin_steps(project: str, cfg) -> List[dict]:
         if not still:
             out.append({"n": 2, "ok": True, "text": "removed the logon task"})
         else:
-            # This line used to be four words with no cause and no remedy,
-            # while step 1 above named the pid, the reason and the command.
-            # The task survived a "successful" teardown on 2026-08-29 and
-            # would have fired at every logon, mounting a backing that had
-            # just been moved away - silently, forever.
             out.append({"n": 2, "ok": False, "text": "could not remove the logon task",
                         "detail": [f"it is still registered as: {schedule.task_name(project)}",
                                    "it will run at every logon and fail, because the "
@@ -321,30 +263,14 @@ def _teardown_admin_steps(project: str, cfg) -> List[dict]:
     plan = protect_mod.plan_unprotect(project)
     if not plan.ok:
         out.append({"n": 3, "ok": False, "text": "could not restore your files",
-                    "detail": plan.problems,
-                    "remedy": f"demo_cli unprotect {project}"})
+            "detail": plan.problems,
+            "remedy": f"demo_cli unprotect {project}"})
         return out
     try:
         for line in protect_mod.unprotect(plan):
             pass
         detail = [f"now at {project}"]
-        # CLEAR THE MOUNT RECORD AGAIN, HERE, AT ITS FINAL LOCATION.
-        #
-        # Step 1 already called mountstate.clear(), but that ran while the
-        # guard was being killed and it deleted THROUGH the mount - so the
-        # unlink hit a filesystem that was going away, failed, and clear()
-        # swallows OSError. The record then rode along inside .demo_cli when
-        # the backing was moved back, and doctor reported
-        #
-        #   [x] filesystem guard  RECORDED BUT NOT RUNNING - pid 18792 is gone
-        #
-        # about a project that had just been torn down correctly (2026-09-02).
-        # A clean teardown that ends in a red FAIL teaches people to ignore
-        # doctor, which is the opposite of what it is for.
-        #
-        # Now the files are back on real disk, so this delete is an ordinary
-        # one - and it is CHECKED, because a silent best-effort is what
-        # produced the stale record in the first place.
+        # Ensure any stale mount record in the restored project directory is deleted.
         leftover = os.path.join(project, cfg.workspace_dir, "mount.json")
         if os.path.exists(leftover):
             try:
@@ -391,20 +317,10 @@ def _show_step(x: dict) -> None:
 
 
 def cmd_teardown(a) -> int:
-    """Remove everything setup added, in reverse, on a machine in any state.
+    """Remove everything setup added, in reverse order, on a machine in any state.
 
-    It never refuses to continue because a step was already done. A teardown
-    that only works when everything is healthy is not a way out - and the
-    moment somebody reaches for it is usually the moment something is broken.
-
-    ONE UAC PROMPT, UP FRONT. Three of the four steps need Administrator - the
-    mount runs elevated, the logon task is /rl highest, and the backing is
-    locked to Administrators. The first version discovered that one step at a
-    time: it stopped, told you to open an admin shell, and asked you to re-run.
-    Tearing down `demo` on 2026-08-29 took THREE invocations across two shells,
-    and still left the logon task registered. Teardown is what somebody reaches
-    for when things are already wrong; it is the last place to make them
-    assemble the fix themselves.
+    Performs administrative steps (guard termination, logon task removal, and
+    backing restoration) via a single up-front UAC elevation prompt on Windows.
     """
     project = os.path.abspath(getattr(a, "project", None) or os.getcwd())
     print(render.c(f"\ndemo_cli {__version__}  teardown  ->  {project}\n", "dim"))
@@ -412,10 +328,7 @@ def cmd_teardown(a) -> int:
     cfg = load_config(project)
     needs_admin = os.name == "nt" and _teardown_needs_admin(project, cfg)
 
-    # Nothing here at all is a WRONG TARGET, not a clean teardown. Four
-    # "nothing to do" lines for a path that does not exist read as success and
-    # send somebody away while their real project is still mounted and locked
-    # (observed 2026-08-29: `demo_cli teardown demo` run one directory up).
+    # Verify the target exists or has active configuration before proceeding.
     if not needs_admin and not os.path.isdir(project) and not _any_hook_installed(cfg):
         print(render.c(f"  {project} does not exist, and nothing is registered "
                        f"for it.", "red"))
@@ -456,9 +369,7 @@ def cmd_teardown(a) -> int:
     for x in steps:
         _show_step(x)
 
-    # Hooks are the user's own config files and need no elevation, so they are
-    # removed HERE rather than in the elevated child - an elevated process is
-    # the wrong thing to be editing a user profile with.
+    # Remove user-level hooks in unelevated context.
     removed = _remove_hooks(project)
     steps.append({"n": 4, "ok": True,
                   "text": f"removed hooks: {', '.join(removed)}" if removed
@@ -467,8 +378,6 @@ def cmd_teardown(a) -> int:
 
     failed = [x for x in steps if not x["ok"]]
     if failed:
-        # A teardown that ends on the cheerful audit-trail note while two
-        # steps failed is the same lie as "installed" when nothing is active.
         print(render.c(f"\n  {len(failed)} step(s) did not complete: "
                        + ", ".join(str(x["n"]) for x in failed), "red"))
         print(render.c("  Re-run this teardown once you have dealt with them.\n", "dim"))
@@ -488,40 +397,20 @@ def cmd_register_task(a) -> int:
 
 
 def cmd_setup(a) -> int:
-    """One command to make a project guarded, and to say what that means.
+    """Configure and bootstrap project protection and agent hooks in a unified flow.
 
-    Setup used to be six commands across two shells with an implicit order and
-    elevation at unpredictable points. Nothing told anyone how far they had
-    got, and "installed but inert" has been the dangerous state six times in
-    this project - four independent manual steps is how a seventh happens.
-
-    What it will NOT do without asking: move your files. That is printed in
-    full and confirmed, every time.
+    Requires explicit user confirmation before any files are relocated.
     """
     project = os.path.abspath(getattr(a, "project", None) or os.getcwd())
     yes = getattr(a, "yes", False)
     print(render.c(f"\ndemo_cli {__version__}  setup  ->  {project}\n", "dim"))
 
-    # PROTECTION STATUS FIRST, because it decides WHERE the config may be
-    # written. Once a project is protected, its own path IS the mount point -
-    # so writing a file there creates a real directory that BLOCKS mounting,
-    # and a second config competing with the real one. That is exactly what
-    # happened on 2026-08-28: setup wrote myproj\\.demo_cli.toml, the logon
-    # task's `rmdir` could not remove a non-empty directory, and the mount
-    # refused because the path existed.
+    # Check protection status first: once protected, the project path is the mount point,
+    # so writing config directly would block mount creation.
     already_protected = os.path.isdir(protect_mod.backing_for(project))
 
-    # WHERE CONFIG AND HOOKS GO, and why the order changes.
-    #
-    # They belong INSIDE the project. For an unprotected one that is just the
-    # project path. For a protected one the only legitimate route to those
-    # files is THROUGH THE MOUNT - writing into the backing directly is
-    # reaching around our own guard, which is exactly what the ACL exists to
-    # prevent, and it fails anyway because the backing is Administrators-only.
-    #
-    # So when a project is already protected we DEFER these steps until the
-    # mount is up, and do them through it. Trying to write into the locked
-    # backing was a crash on 2026-08-28, from a fix made an hour earlier.
+    # For an already-protected project, writing directly to the backing directory is
+    # blocked by ACLs. Defer config and hook setup until the mount is active.
     mounted_now = mountstate.status(load_config(project)).running
     defer = already_protected and not mounted_now
     config_home = project
@@ -583,8 +472,7 @@ def cmd_setup(a) -> int:
                                  ).strip().lower() != "yes":
                 print("\n  Nothing was moved. Setup stopped.\n")
                 return 1
-            # Elevation happens HERE, after the user has agreed - not at the
-            # start, and not by sending them to another shell to start over.
+            # Request elevation only after explicit user confirmation.
             if protect_mod.is_elevated():
                 for line in protect_mod.protect(plan):
                     print("      " + render.c(line, "green"))
@@ -622,19 +510,12 @@ def cmd_setup(a) -> int:
                 for line in out.splitlines()[:6]:
                     print("      " + line)
 
-    # 5. Bring the guard up NOW ------------------------------------------
-    # Registering a logon task is not enough: without this, setup ends with a
-    # protected project and NO filesystem guard until the next reboot - the
-    # manual step the whole command exists to remove. Running the task uses
-    # the elevation it already stores, so there is no second UAC prompt.
+    # 5. Bring the guard up immediately -----------------------------------
+    # Run the scheduled task now so the filesystem guard is active without waiting for a reboot.
     if os.name == "nt" and not getattr(a, "no_protect", False):
         if mountstate.status(load_config(project)).running:
             _step(5, "filesystem guard already running")
         elif schedule.run_now(project):
-            # The old wait here was 15 x 0.4s. Six seconds, silent - and this
-            # machine took closer to four minutes between `schtasks /run` and
-            # a live mount, so setup reported "not mounted" about a guard that
-            # was still starting, and we spent an hour debugging a success.
             _step(5, "starting the filesystem guard")
             up = _wait_until(lambda: mountstate.status(load_config(project)).running,
                              timeout=WAIT_MOUNT,
@@ -642,8 +523,6 @@ def cmd_setup(a) -> int:
             if up:
                 print("      " + render.c("the filesystem guard is running", "green"))
             else:
-                # NOT "failed". We do not know that. Saying so would be the
-                # same unearned certainty as reporting a mount that is not up.
                 print("      " + render.c(
                     f"still starting after {int(WAIT_MOUNT)}s. It may yet come "
                     f"up - check:  demo_cli doctor --root {project}", "yellow"))
@@ -656,8 +535,7 @@ def cmd_setup(a) -> int:
                      "next logon, or run: demo_cli mount (elevated)")
 
     if defer and mountstate.status(load_config(project)).running:
-        # Through the mount now, which is the only honest route to a
-        # protected project's files.
+        # Apply deferred configuration and hooks through the active mount.
         try:
             if not os.path.exists(cfg_path):
                 with open(cfg_path, "w", encoding="utf-8") as f:

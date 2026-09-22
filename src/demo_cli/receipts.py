@@ -34,25 +34,9 @@ GENESIS = "0" * 64
 # tell "the predecessor is unreadable" apart from "the predecessor is gone".
 _HASH_TOKEN = re.compile(r"\b[0-9a-f]{64}\b")
 
-# --------------------------------------------------------------------------
-# ONE WRITER PER FILE.
-#
-# The receipt log used to be a single file, and on Windows that file is
-# reachable by two paths: through the WinFsp mount (which the hook and the
-# egress addon use) and directly in the backing directory (which the mount
-# process itself uses). Byte-range locks do not compose across WinFsp - a lock
-# taken through the mount and a lock taken on NTFS are different locks - so
-# both sides held "the" lock at once and appended at stale offsets.
-#
-# Observed 2026-09-02 on the labubu project: `demo_cli verify` reported
-# TAMPERED at line 349, and the file contained records cut mid-key with the
-# next record written over the remains. Nothing had tampered with anything;
-# the guard had corrupted its own audit trail.
-#
-# The fix is not better locking. It is removing the need for locking to work
-# across the boundary at all: each chain is written from exactly one side.
-# Splitting happens on WRITE; every read merges. See recovery.load_entries and
-# cli.cmd_verify - no command anyone types changes shape.
+# Chains are partitioned by writer: CHAIN_MAIN is written through user space / mount,
+# and CHAIN_FS is written directly by the filesystem guard in the backing directory.
+# This prevents lock contention and offset races across the WinFsp boundary.
 CHAIN_MAIN = "main"     # hook, egress, CLI - written through the mount
 CHAIN_FS = "fs"         # the filesystem guard - written in the backing
 
@@ -60,14 +44,7 @@ _FS_SUFFIX = "-fs"
 
 
 def _base_path(path: str) -> str:
-    """The main chain's path, whichever chain's path was handed in.
-
-    Normalising first makes chain_path idempotent: chain_path(fs_path, FS) is
-    the fs path, not the fs path with a second suffix. Without this, deriving
-    a peer from an already-routed path returned that path itself - so an fs
-    receipt anchored to its own chain instead of the main one, and every
-    peer_head came back None.
-    """
+    """Return the main chain path for any given chain path, stripping suffixes."""
     root, ext = os.path.splitext(path)
     if root.endswith(_FS_SUFFIX):
         return root[:-len(_FS_SUFFIX)] + ext
@@ -75,11 +52,7 @@ def _base_path(path: str) -> str:
 
 
 def chain_path(path: str, chain: str = CHAIN_MAIN) -> str:
-    """Where a given chain's receipts live.
-
-    receipts.jsonl -> receipts-fs.jsonl. Derived rather than configured: two
-    settings that must agree is a way for them to disagree.
-    """
+    """Return the filesystem path for the specified receipt chain."""
     base = _base_path(path)
     if chain != CHAIN_FS:
         return base
@@ -88,8 +61,7 @@ def chain_path(path: str, chain: str = CHAIN_MAIN) -> str:
 
 
 def peer_path(path: str, chain: str = CHAIN_MAIN) -> str:
-    """The OTHER chain's file, for cross-chain reads. Accepts either chain's
-    path, because callers hold whichever one they happen to be writing."""
+    """Return the alternate chain's path for cross-chain reads."""
     return chain_path(_base_path(path),
                       CHAIN_MAIN if chain == CHAIN_FS else CHAIN_FS)
 
@@ -102,12 +74,7 @@ class ReceiptLockError(RuntimeError):
     """Raised when the sidecar receipt lock cannot be acquired in time."""
 
 
-# Bounded so a stuck lock fails loudly instead of hanging a hook forever.
-#
-# Parsed defensively because this runs at IMPORT time, and the hook, the egress
-# addon and the filesystem guard all import this module. `DEMO_CLI_LOCK_TIMEOUT=abc`
-# raised ValueError before any of them could start - a typo in one environment
-# variable took the whole guard down at startup rather than falling back.
+# Bounded lock timeout in seconds; configurable via DEMO_CLI_LOCK_TIMEOUT with fallback to 10.0s.
 def _lock_timeout() -> float:
     try:
         value = float(os.environ.get("DEMO_CLI_LOCK_TIMEOUT", "10"))
@@ -120,29 +87,8 @@ _LOCK_TIMEOUT_SECONDS = _lock_timeout()
 _LOCK_POLL_INTERVAL = 0.05
 
 
-# READERS PASS errors="replace"; THE WRITER DOES NOT NEED TO.
-#
-# Two bytes of invalid UTF-8 anywhere in a ledger used to raise
-# UnicodeDecodeError out of verify_chain, last_hash, load_receipts and both
-# cross-link loops. The try/except in each only wrapped json.loads, and the
-# decode happens before it.
-#
-# last_hash is called INSIDE append_receipt, under the lock - so the file
-# could never be appended to again. Not denial of verification: DENIAL OF
-# RECORDING, silently, for every future command on that project. Found by
-# review 2026-09-09, and reachable without an attacker: a command carrying a
-# binary blob is enough.
-#
-# _tail_hash already had it, which is the tell - the author hit this once and
-# fixed the one call site in front of them.
-#
-# The writer is safe as it stands: json.dumps(ensure_ascii=True) escapes even
-# a lone surrogate from os.fsdecode before it reaches the file. Verified, so
-# nobody adds a guard that is not needed.
-#
-# WHAT THIS DOES NOT DO: recover anything. A mangled line stays unreadable and
-# the receipt it swallowed is gone. This restores the ability to read and to
-# keep recording; it is not retroactive healing.
+# File read configuration using errors="replace" so malformed UTF-8 lines do
+# not crash readers or prevent subsequent receipt appends.
 _READ = {"encoding": "utf-8", "errors": "replace"}
 
 
@@ -193,18 +139,13 @@ def _release(fh) -> None:
 
 @contextlib.contextmanager
 def _chain_lock(path: str):
-    """Exclusive lock guarding the read-last-hash / append pair, held across
-    the full critical section (read last hash -> finalize -> append -> flush
-    -> fsync). POSIX uses fcntl.flock; Windows uses msvcrt.locking on one byte
-    of the sidecar `.lock` file. Both sides poll with a bounded retry loop and
-    raise ReceiptLockError instead of silently proceeding unlocked."""
+    """Context manager acquiring an exclusive file lock on path + '.lock'."""
     lock_path = path + ".lock"
     os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
 
     fh = open(lock_path, "a+b")
     try:
-        # msvcrt.locking needs at least one byte to lock; keep it non-empty
-        # either way so byte-0 locking is always well defined.
+        # msvcrt.locking requires at least one byte; ensure file is non-empty.
         if os.fstat(fh.fileno()).st_size == 0:
             fh.write(b"\0")
             fh.flush()
@@ -241,10 +182,7 @@ class Receipt:
     context_mismatches: List = field(default_factory=list)
     pipeline_segments: List = field(default_factory=list)
     remote_exec: bool = False
-    # Which shell the guard judged this text as. None for anything that is not
-    # a shell command (a file edit has no dialect). The adapters decide it from
-    # signals the receipt does not otherwise record, so without this the trail
-    # cannot answer "which rules were even eligible" after the fact.
+    # Shell dialect evaluated by the guard; None for non-shell operations.
     dialect: Optional[str] = None
     agent_id: str = "unknown"
     session_id: str = "unknown"
@@ -253,13 +191,9 @@ class Receipt:
     receipt_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     timestamp: str = field(default_factory=_now)
     prev_receipt_hash: str = GENESIS
-    # Which log this belongs to. Advisory for grouping during verification,
-    # never a filter for reading: receipts written before the split have no
-    # `chain` and must keep verifying exactly as they did.
+    # Advisory chain identifier (CHAIN_MAIN or CHAIN_FS).
     chain: str = CHAIN_MAIN
-    # The other chain's head hash when this was written, or None when there is
-    # no other chain yet. Proves this receipt came after that one; see the
-    # CROSS-CHAIN ANCHORING note above.
+    # Peer chain head hash at write time for cross-chain causal ordering.
     peer_head: Optional[str] = None
     receipt_hash: str = ""
 
@@ -272,38 +206,9 @@ class Receipt:
 
 
 def last_hash(path: str) -> str:
-    r"""The hash every new receipt chains onto: the last parseable one, or
-    GENESIS when the file holds none.
+    r"""Return the last parseable receipt hash in path, or GENESIS if empty or nonexistent.
 
-    READ FROM THE TAIL. This scanned the WHOLE FILE, line by line, once per
-    append - so appending n receipts cost O(n^2) in total, and the cost landed
-    in the pre-execution path where the user waits for it. Measured on a real
-    receipt line of 888 bytes (2026-09-10):
-
-        entries      file    last_hash    append_receipt
-            100    0.1 MB      0.62 ms           5.66 ms
-         10,000    8.6 MB        83 ms             86 ms
-         50,000     43 MB       459 ms            541 ms
-        100,000     86 MB      1145 ms            955 ms
-
-    Half a second of latency, before the command runs, on every command,
-    because the ledger got long. Nothing was wrong with any receipt - this was
-    never a correctness fault - but a guard that gets slower the longer you
-    have trusted it is a guard people turn off.
-
-    _tail_hash has the identical contract and is flat at ~0.15 ms at every one
-    of those sizes: it walks backwards, skips torn lines the same way, widens
-    its window until it finds a parseable receipt, and returns GENESIS only
-    after it has read the whole file. It was written for the PEER chain during
-    the 2026-09-09 review, for this exact reason - its own docstring says a
-    full scan per append turns a 200-file delete into 200 full reads - and
-    nobody pointed the main chain at it.
-
-        THE FIX WAS ALREADY IN THE FILE, APPLIED TO THE OTHER CALLER.
-
-    Kept as a named function rather than inlined: it is what the rest of this
-    module and its tests call the operation, and the two contracts are worth
-    stating separately even when one delegates to the other.
+    Reads backwards from the tail via _tail_hash for O(1) tail lookups.
     """
     return _tail_hash(path)
 
@@ -311,54 +216,23 @@ def last_hash(path: str) -> str:
 # --------------------------------------------------------------------------
 # CROSS-CHAIN ANCHORING
 #
-# Splitting the log by writer stopped the corruption, but it cost the one
-# property a single chain had: nothing linked a hook receipt to the filesystem
-# capture that followed it. Two separate chains are two separate stories.
-#
-# Each receipt therefore records the OTHER chain's head hash at the moment it
-# was written. That single field buys two things:
-#
-#   ORDER. A receipt naming H(K) must have been written after K existed - you
-#   cannot reference a hash that has not been computed yet. So "the guard
-#   evaluated the command before the deletion happened" becomes provable from
-#   the files alone, with no trust in either machine's clock.
-#
-#   MUTUAL WITNESS. Delete K from the main chain and two things break: that
-#   chain's own links, AND every fs receipt pointing at a hash now absent.
-#   This closes truncation, the one attack a lone hash chain misses entirely -
-#   lop off the tail of a single chain and what remains verifies perfectly.
-#
-# peer_head sits inside the hashed body, so it cannot be edited without
-# breaking its own receipt's hash. It costs nothing to protect.
-#
-# WHAT IT DOES NOT DO: stop someone who can rewrite BOTH files consistently.
-# Neither does a single chain - same threat model, no regression. The answer
-# to that is an external anchor, which `verify` now prints the heads for.
+# Each receipt records the peer chain's head hash at the moment it was written:
+#   1. ORDER: A receipt naming H(K) must have been written after K existed,
+#      proving ordering without relying on machine clocks.
+#   2. MUTUAL WITNESS: Truncating either chain breaks references from the
+#      other chain, preventing undetected tail truncation.
+# peer_head is included in the hashed receipt body.
+# --------------------------------------------------------------------------
 _PEER_CACHE: Dict[str, tuple] = {}   # path -> ((size, mtime_ns), head)
 _PEER_CACHE_LOCK = threading.Lock()
 
 
 def _tail_hash(path: str, max_bytes: int = 65536) -> str:
     """The last receipt_hash in a log, read from the tail rather than the whole
-    file. The fs guard writes one receipt per file in a recursive delete, so a
-    full O(n) scan per append turns a 200-file delete into 200 full reads."""
-    # WIDEN UNTIL A WHOLE LINE FITS. GENESIS MEANS EMPTY, NOTHING ELSE.
-    #
-    # With a fixed window, a final line larger than it left only a partial
-    # line, `lines[1:]` dropped that, and the function fell through to
-    # GENESIS - which peer_head then recorded as the anchor, and
-    # verify_cross_links skips GENESIS because it documents it as "the peer
-    # chain was empty". So the anchor silently vanished and truncation of the
-    # peer chain became undetectable.
-    #
-    # No attacker needed: a receipt whose action_raw runs past ~64 KB does it,
-    # and redact() does not truncate. Found by review 2026-09-09 - the
-    # control/bug pair was stark: a small tail gave unresolved=[hash], ok=False
-    # on truncation; a large tail gave unresolved=[], ok=True.
-    #
-    # Doubling rather than reading the whole file keeps the O(1)-per-append
-    # property this function exists for; it degrades to one full read only for
-    # a file whose last line really is enormous.
+    file. Avoids O(n) full scans on every append."""
+    # Expand the read window until a full line fits to avoid dropping partial
+    # lines larger than max_bytes (which could otherwise fall through to GENESIS).
+    # Doubling/quadrupling keeps O(1) performance for typical appends.
     try:
         size = os.path.getsize(path)
     except OSError:
@@ -384,30 +258,16 @@ def _tail_hash(path: str, max_bytes: int = 65536) -> str:
             except Exception:
                 continue                 # torn line: keep walking backwards
         if start == 0:
-            # The whole file has been read and holds no parseable receipt.
-            # THIS is what GENESIS means.
             return GENESIS
         window *= 4
 
 
 def peer_head(path: str, chain: str) -> Optional[str]:
-    """The other chain's head, cached against its file identity.
+    """The other chain's head, cached against its file identity (size, mtime).
 
-    CACHED ON (size, mtime), NOT ON A CLOCK. A time-based cache was the first
-    attempt and it silently weakened the guarantee: during a fast burst every
-    receipt anchored to the same older head, so the NEWEST peer entries were
-    referenced by nothing - and truncating exactly those, the easiest and most
-    useful thing to remove, went undetected. A test caught it.
-
-    Stat is microseconds and changes the instant the peer is appended to, by
-    any process. So the burst optimisation survives - during a long run of fs
-    captures the main chain is not moving, so the file is read once - while
-    every anchor stays current.
-
-    A stale value would still be SAFE in the sense that "written after that
-    one" remains true. But safe is not the same as useful: an edge to an old
-    entry proves less, and the entries that most need covering are the recent
-    ones.
+    Cached on (size, mtime_ns) rather than a wall clock so bursts of appends
+    anchor to the latest peer entries immediately while avoiding redundant
+    reads when the peer file has not changed.
     """
     other = peer_path(path, chain)
     try:
@@ -430,43 +290,21 @@ def append_receipt(path: str, receipt: Receipt) -> Receipt:
 
     The read-last-hash / finalize / append / flush / fsync sequence is held
     under a single exclusive cross-platform file lock (see `_chain_lock`) so
-    concurrent writers - threads, or separate processes such as real hooks -
-    cannot read the same last hash and append competing receipts.
+    concurrent writers cannot read the same last hash and append competing receipts.
     """
     receipt.action_raw = redact(receipt.action_raw)
-    # ROUTE BY THE RECEIPT'S OWN ROLE, not by the caller's path. A caller that
-    # passes cfg.receipts_path and sets chain="fs" gets the fs file; nobody has
-    # to remember to build the right path at each call site, and a new writer
-    # cannot land in the wrong chain by forgetting.
+    # Route by the receipt's own role rather than caller path.
     path = chain_path(path, getattr(receipt, "chain", CHAIN_MAIN))
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
 
     with _chain_lock(path):
         receipt.prev_receipt_hash = last_hash(path)
-        # Read INSIDE the lock, before finalize, so the anchored value is the
-        # one that gets hashed. Outside it, a concurrent append could change
-        # the peer head between reading and sealing.
+        # Read inside the lock before finalize so the anchored value is sealed in the hash.
         if receipt.peer_head is None:
             receipt.peer_head = peer_head(path, getattr(receipt, "chain", CHAIN_MAIN))
         receipt.finalize()
-        # HEAL A TRUNCATED LINE INSTEAD OF LANDING ON IT.
-        #
-        # recovery._record has done this since 2026-08-25 and its docstring
-        # spells out why: a write interrupted before its newline leaves a
-        # partial line, and the next append lands on that SAME line, producing
-        # `{...partial}{"receipt_id": ...}` - one unparseable line holding
-        # both. The broken record takes the next good one down with it.
-        #
-        # append_receipt never got it. So the receipt chain, which is the
-        # tamper-evidence artefact, was LESS robust than the recovery index:
-        # a torn write destroyed the following receipt outright rather than
-        # merely leaving a gap. Found while establishing that a genuine tear
-        # does not break a link (2026-09-09) - exactly the "two
-        # implementations of append safely is how they drift" that _record's
-        # own comment warned about.
-        #
-        # This heals FORWARD only. The already-torn line stays unreadable and
-        # whatever it swallowed is gone; nothing here is retroactive.
+        # Ensure a torn line missing a trailing newline does not merge with
+        # the newly appended receipt, which would corrupt both entries.
         needs_newline = False
         try:
             if os.path.getsize(path):
@@ -492,19 +330,9 @@ class VerifyResult:
     decisions: Dict[str, int] = field(default_factory=dict)
     broken_at: Optional[int] = None   # 1-based line number
     detail: Optional[str] = None
-    # DAMAGE IS NOT TAMPERING, and saying so was a lie the verifier told.
-    #
-    # A line that will not parse is a WRITE that did not complete - a torn
-    # append, a process killed mid-write, or the lock-domain bug that produced
-    # exactly this on labubu (line 349, 2026-09-02). Nothing was altered.
-    # Reporting "the log was altered" is the verifier claiming knowledge it
-    # does not have, which is the same unearned certainty as an unearned
-    # REVERSIBLE - the invariant this whole tool exists to keep.
-    #
-    # So: damaged lines are recorded and SKIPPED, and verification resumes
-    # from the next entry as a new segment. Tampering - a line that parses but
-    # whose hash or link is wrong - still fails hard, because that is a claim
-    # the evidence supports.
+    # Damaged lines (unparseable/torn writes) are tracked and skipped rather
+    # than immediately failing as tampering, allowing verification to resume
+    # in segments across surviving valid entries.
     damaged_lines: List[int] = field(default_factory=list)
     segments: int = 1
     # Entries whose predecessor hash appears only inside an unreadable line:
@@ -516,9 +344,7 @@ class VerifyResult:
     # but not the line immediately before them. See verify_chain.
     out_of_order: List[int] = field(default_factory=list)
     ledger: Optional[str] = None      # which file this result describes
-    # No log at all. NOT an integrity failure - there is nothing to have
-    # altered - but not evidence of protection either, so it gets its own
-    # state rather than being folded into either neighbour.
+    # No log at all. Uninitialized state rather than an integrity failure.
     absent: bool = False
 
     @property
@@ -533,18 +359,9 @@ class VerifyResult:
 def _chain_conflict(path: str, rows) -> List[int]:
     """Line numbers whose `chain` disagrees with the file they sit in.
 
-    ONE WRITER PER FILE is the invariant the chain split introduced, and until
-    now nothing checked it. It is not decoration: verify_chain's correctness
-    depends on it. The `after_damage` excuse was deleted because a link can
-    only break after a tear when two writers interleave across lock domains -
-    the labubu shape - and the split makes that impossible. If the split is
-    ever violated again (it was once, on 2026-09-02, the guard writing to the
-    wrong ledger) that shape returns, and without this check it would surface
-    as a flat TAMPERED verdict against an honest project.
-
-    So the residual risk becomes an accurate diagnosis instead of a false
-    accusation. Legacy receipts predate the field and carry no `chain`; absent
-    is fine, only a DISAGREEING value is a conflict.
+    Enforces the one-writer-per-file invariant introduced by the chain split.
+    Legacy receipts predate the field and carry no `chain` (absent is permitted);
+    only an explicitly disagreeing value is flagged as a conflict.
     """
     expected = CHAIN_FS if _base_path(path) != path else CHAIN_MAIN
     return [n for n, r in rows
@@ -560,18 +377,8 @@ def verify_chain(path: str) -> VerifyResult:
     that was edited, inserted, removed or reordered.
     """
     if not os.path.exists(path):
-        # A LOG THAT DOES NOT EXIST HAS NOT BEEN TAMPERED WITH.
-        #
-        # This used to return ok=False, which `verify` rendered as TAMPERED -
-        # so a freshly set-up project, seconds old and working perfectly,
-        # was told its audit trail had been altered (dari, 2026-09-02). That
-        # is a false alarm of the worst kind: it fires exactly when someone is
-        # checking whether the tool works, and it accuses the tool of the one
-        # thing it exists to detect.
-        #
-        # Reported as its own state instead. Not a failure - and not a pass
-        # either, which is why `absent` is set and the renderer says plainly
-        # that nothing has been recorded.
+        # An absent log represents an uninitialized state rather than tampering.
+        # Report absent=True so the caller can distinguish it from a verified log.
         return VerifyResult(ok=True, absent=True, ledger=path,
                             detail="No receipts recorded yet.")
 
@@ -592,55 +399,13 @@ def verify_chain(path: str) -> VerifyResult:
                 damaged.append(n)
                 salvaged.update(_HASH_TOKEN.findall(line))
 
-    # THERE IS NO `after_damage` EXCUSE ANY MORE, and the reason is worth
-    # keeping because the excuse looked obviously necessary.
-    #
-    # It suppressed the broken-link failure for the first readable entry after
-    # a damaged line, on the theory that a torn line takes its hash with it and
-    # the next entry has nothing to link to. THAT NEVER HAPPENS. last_hash
-    # SKIPS unparseable lines, so a receipt appended after a tear links to the
-    # last GOOD entry - across the damage - and no link is broken at all.
-    # Demonstrated 2026-09-09: m1, a real interrupted append, then m4, gives
-    # m4.prev == m1.receipt_hash and segments == 1.
-    #
-    # So the excuse could only ever fire on a link that was intact when it was
-    # written and unreadable afterwards - which without editing requires two
-    # writers interleaving across lock domains. That is the labubu shape at
-    # line 348, and ONE WRITER PER FILE is precisely what the chain split was
-    # built to stop. The excuse was rescuing a case the split had already
-    # removed.
-    #
-    # Meanwhile an attacker chose where to put a junk line, and a removal is
-    # contiguous by construction, so one garbage line landed exactly in the
-    # hole: five receipts, entries 3 and 4 replaced by one bad line, verdict
-    # ok=True with "a torn write, not an alteration - nothing was edited"
-    # printed over a deliberate removal. Reordering and forged insertion went
-    # the same way, the hash being unkeyed.
-    #
-    # The split is an UNENFORCED invariant and has been violated once, so
-    # deleting the excuse without checking the invariant would make
-    # correctness quietly conditional on it. Hence _chain_conflict below.
-    # Every hash this file contains, readable or salvaged. A link naming one
-    # of these points at an entry that IS here - so nothing was removed, the
-    # entries are merely not in chain order.
-    # TWO SETS, NOT ONE, and the difference is the difference between a fact
-    # and a guess. `readable` holds hashes of entries we actually parsed.
-    # `salvaged` holds 64-hex tokens scraped off lines that would not parse -
-    # which is evidence that a hash was THERE, and no evidence at all that it
-    # belonged to a receipt. Merging them let a link resolve against a token
-    # an attacker typed into their own junk line, and the report then said
-    # "every referenced receipt is present, so nothing was removed" over a
-    # removal (2026-09-09).
+    # An appended receipt links to the last readable receipt (skipping damaged lines).
+    # Distinguish between parsed receipts ('readable') and raw tokens from damaged
+    # lines ('salvaged') so forged tokens cannot masquerade as valid entries.
     readable = {r.get("receipt_hash") for _, r in rows}
     inconclusive: List[int] = []
-    # BEFORE THE WALK, because it changes what a broken link MEANS.
-    #
-    # Two writers in one ledger produce exactly the shape a removal produces -
-    # that is the labubu case. Computed after the loop, the "an entry is
-    # missing" early return fired first and the report accused an honest
-    # project of tampering while the real diagnosis sat one line below,
-    # uncomputed. The better explanation must be available before the worse
-    # one is asserted.
+    # Check for chain conflicts before walking: if writers interleaved into
+    # the same ledger, ordering cannot be trusted.
     conflict = _chain_conflict(path, rows)
     prev = GENESIS
     prev_line = 0
@@ -651,8 +416,7 @@ def verify_chain(path: str) -> VerifyResult:
         body = {k: v for k, v in r.items() if k != "receipt_hash"}
         recomputed = hashlib.sha256(
             (_canon(body) + r.get("prev_receipt_hash", "")).encode()).hexdigest()
-        # SELF-CONSISTENCY IS CHECKED FIRST, and is never excused. It needs no
-        # predecessor, so neither damage nor disorder can cover an edited field.
+        # Self-consistency check: verify receipt body hash against stored hash.
         if recomputed != stored:
             return VerifyResult(ok=False, broken_at=n, damaged_lines=damaged,
                                 out_of_order=out_of_order,
@@ -661,31 +425,13 @@ def verify_chain(path: str) -> VerifyResult:
         link = r.get("prev_receipt_hash")
         if link != prev:
             if link in readable:
-                # OUT OF ORDER, NOT REMOVED. The predecessor is in this file,
-                # just not on the preceding line. That is what concurrent
-                # writers appending at stale offsets produce, and it is the
-                # commonest shape of the WinFsp lock-domain bug - observed on
-                # labubu at line 348, where an egress receipt correctly linked
-                # to an fsguard receipt stored further along and torn.
-                #
-                # Reported, and still a failure, but NOT called tampering:
-                # "an entry was removed" is a claim the evidence contradicts,
-                # since the entry is right there. Deliberate reordering
-                # produces the same shape, so the wording names both causes
-                # and asserts neither.
+                # Out of order: predecessor exists in file but not on preceding line.
                 out_of_order.append(n)
             elif link in salvaged:
-                # THE HASH IS IN AN UNREADABLE LINE. We cannot say the
-                # predecessor is present - only that its hash appears in text
-                # we could not parse. That is exactly what a genuine torn
-                # write looks like AND exactly what someone deleting an entry
-                # and typing its hash into a junk line looks like. The two are
-                # indistinguishable from here, so neither is asserted.
+                # Predecessor hash found only within an unparseable/torn line.
                 inconclusive.append(n)
             elif conflict:
-                # Ordering in this file is not trustworthy, so an
-                # ordering-based accusation is not either. Record it and let
-                # the conflict be the headline.
+                # Chain conflict: cross-writer ordering in this file is untrusted.
                 inconclusive.append(n)
             else:
                 return VerifyResult(ok=False, broken_at=n, damaged_lines=damaged,
@@ -703,10 +449,6 @@ def verify_chain(path: str) -> VerifyResult:
         decisions[d] = decisions.get(d, 0) + 1
     notes = []
     if damaged:
-        # NOT "not an alteration". The old wording volunteered the innocent
-        # explanation for evidence we cannot explain, which is worse than
-        # silence: a person who reads "nothing was edited" stops looking.
-        # What we know is what is said.
         notes.append(f"{len(damaged)} line(s) could not be read. Every entry "
                      f"that could be read is verified; what the unreadable "
                      f"lines held cannot be established from this file.")
@@ -727,20 +469,6 @@ def verify_chain(path: str) -> VerifyResult:
                      f"referenced receipt is present, so nothing was removed - "
                      f"consistent with concurrent writers appending at stale "
                      f"offsets, or with deliberate reordering.")
-    # OUT OF ORDER STILL FAILS. The chain is not linear, and a verifier that
-    # returned ok for that would be excusing the one shape a reordering attack
-    # produces. What changes is the WORDING, not the verdict: it names what is
-    # true (the order is wrong) instead of what is not (an entry was removed).
-    # INCONCLUSIVE IS NOT A PASS. An entry linking to a hash that exists only
-    # inside an unreadable line is exactly what a torn write looks like and
-    # exactly what deleting an entry and re-typing its hash looks like. If
-    # that returned ok, the attacker would have bought silence by writing one
-    # extra token - the vulnerability would have moved, not closed. "We could
-    # not tell" is not "we looked and it was fine", here as everywhere else in
-    # this codebase.
-    #
-    # A chain conflict is the same shape: it means ordering in this file is
-    # not trustworthy, so the ordering verdict cannot be trusted either.
     return VerifyResult(ok=not (out_of_order or inconclusive or conflict),
                         entries=len(rows), head=prev,
                         decisions=decisions, damaged_lines=damaged,
@@ -749,50 +477,30 @@ def verify_chain(path: str) -> VerifyResult:
                         ledger=path, detail=" ".join(notes) or None)
 
 
-# writes and verifies) plus the shareable proof-card builder. They reuse the
-# same _canon / hashing already defined above, so nothing else changes.
-
-
 @dataclass
 class CrossLinkResult:
-    """How the two chains vouch for each other."""
+    """Cross-chain verification result linking main and fs chains."""
     verified: int = 0            # peer_head values that resolve to a real entry
     unresolved: List[str] = field(default_factory=list)
     checked: bool = False        # False when there is no second chain to check
-    # Entries appended after the LAST peer write. peer_head records the peer's
-    # head at write time, so nothing written afterwards is referenced by
-    # anything - they are inside the ledger but outside the cross-check.
+    # Entries appended after the last peer write (outside the cross-check window).
     unanchored: int = 0
 
     @property
     def ok(self) -> bool:
-        # NOT A PASS WHEN NOTHING WAS CHECKED. The docstring one line above
-        # distinguishes "we did not look" from "we looked and it was fine",
-        # and `ok` collapsed them - so a caller writing `if links.ok` got a
-        # clean answer for a check that never ran. cli.py happens to guard
-        # with `if links else True`; the next caller would not have.
         return self.checked and not self.unresolved
 
 
 def verify_cross_links(main_path: str, fs_path: str) -> CrossLinkResult:
     """Check that every peer_head names a hash that exists in the other chain.
 
-    An unresolved link is REAL evidence, and it is the thing a single chain
-    could never show: entries were removed from the end of a log. Truncate the
-    main chain and its own hashes still verify perfectly - a valid, shorter
-    history. But the fs chain still carries peer_head values pointing at the
-    receipts that were cut, and those no longer resolve.
-
-    Reads only; never raises. A missing file means there is nothing to check,
-    which is reported as checked=False rather than as a pass - "we did not
-    look" and "we looked and it was fine" are different answers.
+    Detects tail truncation across chains: if entries are stripped from one chain,
+    the other chain will still reference missing heads. Missing chains report
+    checked=False.
     """
     res = CrossLinkResult()
     if not (os.path.exists(main_path) and os.path.exists(fs_path)):
-        # COUNT THE UNANCHORED ENTRIES EVEN HERE - especially here. With one
-        # chain there is nothing to anchor against, so EVERY entry is outside
-        # the cross-check. That is the Linux shape, and returning 0 would be
-        # the same misleading silence this count exists to remove.
+        # When only one chain exists, all its entries are unanchored.
         res.unanchored = _unanchored_after_last_peer_write(main_path, fs_path)
         return res
     res.checked = True
@@ -839,22 +547,8 @@ def verify_cross_links(main_path: str, fs_path: str) -> CrossLinkResult:
         except OSError:
             pass
 
-    # HOW MUCH OF THE LEDGER THIS ACTUALLY COVERS.
-    #
-    # peer_head anchors BACKWARDS: it records the peer's head as it was when
-    # the receipt was written. Everything appended after the last peer write
-    # is therefore referenced by nothing, and truncating back to that point
-    # leaves both chains verifying cleanly - no damage, no junk line, no
-    # oversized receipt. Reproduced 2026-09-09.
-    #
-    # On Linux, and on Windows whenever the filesystem guard is idle, that
-    # unreferenced region is the entire recent tail: exactly the receipts
-    # worth removing.
-    #
-    # Closing it needs periodic anchoring, which is a feature with its own
-    # failure modes and does not belong in a robustness pass. What belongs
-    # here is not letting the reader infer coverage that does not exist - so
-    # the count is reported, and the README and share_card say the same thing.
+    # peer_head anchors backwards to the peer's head at write time. Entries
+    # appended after the last peer write are unanchored until the next peer append.
     res.unanchored = _unanchored_after_last_peer_write(main_path, fs_path)
     return res
 
@@ -866,8 +560,7 @@ def _unanchored_after_last_peer_write(main_path: str, fs_path: str) -> int:
     r_a = tail_a[0] if tail_a else None
     r_b = tail_b[0] if tail_b else None
     if not r_a or not r_b:
-        # One chain only: nothing anchors anything, so every entry is
-        # unanchored. That is the Linux shape, and saying so is the point.
+        # When only one chain exists, all entries are unanchored.
         cnt_a = sum(1 for _ in iter_receipts(main_path))
         cnt_b = sum(1 for _ in iter_receipts(fs_path))
         return cnt_a + cnt_b
@@ -1101,18 +794,8 @@ def find_receipt(path: str, receipt_id: Optional[str] = None) -> Optional[dict]:
 
 
 def _fence_safe(text: str) -> str:
-    r"""Neutralise anything that would end the code fence a proof card puts
-    this text inside.
-
-    share_card is the one artefact handed to a STRANGER - it is pasted into a
-    PR or an issue, and it invites the reader to verify the chain themselves.
-    A command containing ``` closed the fence early, so the rest of the
-    command rendered as prose in somebody else's document, and redact() does
-    not strip backticks or newlines (2026-09-09).
-
-    Not a security boundary on its own - the card is not a trust anchor - but
-    the tool should not be the thing that injects attacker-influenced markup
-    into a third party's page.
+    r"""Neutralise characters (backticks and newlines) that would prematurely
+    terminate markdown code fences in generated share cards.
     """
     if not text:
         return text
@@ -1175,15 +858,6 @@ def share_card(receipt: dict, *, repo: str = "github.com/nizaryart/DEMO_LOADING"
         f"  hash         {rhash[:32]}…",
         f"  prev         {phash[:32]}…",
         "",
-        # WHAT THE CARD MAY CLAIM, AND WHAT IT MAY NOT.
-        #
-        # This is the one artefact handed to a stranger, and it invites them
-        # to check. So it must not overstate: the chain detects an EDIT to any
-        # entry it holds, and it does not by itself detect a rewrite of the
-        # whole file - only a head hash recorded somewhere else does that.
-        # Until 2026-09-09 the card said "tamper-evident" flatly while
-        # verify could be made to report a modified ledger clean, and the
-        # person least able to know better was the one being told.
         "  hash-chained: an edit to any entry below breaks the chain.",
         "  a head recorded elsewhere is what detects a whole-file rewrite.",
         "  verify the chain yourself:",

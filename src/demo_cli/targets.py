@@ -93,19 +93,14 @@ def resolve_target(cmd: str, explicit_db: Optional[str] = None,
 
 
 # --------------------------------------------------------------------------
-# Filesystem-operand extraction (Trou 2): make the snapshot actually fire on
-# the auto-fire path for rm / mv, where the target is named in the command
-# rather than passed as a flag.
+# Filesystem-operand extraction: identify targets for commands where operands
+# are arguments (e.g. rm, mv) rather than flags.
 # --------------------------------------------------------------------------
 
-# Leading env-var assignments (`X=1 rm ...`) are a shell prefix before the
-# command word; allow them so the operand extractor still fires (#006).
+# Allow leading environment variable assignments (e.g. 'X=1 rm ...') before command words.
 _ENV_ASSIGN = re.compile(r"^[A-Za-z_]\w*=")
 _RM_RE = re.compile(r"^\s*(?:[A-Za-z_]\w*=\S*\s+)*(?:sudo\s+)?rm\b", re.I)
-# An in-place writer POINTED AT a path. Two conditions, deliberately: the
-# command word must be one that takes a path (so npm/pip are excluded), AND
-# the segment must match the classifier's own writer rule (so a read without
-# --write is not counted as an action).
+# In-place file writers: must take a path and match the classifier's writer rules.
 _WRITER_CMD_RE = re.compile(
     r"^\s*(?:[A-Za-z_]\w*=\S*\s+)*(?:sudo\s+)?(?:"
     + "|".join(FILE_WRITER_TARGET_VERBS) + r")\b", re.I)
@@ -117,10 +112,7 @@ def _writer_hit(seg: str, _dialect: str) -> bool:
 
 _MV_RE = re.compile(r"^\s*(?:[A-Za-z_]\w*=\S*\s+)*(?:sudo\s+)?mv\b", re.I)
 _PS_REMOVE_RE = re.compile(r"^\s*Remove-Item\b", re.I)
-# `ri` is Remove-Item in PowerShell and Ruby's documentation viewer on POSIX.
-# classify.py gates the matching rule the same way; if these two disagree, one
-# module calls a command a deletion while the other looks for its target in
-# text that does not describe one.
+# 'ri' alias is Remove-Item only under PowerShell.
 _PS_REMOVE_ALIAS_RE = re.compile(rf"^\s*(?:{PS_REMOVE_ALIASES})\b", re.I)
 _PS_REMOVE_ANY_RE = re.compile(
     rf"^\s*(?:Remove-Item|{PS_REMOVE_ALIASES})\b", re.I)
@@ -130,24 +122,9 @@ def _ps_remove_hit(seg: str, dialect: str) -> bool:
     return bool(_PS_REMOVE_RE.search(seg)
                 or (dialect == POWERSHELL and _PS_REMOVE_ALIAS_RE.search(seg)))
 
-# Brace expansion. The shell expands `{a,b}` and `{1..3}` BEFORE globbing and
-# *unconditionally* - independent of what exists on disk - so `rm file{1,2,3}.txt`
-# deletes three files even though none of them is named literally anywhere. This
-# is the same failure mode as the glob one: the command reaches us as the literal
-# string, so if we do not expand braces ourselves we see one non-existent operand
-# and snapshot nothing. Bounded by _BRACE_MAX: a pathological expansion falls back
-# to the literal token (we capture nothing for it -> the honest escalate path),
-# never an unbounded blow-up.
+# Brace expansion bounds: expand '{a,b}' and '{1..3}' bash-style before globbing.
+# Bounded by _BRACE_MAX and _BRACE_MAX_DEPTH to avoid hangs on pathological input.
 _BRACE_MAX = 1024
-# One recursion level per brace GROUP, so a token with thousands of them blew
-# the stack once the expansion was made linear (2026-09-08). Before that it was
-# exponential and hung long before it got deep, which is the only reason this
-# never showed. A RecursionError is not an OSError, so it would have escaped
-# Guard.evaluate and the hook would have failed open - the same silent
-# unguarded-delete as the dangling-symlink crash.
-#
-# 64 is far past anything meaningful: _BRACE_MAX caps the product at 1024, so
-# even binary groups stop expanding after ten. Past this the token is literal.
 _BRACE_MAX_DEPTH = 64
 
 
@@ -219,36 +196,10 @@ def _expand_braces(token: str) -> List[str]:
 
 
 def _expand_braces_bounded(token: str, depth: int = 0) -> Optional[List[str]]:
-    """The recursion behind _expand_braces. None means "too big, give up".
+    """Recursive helper for _expand_braces. Returns None if expansion exceeds bounds.
 
-    TWO DEFECTS, ONE SHAPE (found by review 2026-09-08).
-
-    1. EXPONENTIAL IN TIME. The tail was expanded INSIDE the option loop:
-
-           for opt in options:
-               for opt_x in _expand_braces(opt):
-                   for tail in _expand_braces(post):   # recomputed every time
-
-       so T(n) = 2*T(n-1) for `{a,b}` repeated n times - measured at 4x per
-       two groups: 10 groups 0.016s, 18 groups 2.6s, 20 groups 10.6s, 600
-       groups never returned. _BRACE_MAX bounded `result`, but the blowup
-       happens inside the recursive calls, before the first append, so the
-       check was never reached. A hang in the guard's hot path, which runs
-       before every single tool call.
-
-       The tail does not depend on the option, so it is computed once.
-
-    2. THE BAIL PRODUCED GARBAGE, NOT A FALLBACK. The old bail returned
-       `[token]` from an INNER level, and the outer level then combined that
-       literal with its own options - yielding operands like `a{a,b}{a,b}...`
-       that are neither the full expansion nor the original token. Visible in
-       the timings above as absurd result counts (14 groups -> 8 items).
-       Those strings reach _path_operands as candidate paths.
-
-       So "too big" is now a distinct return value that propagates all the way
-       up, and the caller substitutes the whole unexpanded token exactly once.
-       A partial expansion is never a safe answer: the operand list is what
-       decides whether a command is a single-target capture or an escalation.
+    Computes suffix tails once per group (linear rather than exponential recursion)
+    and propagates aborts up the call tree to avoid producing partial expansions.
     """
     if depth > _BRACE_MAX_DEPTH:
         return None
@@ -266,9 +217,7 @@ def _expand_braces_bounded(token: str, depth: int = 0) -> Optional[List[str]]:
     if len(options) <= 1:
         rng = _expand_range(inner)
         if rng is None:
-            # Not expandable: keep this group literal, expand anything after
-            # it. (_expand_range also returns None for a range that is simply
-            # too large, and literal is the right answer for that too.)
+            # Not expandable: keep this group literal, expand anything after it.
             return [token[:b + 1] + tail for tail in tails]
         options = rng
 
@@ -280,8 +229,7 @@ def _expand_braces_bounded(token: str, depth: int = 0) -> Optional[List[str]]:
             return None
         expanded.append(ex)
         total += len(ex)
-        # Bounded BEFORE building the product, so the cost of refusing is not
-        # itself the thing that hangs.
+        # Bounded before building the product to prevent hangs.
         if total * len(tails) > _BRACE_MAX:
             return None
     return [pre + opt_x + tail
@@ -289,18 +237,11 @@ def _expand_braces_bounded(token: str, depth: int = 0) -> Optional[List[str]]:
 
 
 def _mv_target_dir(seg: str) -> Tuple[Optional[str], bool]:
-    """(target directory, ambiguous?) for `mv -t DIR src...`.
+    """Extract (target directory, ambiguous?) for `mv -t DIR src...`.
 
-    `mv -t bk s1` moves s1 INTO bk, so the file at risk is bk/s1. _mv took
-    ops[-1] as the destination, and _path_operands drops `-t` as a flag while
-    keeping its value - so ops was [bk, s1] and ops[-1] was the SOURCE. The
-    guard snapshotted s1, which is merely being moved away, and reported
-    REVERSIBLE while bk/s1 was overwritten with nothing captured. Found by
-    review 2026-09-08.
-
-    Returns ambiguous=True for a short-flag cluster we cannot split with
-    confidence (`mv -ft bk s1`). Escalating on a spelling we cannot read is
-    the same contract as everywhere else in this module.
+    When -t / --target-directory is used, destination is DIR rather than the last
+    operand. Returns (dir, False) if found, (None, False) if absent, or
+    (None, True) if an ambiguous flag cluster (e.g. -ft) cannot be safely split.
     """
     toks = _tokenize(seg)
     for i, tok in enumerate(toks):
@@ -386,16 +327,7 @@ def _path_operands(cmd: str, base: Optional[str] = None) -> List[str]:
     # only the leading run is skipped - `rm X=1 f` still treats X=1 as an operand.)
     while i < len(toks) and (_ENV_ASSIGN.match(toks[i]) or toks[i] == "sudo"):
         i += 1
-    # DROPPING THE COMMAND WORD IS WHAT MAKES THE REST OF THIS WORK, and it
-    # was a two-element tuple. Everything else kept its verb as a phantom
-    # operand, so `black app.py` counted TWO paths and collapsed to a common
-    # root instead of naming the file - while the flag skipping below already
-    # handled --write and -w for free. The generic machinery was all here;
-    # this line was the gate.
-    #
-    # Only a BARE verb is recognised. `./node_modules/.bin/prettier a.js`
-    # keeps its command word and still collapses - a stated miss, not a
-    # claim.
+    # Drop the bare command verb so it isn't treated as a path operand.
     if i < len(toks) and (toks[i] in ("rm", "mv")
                           or toks[i].lower() in FILE_WRITER_TARGET_VERBS):
         i += 1
@@ -404,20 +336,9 @@ def _path_operands(cmd: str, base: Optional[str] = None) -> List[str]:
         if tok.startswith("-"):
             continue
         tok = tok.strip("'\"")
-        # The shell expands `~` before the command ever sees it, so our view of
-        # the operands has to as well. Left literal, `~/a` became "<cwd>/~/a"
-        # via abspath - a path that cannot exist - and two such operands
-        # collapsed to a common root of the CURRENT DIRECTORY. `rm -f ~/a ~/b`
-        # run from a subdirectory then snapshotted that subdirectory and
-        # reported REVERSIBLE, while the files that died were in $HOME and the
-        # recovery point held none of them (2026-09-08). Expanded, they
-        # collapse to $HOME, which _too_broad refuses, and the command
-        # escalates honestly.
+        # Expand user home directory '~' so operands match actual filesystem paths.
         tok = os.path.expanduser(tok)
-        # `base` is the working directory the shell will actually be in when
-        # this runs - set only when a `cd` moved it somewhere other than here.
-        # Without it, globbing and os.path.exists resolve against OUR cwd and
-        # the answer describes a different directory's contents.
+        # 'base' is the effective working directory when 'cd' moved it.
         if base and not os.path.isabs(tok):
             tok = os.path.normpath(os.path.join(base, tok))
         for piece in _expand_braces(tok):
@@ -432,58 +353,18 @@ _PS_PATH_FLAGS = {"-literalpath", "-path"}
 
 
 def sole_segment(cmd: str, rx, dialect: str = POSIX) -> Optional[str]:
-    """The ONE segment of a command line that `rx` matches, or None.
+    """Find the single segment in a multi-command line matching `rx`, or None.
 
-    WHY THIS EXISTS (found 2026-08-25, on Windows, by a PowerShell test that
-    should never have been platform-gated).
-
-    Every operand extractor below is written as if its verb were the first
-    word on the line - `_path_operands` skips a leading run of assignments and
-    `sudo`, `_ps_remove_item_operand` drops exactly one token. Anything else in
-    front leaks in as an extra operand, the count stops being one, and the
-    extractor gives up:
-
-        echo hi; rm a.txt                  -> None
-        cd build && rm -rf ./out           -> None
-        Write-Host hi; Remove-Item a.txt   -> None
-        $t = "a.txt"; Remove-Item $t       -> None
-
-    None of that was dangerous - an unresolved target escalates, so the action
-    is blocked rather than run unsnapshotted - but `cd x && rm y` is what
-    agents actually write, and a guard that blocks the common case instead of
-    protecting it gets uninstalled. Narrowing to the matching segment fixes
-    every one of them, in both dialects, without touching the extractors.
-
-    THE HONESTY RULE, and the reason this returns None rather than the first
-    match: when TWO segments are destructive -
-
-        rm a.txt; rm b.txt
-
-    - picking one would snapshot a.txt and let b.txt die unrecorded, while the
-    receipt claimed a recovery. That is the partial-recovery lie FIX #5 exists
-    to prevent, so several matches means no target and an honest escalation.
+    If exactly one segment matches (e.g. 'cd build && rm -rf ./out'), returns
+    that segment. If zero or multiple segments match (e.g. 'rm a; rm b'), returns
+    None to avoid partial snapshots and ensure honest escalation.
     """
     matches = [s for s in split_segments(cmd, dialect) if rx.search(s)]
     return matches[0] if len(matches) == 1 else None
 
 
 def _ps_remove_item_operand(cmd: str) -> Optional[str]:
-    """Conservative PowerShell `Remove-Item` target extraction. Supports:
-
-        Remove-Item -Recurse -Force ".\\victim"
-        Remove-Item -LiteralPath ".\\victim" -Recurse -Force
-        Remove-Item -Path ".\\victim" -Recurse -Force
-
-    Not a shell parser - like `_path_operands`, good enough to find the single
-    target of a simple call. Any flag other than -Path/-LiteralPath is skipped
-    without consuming a value, so a command carrying an unsupported flag with
-    its own argument (e.g. `-ErrorAction Stop`) leaves that argument looking
-    like a second positional operand - deliberately, so it is treated as
-    ambiguous below rather than guessed at. Returns None (never a target) when
-    the operand count is not exactly one, or the operand contains a wildcard:
-    the honesty rule is that a target this function cannot pin down exactly
-    must not be snapshotted at all.
-    """
+    """Extract single target operand for PowerShell Remove-Item, or None if ambiguous/wildcard."""
     if not _PS_REMOVE_ANY_RE.search(cmd):
         return None
     tokens = _tokenize(cmd, windows_paths=True)[1:]  # PowerShell: \\ is a path sep
@@ -638,26 +519,11 @@ def _ps_write_target(cmd: str) -> Optional[str]:
 
 
 def _ps_dest_target(cmd: str) -> Optional[str]:
-    r"""What a Move/Copy/Rename -Force will CLOBBER: the destination, not the
-    source. Mirrors the mv branch of extract_path_operand.
+    r"""Resolve destination target that Move/Copy/Rename -Force will clobber.
 
-    RESOLVED BY FLAG, NOT BY POSITION. `ops[-1]` assumed the author wrote
-    -Path before -Destination; PowerShell named parameters are order-free, so
-    `Copy-Item -Destination keep\b.txt -Path a.txt` resolved to the SOURCE.
-
-    -NewName is joined to the source's directory, because it names a file
-    beside the source rather than a path from here. A -NewName containing a
-    separator is refused: PowerShell's behaviour there is something neither I
-    nor the reviewer could confirm without a Windows box, and refusing is
-    correct under both readings - unreachable if PowerShell errors, and the
-    honest answer if it does not. Choosing the branch that is right either way
-    is cheaper than being sure.
-
-    ONE CMDLET CHECK, and only in the positional fallback. `Rename-Item a b`
-    means -NewName b while `Move-Item a b` means -Destination b, and no flag
-    separates them, so nothing else can. It is not new coupling: ps_named_target
-    already reaches this function through _PS_DEST_RE, which is literally
-    Move-Item|Copy-Item|Rename-Item.
+    Resolves by flag (-Destination, -NewName) rather than purely positional order.
+    -NewName is joined to the source's directory. Returns None if ambiguous or
+    contains wildcards.
     """
     pairs = _ps_flagged_operands(cmd)
     values = [v for _, v in pairs]
@@ -691,25 +557,8 @@ def _ps_dest_target(cmd: str) -> Optional[str]:
     return dst
 
 
-# A target token that is not a filename yet. Three families, and the third is
-# the one that bit us: a token CUT AT WHITESPACE inside an unclosed construct.
-#
-#   $VAR ${VAR} %VAR%      a variable we could not substitute
-#   $( ` )                 command substitution - the value does not exist
-#                          until the shell runs the inner command
-#   !VAR!                  cmd.exe delayed expansion
-#
-# `echo x > $(cat name.txt)` reaches redirect_target as the partial token
-# `$(cat`, because the target is read up to whitespace. The first version of
-# this regex looked for `$\w` and `${` and matched neither, so the resolver
-# reported RESOLVED for a string that can never name a file - the guard then
-# stat'd it, found it absent, and read absent as creation. Same false ALLOW
-# the resolver exists to prevent, through a different door (2026-09-08).
-#
-# This is not evasion and does not sit behind the §2 frontier: `> $(date
-# +%F).log` and `> $(hostname).sql` are ordinary idioms. They belong in the
-# RESOLUTION gap - known-dangerous, unresolvable before it runs - which is
-# answered by escalate, not by a guess.
+# Unexpanded shell tokens (variables, command substitutions, unclosed quotes/brackets).
+# Tokens matching these cannot be safely resolved to a concrete path before execution.
 _UNEXPANDED = re.compile(r"""
       \$\w | \$\{ | \$\(          # $VAR  ${VAR}  $(cmd
     | `                            # `cmd`
@@ -772,19 +621,11 @@ def _too_broad(path: str) -> bool:
 
 
 def _common_capture_root(paths: List[str]) -> Optional[str]:
-    """The one directory that provably contains every path the command can
-    affect. Snapshotting it captures a SUPERSET of the damage, so the recovery
-    stays provable rather than partial - which is the whole invariant. Returns
-    None when no such directory exists, or when it would be absurdly broad."""
-    # Two distinct Windows drive letters have no common root at all. Detect this
-    # with ntpath (available on every OS) so it is caught even when the check
-    # runs on a POSIX host, where backslash paths would otherwise be treated as
-    # literal filenames and collapse to a bogus common root under the cwd.
-    # AN UNEXPANDED OPERAND IS NOT A PATH, and a common root computed from one
-    # is meaningless. `$HOME/a` abspath's to "<cwd>/$HOME/a", so two of them
-    # collapse to the current directory and the capture lands on whatever
-    # happens to be there. Same contract as resolve_redirect_target: refusing
-    # to answer is an answer, guessing is not.
+    """Find the common directory containing all target paths for superset capture.
+
+    Returns None if paths span multiple drives, contain unexpanded variables,
+    or collapse to an overly broad directory (e.g. root or $HOME).
+    """
     if any(_UNEXPANDED.search(p) for p in paths):
         return None
     drives = {ntpath.splitdrive(p)[0].upper() for p in paths}
@@ -803,36 +644,10 @@ def _common_capture_root(paths: List[str]) -> Optional[str]:
 
 
 def expanded_operands(cmd: str, dialect: str = POSIX) -> List[str]:
-    """The concrete list of existing paths an rm / mv will touch.
+    """Return concrete sorted list of existing paths affected by rm / mv in `cmd`.
 
-    Exposed so the preview can PRINT it. claude-code#76626: an agent ran
-    `rm -f Reports/report_*.txt Reports/report_*.png` intending "just to check
-    the current file count". The glob expansion IS the file count. Showing this
-    list answers the question the agent was asking and makes the deletion
-    impossible to approve by accident, in the same operation. The preview is not
-    friction here - the preview is the task.
-
-    Returns [] for anything that is not an rm / mv, so callers can invoke it
-    unconditionally: the crude operand split is only meaningful for those two.
-
-    PER SEGMENT, AGAINST THE EFFECTIVE DIRECTORY. _RM_RE is anchored at the
-    start of the string, so matched against a whole LINE it saw nothing in
-
-        cd x && rm -rf a b
-        echo hi; rm -rf a b
-        bash -c "rm -rf a b"
-
-    and the preview printed "no files affected" for deletions that were about
-    to happen. The snapshot was correct throughout - only the display lied,
-    which is why no test caught it and why it is worse than it sounds: this is
-    the surface built FOR claude-code#76626, where the agent's stated goal was
-    to COUNT the files. A preview that answers "none" is the wrong answer to
-    the exact question that incident was about. Found by review 2026-09-08.
-
-    Every rm/mv segment contributes, not just one. The snapshot decision has
-    its own multiplicity rule and escalates; the preview's job is to show what
-    the line touches, and showing half of it would be the display telling a
-    smaller version of the same lie.
+    Evaluates operands per segment against the effective working directory so
+    chained 'cd' commands resolve targets accurately.
     """
     pairs, moved = _operand_context(cmd, dialect)
     segments = [seg for seg, _ in pairs]
@@ -840,64 +655,23 @@ def expanded_operands(cmd: str, dialect: str = POSIX) -> List[str]:
     for index, seg in enumerate(segments):
         if not (_RM_RE.search(seg) or _MV_RE.search(seg)):
             continue
-        # This segment's view, not the line's. See _base_at.
         base, ok = _base_at(cmd, segments, index, moved)
         if not ok:
             return []                   # unmodellable cd: nothing honest to show
         for path in _path_operands(seg, base):
-            # ABSOLUTE AND DEDUPED BY IDENTITY, not by spelling. `rm a.txt; rm
-            # ./a.txt` is one file, and a string dedupe reported "files
-            # matched: 2" - inflating the very count that #76626 was about.
-            # Mixing relative and absolute in one list also made render's
-            # redact() show the same file two ways depending on whether a cd
-            # appeared earlier in the line.
             real = os.path.normpath(os.path.abspath(path))
             if real not in seen and os.path.exists(real):
                 seen.add(real)
                 out.append(real)
-    # Sorted because glob order is os.scandir order: stable on one filesystem,
-    # not guaranteed across them. An unsorted preview is a test that passes
-    # here and fails on somebody else's machine.
     return sorted(out)
 
 
 def extract_path_operand(cmd: str, dialect: str = POSIX) -> Optional[str]:
-    """Return the filesystem path an rm / mv will affect, or None.
+    """Return the filesystem path a mutating command (rm, mv, writer) will affect, or None.
 
-    Honesty rule (the invariant): never snapshot a SUBSET and imply full
-    recovery.
-
-    v0.4 - a multi-path rm used to return None unconditionally. That was too
-    blunt, and it cost someone their work. Live incident, claude-code#76626: an
-    agent ran
-
-        rm -f Reports/report_*.txt Reports/report_*.png
-
-    intending only to count the files. Every path was local, bounded and cheap
-    to copy - precisely the case where full capture is PROVABLE - and the old
-    rule escalated instead of capturing. Not in the recycle bin (no CLI delete
-    ever is), not git-tracked, not in shadow copies. Permanently gone.
-
-    So: several paths that collapse into one capturable directory now snapshot
-    that DIRECTORY. It is a superset of everything the command can touch, so the
-    recovery is still provable, never partial. Anything that does NOT collapse
-    to one bounded directory still returns None and still escalates honestly.
-    The size cap in snapshot() and the project-root bound in guard() both still
-    apply on top of this.
-
-    Two cautions for anyone touching this later:
-
-    * This function is NOT the honesty boundary by itself. When only one operand
-      exists among several, the result collapses to that single path even if it
-      lies outside the project; it is the guard's `within` project-root check
-      (guard.evaluate) that refuses to snapshot or claim reversibility for it.
-      Do not reuse extract_path_operand at a new call site without that bound.
-    * The directory return means undo is COARSE: restoring a multi-path rm
-      restores the whole captured directory to its snapshot state (see
-      restore_entry). That is what keeps recovery a provable superset, but it
-      also rolls back unrelated edits made to other files in that directory
-      after the snapshot. Immediately after the rm (the flagship flow) this is a
-      non-issue; the window only matters if other writes land before undo.
+    Single paths return that path if it exists. Multiple paths that collapse into a
+    single common parent directory return that directory for superset snapshotting.
+    If targets cannot be collapsed to a single valid directory, returns None to escalate.
     """
     pairs, moved = _operand_context(cmd, dialect)
     segments = [seg for seg, _ in pairs]
@@ -965,32 +739,12 @@ def extract_path_operand(cmd: str, dialect: str = POSIX) -> Optional[str]:
             return target if target and os.path.exists(target) else None
         return run
 
-    # MULTIPLICITY IS COUNTED ACROSS RULES, NOT WITHIN EACH ONE.
-    #
-    # The loop below returns on the first rule that matches, so it could only
-    # ever see its own segments. `rm a.txt; rm b.txt` escalated correctly - two
-    # hits for one rule - while these did not:
-    #
-    #     rm old.txt; mv new.txt keep.txt      snapshot of old.txt, REVERSIBLE
-    #     rm old.txt; echo z > keep.txt        snapshot of old.txt, REVERSIBLE
-    #
-    # keep.txt is clobbered in both, with nothing captured and the receipt
-    # claiming a recovery. That is the partial-recovery lie FIX #5 exists to
-    # prevent, surviving because the two destructive steps used DIFFERENT
-    # verbs. Found by review 2026-09-08.
-    #
-    # A set of indices, so one segment matching two rules still counts once,
-    # and the redirect detector is included because `> file` is a destructive
-    # step even though no rule regex covers it.
+    # Multiplicity across rules: count destructive steps across all matchers and redirects.
+    # If multiple distinct operations occur in one line, escalate to prevent partial recovery.
     def _rx(rx):
         return lambda seg, _d: bool(rx.search(seg))
 
-    # (does this segment act?, what is its target?). A matcher takes the
-    # segment AND its dialect, because `ri` only means Remove-Item in one.
-    # The writer row reuses _rm UNCHANGED: one operand -> that path, several
-    # -> their common capture root. That is already exactly a formatter's
-    # semantics, so `prettier --write src/` snapshots src/ and
-    # `black a.py b.py` snapshots the directory holding both.
+    # Matchers: (does this segment act?, what is its target?).
     _MATCHERS = ((_rx(_RM_RE), _rm),
                  (_rx(_MV_RE), _mv),
                  (_writer_hit, _rm),
@@ -1014,20 +768,12 @@ def extract_path_operand(cmd: str, dialect: str = POSIX) -> Optional[str]:
         if not ok:
             return None                         # cannot model it: do not guess
         target = handler(seg)
-        # Belt and braces: a relative answer after a move would describe the
-        # wrong directory, and there is no honest way to interpret it.
+        # Refuse relative target after a directory move if it cannot be verified.
         if target and moved and base and not os.path.isabs(target):
             return None
         return target
 
-    # Truncating output redirection ('> file'): snapshot the file it overwrites.
-    # Uses the same quote-aware detector as the classifier, so classify (is it
-    # destructive?) and recovery (what to snapshot?) can never disagree.
-    #
-    # Per SEGMENT, and only when exactly one segment redirects. `cmd` is the
-    # raw line now, not a normalised whole, and `a > x; b > y` must escalate
-    # for the same reason two rm segments do: snapshotting x while y is
-    # truncated unrecorded is the partial-recovery lie.
+    # Truncating output redirection ('> file'): snapshot target if exactly one segment redirects.
     tgt, _ = resolve_redirect_target(cmd, dialect, moved=moved)
     if tgt:
         return tgt if os.path.exists(tgt) else None
@@ -1037,39 +783,11 @@ def extract_path_operand(cmd: str, dialect: str = POSIX) -> Optional[str]:
 def resolve_redirect_target(cmd: str, dialect: str = POSIX,
                             moved: Optional[bool] = None
                             ) -> Tuple[Optional[str], bool]:
-    """(absolute target, resolved?) for a truncating output redirection.
+    """Resolve the target path for a truncating output redirection (> file).
 
-    THE ONE RESOLVER, because three modules used to answer this differently and
-    the disagreement cost a silent data loss (2026-09-08).
-
-        classify_pipeline           effective segments  (since 2026-09-02)
-        extract_path_operand        effective segments + substitution
-        Guard.evaluate              THE RAW LINE
-
-    The classifier was widened on 2026-09-02 to judge unwrapped segments, so it
-    began flagging `bash -c "echo x > app.db"`. The guard's creates-if-missing
-    correction still read the raw line, could not find a target there (the `>`
-    is inside quotes), and cleared the flag - reading "I cannot find it" as
-    "there is nothing there to destroy". An existing file was truncated with no
-    snapshot, no receipt and no escalation. Five spellings did this; only the
-    bare `echo x > app.db` was ever handled correctly.
-
-    RESOLVED IS NOT THE SAME AS FOUND, and that distinction is the whole point:
-
-        (path, True)   a single, fully expanded target. The caller stats it:
-                       present means overwrite, absent means creation.
-        (None, False)  nothing resolved, MORE than one segment redirects, or
-                       the target still carries an unexpanded variable. The
-                       caller must keep its classification and escalate.
-
-    Two redirects are unresolved on purpose. `a > x; b > y` snapshotting x
-    while y is truncated unrecorded is the partial-recovery lie, the same
-    reason a multi-target rm returns None.
-
-    An unexpanded `$HOME/data.db` is unresolved for the same reason: it does
-    not exist under that literal name, so treating it as "found and absent"
-    reads a real file as a new one. Substitution handles in-line assignments;
-    anything from the environment is beyond us and must say so.
+    Returns (absolute_path, True) if exactly one segment redirects to an expanded,
+    resolvable target. Returns (None, False) if zero or multiple segments redirect,
+    or if the redirection target contains unexpanded shell variables.
     """
     segments = [seg for seg, _ in
                 effective_segments(cmd, dialect, substitute=True)] or [cmd]
@@ -1106,47 +824,10 @@ _UNMODELLED = re.compile(r"^\s*(?:pushd|popd)\b", re.I)
 
 
 def effective_cwd(cmd: str, segments: List[str], upto: int) -> Optional[str]:
-    """The working directory in effect when segments[upto] runs, or None.
+    """Compute simulated working directory up to segments[upto], or None if unmodellable.
 
-    STEP 2 OF THE cd FIX. Step 1 refused every relative operand after a `cd`,
-    which closed the wrong-file snapshot and escalated a pattern agents write
-    constantly. This folds the `cd`s instead, so the common case resolves to
-    the RIGHT file rather than to nothing.
-
-    Folding is one line per hop - normpath(join(cwd, arg)) - and it composes,
-    so any number of `cd`s in a row works, and `..`, `.` and absolute paths
-    all fall out for free. It also matches bash: bash's default `cd` is
-    LOGICAL (-L), so `cd link` then `cd ..` returns to the link's parent,
-    which is exactly what normpath does. (`cd -P` would differ; it is refused
-    below along with everything else we cannot model.)
-
-    RETURNS None RATHER THAN A GUESS, for:
-
-      * `pushd` / `popd`         a directory stack we do not model
-      * a `(` or `)` anywhere    `(cd x && rm y); rm z` puts z back at the
-                                 original cwd, and we do not track subshells
-      * a `|` anywhere           each side of a pipeline runs in its own
-                                 subshell, so a `cd` on the left never reaches
-                                 the right. split_segments discards the
-                                 separator, so we cannot tell `cd x | rm y`
-                                 from `cd x && rm y` - refuse both rather than
-                                 get one of them wrong
-      * CDPATH set               `cd foo` can then land somewhere else entirely
-      * an unexpanded argument   `cd $VAR`, `cd $(...)`, a backtick
-      * more than one argument   `cd a b` is an error in bash, not a hop
-      * a target that is not a directory NOW
-
-    THE ONE CASE THIS CANNOT DECIDE, stated plainly: with `;` rather than
-    `&&`, whether the `cd` succeeded is a runtime fact.
-
-        cd build && rm -rf ./out    cd fails -> rm never runs. Safe.
-        cd build ;  rm -rf ./out    cd fails -> rm runs at the OLD cwd.
-
-    Requiring the target to be a real directory reduces that to a race - the
-    directory would have to vanish between this check and the command - rather
-    than a guess. It is the residual risk, and it is smaller than either
-    alternative: escalating every chained rm, or resolving against the wrong
-    directory.
+    Folds sequential 'cd' commands. Returns None for constructs like CDPATH,
+    pipes, subshells, pushd/popd, unexpanded variables, or non-existent directories.
     """
     if os.environ.get("CDPATH"):
         return None
@@ -1176,29 +857,7 @@ def effective_cwd(cmd: str, segments: List[str], upto: int) -> Optional[str]:
 
 
 def _changes_directory(segments: List[str]) -> bool:
-    """Does any segment move the shell somewhere else before the destructive one?
-
-    STEP 1 OF THE FIX FOR A WRONG-FILE SNAPSHOT (2026-09-08).
-
-        cd build && rm -rf ./out
-
-    On 2026-08-25 operand extraction moved from the whole line to per-segment,
-    because an anchored rule applied to a whole line matched nothing here and
-    the command escalated. That fixed the escalation and introduced something
-    worse: `./out` is now resolved against the CURRENT directory, so the guard
-    snapshots <cwd>/out - an unrelated, innocent directory - while build/out is
-    the one deleted. The receipt says REVERSIBLE and `undo` would restore the
-    wrong tree over live data.
-
-    Until the cwd is actually tracked (step 2), a relative operand after a `cd`
-    is UNRESOLVED. That is the same contract as resolve_redirect_target and
-    _common_capture_root: refusing to answer is an answer, guessing is not.
-
-    Absolute operands are unaffected - `cd x && rm /tmp/y` needs no cwd.
-
-    Deliberately broad: pushd/popd and PowerShell's Set-Location/sl count too,
-    since all of them invalidate the assumption in the same way.
-    """
+    """True if any segment changes the working directory (cd, chdir, pushd, Set-Location)."""
     return any(_CD_RE.match(seg) for seg in segments)
 
 
@@ -1216,29 +875,9 @@ def _operand_context(cmd: str,
 
 def _base_at(cmd: str, segments: List[str], index: int,
              moved: bool) -> Tuple[Optional[str], bool]:
-    """(base directory, could we tell?) for the segment at `index`.
+    """Resolve (base_directory, ok) for the segment at `index`.
 
-    ONE STRATEGY, RESOLVED PER INDEX, and the index is the caller's choice.
-
-    The first version of this shared helper resolved the cwd once, as of the
-    END of the line - and handed that to expanded_operands, which needs the
-    directory in force AT ITS SEGMENT. So
-
-        cd build && rm -rf ./out            preview: build/out   correct
-        cd build && rm -rf ./out && cd ..   preview: (nothing)   WRONG
-
-    The trailing `cd` moved the end-of-line cwd, `./out` resolved against the
-    wrong directory, the exists() filter dropped it, and the preview said "no
-    files affected" for a deletion that was about to happen - the exact lie
-    F12 was written to remove, reintroduced by its own fix (2026-09-09).
-
-    Note the shape of that failure: because the operand list is filtered by
-    exists(), a WRONG BASE can never surface as a wrong path. It can only
-    surface as a missing one. Silence is the only symptom this bug has.
-
-    `base` is None when nothing moved - the overwhelming majority - so callers
-    take exactly the path they took before. `ok` is False only when a `cd`
-    exists and cannot be modelled.
+    Returns the simulated working directory active when the segment at `index` runs.
     """
     if not moved:
         return None, True
@@ -1251,37 +890,15 @@ def _base_at(cmd: str, segments: List[str], index: int,
 
 
 def unignorable_dirs(cmd: str, dialect: str = POSIX) -> frozenset:
-    """Ignored directory names this command explicitly reaches into.
+    """Return ignored directory names explicitly targeted by the command.
 
-    IGNORED_DIRS keeps `.git`, `node_modules` and `__pycache__` out of a
-    directory snapshot, because copying them on every rm is expensive and they
-    are usually reconstructible. That reasoning holds right up until the
-    command NAMES something inside one:
-
-        rm proj/.git/config proj/src/a.py
-
-    collapses to `proj`, snapshots it without `.git`, and reports REVERSIBLE.
-    The snapshot contains src/a.py and nothing else; `undo` restores half the
-    damage and says nothing about the other half. The entry is
-    indistinguishable from a complete capture - no field records the omission -
-    which is what makes it a lie rather than a limitation. Found by review
-    2026-09-08.
-
-    So an ignore is a default, not a rule: a directory the command reaches
-    into is captured after all. If that makes the capture exceed the size cap,
-    snapshot() returns None and the command escalates, which is the honest
-    outcome and needs no extra code.
-
-    `.demo_cli` and `.demo_cli_recovery` are NEVER returned. Un-ignoring the
-    recovery store would copy the backup into the backup, and `rm
-    .demo_cli/something` is a request to delete recovery points, not a reason
-    to duplicate them.
+    If a command targets paths inside an ignored directory (e.g. proj/.git/config),
+    that directory is included in the snapshot. Recovery directories (.demo_cli,
+    .demo_cli_recovery) are never included.
     """
     pairs, moved = _operand_context(cmd, dialect)
     segments = [seg for seg, _ in pairs]
-    # End of the line on purpose: "does this command reach into an ignored
-    # directory ANYWHERE" is a whole-line question, unlike the two callers
-    # below which care about one segment's view.
+    # Check whole-line target paths for ignored directories
     base, ok = _base_at(cmd, segments, len(segments), moved)
     if not ok:
         return frozenset()              # cannot tell where it points; do not guess
@@ -1295,35 +912,10 @@ def unignorable_dirs(cmd: str, dialect: str = POSIX) -> frozenset:
 
 
 def ignored_dirs_under(paths) -> frozenset:
-    """Ignored directory names that lie AT OR UNDER one of `paths`.
+    """Return ignored directory names that lie at or under one of target `paths`.
 
-    unignorable_dirs answers one direction - an operand INSIDE an ignored
-    directory, `rm proj/.git/config`. This answers the ANCESTOR direction,
-    which that question cannot see:
-
-        rm -rf proj        destroys proj/.git and proj/node_modules
-                           completely while naming nothing ignored at all
-
-    So the name-based set came back empty, the ignore list stayed in force,
-    and the capture was a strict SUBSET reported REVERSIBLE - 3 files of 7,
-    with no field on the entry recording the omission and `undo` exiting 0.
-    Exactly the failure unignorable_dirs was written to stop, arriving from
-    the opposite side. Measured 2026-09-17.
-
-    DELIBERATELY NOT "everything under the capture root". Several scattered
-    operands collapse to a common root they do NOT destroy -
-    `rm proj/src/a.py proj/other/c.py` resolves to `proj` - and lifting the
-    ignore there would copy .git on a two-file delete, which is the cost the
-    ignore list exists to avoid. Only a directory inside the actual blast
-    radius is lifted.
-
-    Never descends INTO an ignored directory: the NAME is the answer, not
-    the contents, and walking node_modules to discover it is node_modules
-    would cost what this is trying to bound. Stops early once every
-    candidate is found.
-
-    .demo_cli / .demo_cli_recovery are never returned, matching
-    unignorable_dirs.
+    Ensures ignored directories destroyed as descendants of target paths are
+    accounted for without unnecessary deep recursive traversals.
     """
     candidates = IGNORED_DIRS - {".demo_cli", ".demo_cli_recovery"}
     hit = set()

@@ -22,14 +22,8 @@ from . import fsmount, mountstate, render, protect as protect_mod
 from .receipts import load_all_receipts, load_receipts, iter_all_receipts
 from .version import __version__
 
-# Every host demo_cli can hook, and where each keeps its registration.
-# `nested` distinguishes the two config shapes: Claude Code and Codex wrap
-# handlers in a group ({matcher, hooks:[{type, command}]}), Cursor lists them
-# flat ({command, failClosed}).
-# `module` is the hooks submodule that owns that host's settings_snippet(), so
-# "what we would install today" is read from the installer itself rather than
-# retyped here. A retyped duplicate is how _walk_cost once measured a
-# different ignore set than the copy it was bounding.
+# Host registration table. `nested` handles grouped vs flat handlers.
+# `module` identifies the hooks submodule providing settings_snippet().
 #            label          directory   filename         event                   command                nested  module
 _HOSTS = [
     ("claude code", ".claude", "settings.json", "PreToolUse",            "demo_cli hook",        True,  "claude_code"),
@@ -168,28 +162,13 @@ def _host_hook_audit(cfg):
 
 
 def _host_hook_status(cfg):
-    """[(label, path_or_None)] - the view guarded.assess takes. One traversal
-    behind it, in _host_hook_audit.
-
-    doctor used to report a single 'claude code hook' row and look only in
-    .claude, so a machine with Codex fully wired up was told 'not installed' by
-    the one command whose job is answering 'am I protected'."""
+    """[(label, path_or_None)] - hook status view derived from _host_hook_audit."""
     return [(label, path) for label, path, _stale, _inert in _host_hook_audit(cfg)]
 
 
 def _hook_selftest(tool_name: str, command: str) -> bool:
-    """Run a harmless destructive command through the real hook entrypoint,
-    as the named tool (Bash or PowerShell), and confirm the ADAPTER turns it
-    into a real decision.
-
-    SCOPE, corrected 2026-09-17: this said it "proves the wiring end to end"
-    and "catches a Windows install where only the Bash matcher got
-    registered". It cannot. It builds its own payload and calls
-    run_pretooluse IN-PROCESS - it never opens settings.json and never
-    consults a matcher, so it passes identically whether PowerShell is
-    registered or not. The missing matcher is caught by _host_hook_audit,
-    which compares the file against settings_snippet(); this proves the
-    adapter, and the receipts row below is what proves the wiring.
+    """Run a synthetic command through the hook entrypoint in-process
+    to verify adapter decision generation for the named tool.
     """
     from .hooks.claude_code import run_pretooluse
 
@@ -217,12 +196,7 @@ def _hook_selftest(tool_name: str, command: str) -> bool:
         }
 
         output = io.StringIO()
-        # Swallow the hook's stderr. It is a real run, so it emits the loud
-        # "recovery point captured, undo with demo_cli undo <id>" banner - but
-        # the canary lives in a temp directory that is deleted immediately, so
-        # printing it would tell the user to undo something that no longer
-        # exists, and would greet anyone running `doctor` for reassurance with
-        # two alarming messages about deletions they never made.
+        # Suppress hook stderr to prevent ephemeral canary snapshot notices during check.
         with contextlib.redirect_stderr(io.StringIO()):
             run_pretooluse(io.StringIO(json.dumps(payload)), output)
 
@@ -256,19 +230,7 @@ def _any_hook_installed(cfg) -> bool:
 
 
 def _mount_checks(cfg) -> List[tuple]:
-    """Is the filesystem guard running RIGHT NOW, and can it be bypassed?
-
-    Every other doctor check is paperwork - a config exists, a hook is
-    registered, a binary is on PATH. A mount is different: it is a live
-    process, and when it stops the directory it was serving simply is not
-    there any more. Nothing else in this report would notice.
-
-    That makes a STALE record a hard fail rather than a warning. "No record"
-    means nobody started a guard, which is a choice. "Recorded but the process
-    is gone" means somebody started one, believes it is running, and is not
-    protected - the fourth appearance of installed-but-inert, and the only one
-    where the user has positive reason to think otherwise.
-    """
+    """Check active filesystem guard mount status and detect stale/missing mounts."""
     st = mountstate.status(cfg)
     # Silent on platforms that cannot mount and where nobody has tried, so the
     # report does not grow a permanently-yellow line on Linux.
@@ -279,15 +241,10 @@ def _mount_checks(cfg) -> List[tuple]:
 
     if not st.recorded:
         if not fsmount.available():
-            # Deliberately does NOT name a cause. The driver/binding lines
-            # above already did, separately and correctly; repeating a guess
-            # here is how the wrong one got printed for three weeks.
+            # WinFsp driver/binding checks above already report specific cause.
             return [("warn", "filesystem guard",
                      "not running - see the winfsp lines above for why")]
-        # Telling somebody to protect a project that is already protected
-        # reads as the tool not knowing its own state. guarded.assess makes
-        # the same distinction; this is the second copy of that message and
-        # it had already drifted.
+        # Distinguish between an unprotected project vs a protected project awaiting mount.
         protected = os.path.isdir(protect_mod.backing_for(cfg.project_root))
         return [("warn", "filesystem guard",
                  "protected but NOT RUNNING - demo_cli mount (elevated), or it "
@@ -302,15 +259,7 @@ def _mount_checks(cfg) -> List[tuple]:
                     f"recorded for {where} (pid {st.pid}) but its state cannot "
                     f"be checked from here"))
     elif st.stale:
-        # TWO VERY DIFFERENT SITUATIONS WEAR THE SAME RECORD, and calling both
-        # a failure cost a clean teardown a red FAIL on 2026-09-02.
-        #
-        #   backing still there -> the project IS protected and its guard died.
-        #                          Real, dangerous, unguarded. fail.
-        #   backing gone        -> the project was torn down and the record was
-        #                          left behind. Nothing claims protection it
-        #                          does not have; there is nothing to guard.
-        #                          Untidy, not unsafe. warn.
+        # Fail if backing directory exists (guard died while protected); warn if orphaned record.
         if os.path.isdir(protect_mod.backing_for(cfg.project_root)):
             out.append(("fail", "filesystem guard",
                         f"RECORDED BUT NOT RUNNING - pid {st.pid} is gone, so {where} "
@@ -324,20 +273,7 @@ def _mount_checks(cfg) -> List[tuple]:
     else:
         out.append(("ok", "filesystem guard", f"mounted at {where} (pid {st.pid}{age})"))
 
-    # THE BACKING LOCK IS CHECKED IN deps.py, NOT HERE.
-    #
-    # It used to be in both, and the two copies had already drifted: this one
-    # said "warn", deps says "fail", for the same fact. A doctor report that
-    # prints one label twice with two severities is worse than either verdict
-    # alone - the reader cannot tell which to believe. Observed on real
-    # hardware 2026-09-05, both lines visible in one report.
-    #
-    # deps wins the merge on coverage: it keys on the backing directory
-    # EXISTING, so it also catches a protected project whose guard has never
-    # started, whereas st.backing is only populated once a mount is recorded.
-    # It wins on severity too - the comment that used to sit here noted the
-    # bypass was demonstrated live on 2026-08-25 by an ordinary Remove-Item
-    # the guard never saw, and a demonstrated bypass is not a warning.
+    # Backing lock status is checked in deps.py.
     if not st.backing and st.running:
         out.append(("warn", "filesystem guard storage",
                     "IN MEMORY - contents are lost on unmount. "
@@ -448,9 +384,7 @@ def cmd_doctor(a) -> int:
     checks.append(("ok" if pyok else "fail", "python >= 3.9",
                    f"{sys.version_info.major}.{sys.version_info.minor}"))
     checks.append(("ok", "mode", cfg.mode))
-    # "found" is not "usable". A .demo_cli.toml written by PowerShell carries a
-    # UTF-8 BOM, fails to parse, and used to disable the guard silently while
-    # this line still reported ok because source_path was set.
+    # Verify config parsed cleanly, not merely that a file was found.
     if cfg.config_error:
         checks.append(("fail", "config parses", f"NO - {cfg.config_error}"))
     elif cfg.source_path:
@@ -469,10 +403,7 @@ def cmd_doctor(a) -> int:
         checks.append(("ok", "target rules", "none declared (heuristic detection)"))
 
     ws = cfg.workspace
-    # This check used to CREATE the workspace, parents and all. On a protected
-    # Windows project the parent is the mount point, so running doctor while
-    # the guard was down left a real directory there and the guard could never
-    # remount - the diagnostic bricking the thing it diagnosed (2026-08-29).
+    # Validate workspace path without prematurely creating mount-point directories.
     refused = config_mod.ensure_workspace(cfg)
     if refused:
         checks.append(("warn", "workspace", refused))
@@ -487,11 +418,7 @@ def cmd_doctor(a) -> int:
             writable = False
         checks.append(("ok" if writable else "fail", "workspace writable", ws))
 
-    # Prerequisites, each with the command that fixes it. Moved out to deps.py
-    # so the verdicts are pure functions testable off Windows - and so the
-    # WinFsp driver stops being conflated with the winfspy binding, which is
-    # the fourth time a diagnostic in this project has been able to name only
-    # one cause and named it wrongly.
+    # External prerequisites and dependency checks.
     checks.extend(d.as_check() for d in deps_mod.check_all(cfg.project_root))
 
     checks.extend(_hook_check_rows(cfg))
@@ -500,21 +427,14 @@ def cmd_doctor(a) -> int:
     checks.extend(_mount_checks(cfg))
     checks.extend(_egress_checks(cfg))
 
-    # THE check that actually predicts protection: is `demo_cli` resolvable on
-    # PATH? Claude Code launches the hook as a bare `demo_cli hook` command in a
-    # fresh shell; if it is not on PATH there, the hook silently never runs and
-    # the user THINKS they are protected. A registered-but-unreachable hook is
-    # worse than no hook, so this is a hard fail, not a warning.
+    # Check if demo_cli binary is on PATH for hook invocations.
     on_path = shutil.which("demo_cli")
     checks.append(("ok" if on_path else "fail", "demo_cli on PATH",
                    on_path if on_path else
                    "NOT FOUND - Claude Code will silently skip the hook. "
                    "Install with pipx or keep your venv active."))
 
-    # End-to-end self-test: feed a known destructive command through the SAME
-    # hook entrypoint Claude Code uses, once per shell tool (Bash, PowerShell),
-    # and confirm each comes back as a real decision. This proves the wiring
-    # end to end, not just that files exist.
+    # End-to-end hook self-test for each configured shell tool.
     if hook and on_path:
         for tool_name, command in _SELFTEST_PAYLOADS:
             try:
@@ -526,11 +446,7 @@ def cmd_doctor(a) -> int:
             except Exception as exc:
                 checks.append(("warn", f"hook self-test ({tool_name})", f"could not run ({exc})"))
 
-    # THE question every other check only approximates: has this guard actually
-    # run? Config, registration and PATH are all paperwork - a receipt written
-    # by an AGENT is evidence. Three separate times the failure mode has been
-    # "installed, looks fine, protecting nothing" (Codex config shape, Codex
-    # stale session, Windows BOM), and each time a receipt would have said so.
+    # Check for recorded agent receipts confirming active interception.
     has_receipts = False
     by_agent = {}
     for r in iter_all_receipts(cfg.receipts_path):

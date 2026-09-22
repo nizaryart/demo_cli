@@ -21,9 +21,6 @@ from typing import List, Optional, Tuple
 # --------------------------------------------------------------------------
 # Shell dialects
 # --------------------------------------------------------------------------
-# Defined before the rule tables because a rule may be eligible in only one of
-# them. The full dialect machinery (continuations, escapes, splitting) is
-# further down; only the names are needed here.
 POSIX = "posix"
 POWERSHELL = "powershell"
 
@@ -31,17 +28,13 @@ POWERSHELL = "powershell"
 # Rule tables
 # --------------------------------------------------------------------------
 
-# SQL statement shapes. A SQL verb is also an English word, so each demands
-# the statement's grammar, never a lone verb. Shared by the destructive table,
-# _SQL_MUTATING and is_sql_preview_candidate so they cannot drift apart.
+# SQL statement shapes shared by destructive rules, _SQL_MUTATING, and preview.
 _SQL_TRUNCATE_RX = (
-    # Bare `TRUNCATE t` only when the statement ends there: "truncate <word>"
-    # is ordinary English. Accepted miss: psql -c "TRUNCATE users", no semicolon.
+    # Match TRUNCATE TABLE or bare TRUNCATE at statement end.
     r"\bTRUNCATE\s+TABLE\b"
     r"|\bTRUNCATE\s+[\w.\"`\[\]]+\s*(?:;|$)"
 )
-# Accepted miss: MySQL's multi-table `DELETE t FROM a`. Allowing a word between
-# DELETE and FROM matches "delete files from src" in a commit message.
+# Match DELETE FROM to avoid matching ordinary prose.
 _SQL_DELETE_RX = r"\bDELETE\s+FROM\b"
 _SQL_UPDATE_RX = r"\bUPDATE\s+[\w.\"`\[\]]+\s+SET\b"
 _SQL_DDL_RX = (
@@ -52,35 +45,16 @@ _SQL_DDL_RX = (
 )
 _SQL_INSERT_RX = r"\bINSERT\s+(?:OR\s+\w+\s+)?INTO\b|\bREPLACE\s+INTO\b"
 
-# PowerShell aliases, read off `Get-Alias` on Windows PowerShell 5.1
-# (2026-09-15) rather than remembered. recovery.py imports these, so the two
-# modules cannot drift about what a command IS.
-#
-# `rm` and `mv` are absent on purpose: rm_local and mv_overwrite already catch
-# them in every dialect, and re-labelling them here would churn the rule id on
-# receipts for no gain.
-#
-# `sc` is absent on purpose too. It is Set-Content on 5.1 and sc.exe on
-# PowerShell 7, we cannot see the version, and `sc.exe /?` does not even list
-# all its own verbs - so no verb list can separate them honestly.
+# PowerShell aliases shared with recovery.py.
 PS_REMOVE_ALIASES = "ri|del|erase|rd|rmdir"
 PS_COPY_ALIASES = "cpi|copy|cp"
 PS_MOVE_ALIASES = "mi|move"
 PS_RENAME_ALIASES = "ren|rni"
 PS_NEW_ITEM_ALIASES = "ni"
 PS_CLEAR_CONTENT_ALIASES = "clc"
-# gsv (Get-Service) and sasv (Start-Service) are reads and are not here.
 PS_STOP_SERVICE_ALIASES = "spsv"
 
-# sc.exe verbs that change something. The query forms - query, queryex, qc,
-# q*, showsid, sdshow, GetDisplayName, GetKeyName, EnumDepend, QueryLock - are
-# reads and must never appear here.
-#
-# `failureflag` precedes `failure` so the longer verb is not cut short.
-#
-# Taken from `sc.exe /?` on Windows 10, with one correction: that help text
-# does not list `delete` at all, though it works. A verb list built only from
-# it would have had a hole.
+# Mutating sc.exe verbs (query operations are excluded; failureflag precedes failure).
 _SC_WRITE_VERBS = (
     "delete|config|create|sdset|failureflag|failure|privs|sidtype"
     "|description|triggerinfo|preferrednode|managedaccount|boot|stop"
@@ -92,22 +66,13 @@ _DESTRUCTIVE_RULES = [
     ("sql_truncate", "sql", _SQL_TRUNCATE_RX),
     ("sql_delete", "sql", _SQL_DELETE_RX),
     ("tf_destroy", "infra", r"\bterraform\s+destroy\b"),
-    # Any kind, not a resource list: every form removes cluster state we hold
-    # no copy of, so none deserves a different answer.
+    # Matches cluster state deletion operations.
     ("kubectl_delete", "infra", r"\bkubectl\s+delete\b"),
     ("cloud_delete", "infra", r"\b(?:aws|gcloud|az)\b[\w\s.-]*\b(?:delete|terminate|destroy|rb)\b"),
     ("railway_drop", "infra", r"railway\s+run.*production.*(?:DROP|DELETE|TRUNCATE)"),
     ("railway_vol_del", "infra", r"railway\s+volume\s+delete"),
     # ---- Service and account control -------------------------------------
-    # A service or a local account is registry + SCM state, not a file we can
-    # copy, so none of this is snapshottable - see _LOCAL_UNRECOVERABLE.
-    #
-    # `sc` needs no dialect gate here, unlike the Set-Content alias: every
-    # reading of `sc delete svc` is destructive. On 5.1 it is Set-Content
-    # writing a file called "delete"; on PowerShell 7 and cmd.exe it removes
-    # the service. The VERB is what removes the ambiguity the path form had,
-    # and `cmd /c "sc delete x"` arrives as POSIX, so gating would miss it.
-    # `sc <server>` takes \\Name before the verb.
+    # SCM and account modifications (unrecoverable state changes).
     ("service_control", "system",
      rf"\bsc(?:\.exe)?\s+(?:\\\\\S+\s+)?(?:{_SC_WRITE_VERBS})\b"),
     ("service_control", "system",
@@ -119,77 +84,30 @@ _DESTRUCTIVE_RULES = [
      r"\bnet\s+stop\b"
      r"|\bsystemctl\b[^|;&]*\s(?:stop|disable|mask|kill)\b"
      r"|\bservice\s+\S+\s+stop\b"),
-    # Blocking `net stop` while `net user victim /delete` walks through would
-    # stop the smaller thing and wave the larger one past.
+    # Account and share modifications.
     ("account_control", "system",
      r"\bnet\s+(?:user|localgroup)\b[^|;&]*\s/(?:delete|add)\b"
      r"|\bnet\s+share\b[^|;&]*\s/delete\b"
      r"|\b(?:userdel|groupdel|deluser|delgroup)\b"),
     ("git_force_push", "git", r"\bgit\s+push\b.*(?:--force|-f)\b"),
     ("git_reset_hard", "git", r"\bgit\s+reset\s+--hard\b"),
-    # rm with both recursive and force, in either flag order (-rf or -fr),
-    # bounded so it does not leak across a pipe / chain separator. Listed first
-    # so this specific, higher-signal id wins for the -rf case.
-    # NOT `docker rm -f` / `podman rm -f`. Until 2026-09-17 those matched here
-    # and nowhere else: right outcome (ESCALATE), wrong name on the receipt,
-    # and `docker rm` without -f was ALLOW. rm_local below excludes docker in
-    # twelve lines of comment; this rule never did, because it is unanchored
-    # on purpose. Safe to exclude only now that container_runtime covers it
-    # honestly - before that, the accident was the only thing stopping it.
+    # rm with recursive and force (-rf / -fr), excluding container runtimes covered elsewhere.
     ("rm_rf", "shell",
      r"(?<!docker )(?<!podman )\brm\b"
      r"(?=[^|;&]*\b-?[a-z]*r[a-z]*\b)(?=[^|;&]*\b-?[a-z]*f[a-z]*\b)[^|;&]*"),
-    # Any *top-level* rm, not only -rf. A plain `rm app.db` deletes a file just
-    # as irrecoverably from the shell's point of view, and "delete this file" is
-    # the single most common destructive thing an agent does. Anchored to the
-    # start of the segment (like the operand extractor) so subcommands such as
-    # `git rm`, `docker rm`, `npm rm` do NOT match - those are not local-file
-    # deletions and would only produce false escalations.
-    # Leading `NAME=value ` env-var assignments (a shell prefix) are allowed
-    # before rm, so `X=1 rm app.db` is caught like `rm app.db` (#006). Only
-    # assignment tokens are permitted - an arbitrary word prefix is NOT, so
-    # `git rm` / `docker rm` / `npm rm` still do not match.
+    # Top-level rm invocations (allowing leading env var assignments and sudo).
     ("rm_local", "shell", r"^\s*(?:[A-Za-z_]\w*=\S*\s+)*(?:sudo\s+)?rm\b[^|;&]*"),
-    # PowerShell recursive-force delete: Remove-Item (alias `ri`) carrying BOTH a
-    # Recurse-like flag and a Force-like flag, in any order, full or abbreviated
-    # (-Recurse/-rec/-r and -Force/-fo/-f). The two lookaheads disambiguate
-    # cleanly by requiring the recurse token to start "-r" and the force token to
-    # start "-f", so a lone `-Force` (which contains an "r") does NOT satisfy the
-    # recurse lookahead - only the real `-Recurse -Force` nuke matches. Placed
-    # before rmdir/del so this higher-signal id wins. NOT in _LOCAL_UNRECOVERABLE:
-    # recovery.py resolves its target and guard.py snapshots it when possible, so
-    # it is honestly recoverable when the target is a single, existing, in-project
-    # path (see decide.py for the still-unrecovered hard-stop).
+    # PowerShell Remove-Item with both -Recurse and -Force flags (in any order or abbreviation).
     ("ps_remove_item_rf", "shell",
      r"\bRemove-Item\b(?=[^|;&]*\s-r[a-z]*\b)(?=[^|;&]*\s-f[a-z]*\b)[^|;&]*"),
-    # Alias twin, PowerShell only. Same rule id: the receipt should not care
-    # which spelling the agent used.
+    # Alias twin, PowerShell only.
     ("ps_remove_item_rf", "shell",
      rf"\b(?:{PS_REMOVE_ALIASES})\b(?=[^|;&]*\s-r[a-z]*\b)"
      rf"(?=[^|;&]*\s-f[a-z]*\b)[^|;&]*", POWERSHELL),
-    # Any top-level Remove-Item (alias `ri`) - the PowerShell twin of rm_local.
-    # Closes the parity gap: `Remove-Item app.db` and `Remove-Item -Recurse x`
-    # (no -Force) were previously missed on Windows while `rm app.db` was caught
-    # on POSIX. Recoverable (recovery.py resolves the -Path/-LiteralPath/
-    # positional operand and snapshots it), so NOT in _LOCAL_UNRECOVERABLE.
-    # Listed AFTER ps_remove_item_rf so the -Recurse -Force nuke keeps its id.
+    # Top-level Remove-Item invocations (recoverable single file/dir targets).
     ("ps_remove_item", "shell", r"^\s*Remove-Item\b[^|;&]*"),
     # ---- PowerShell content destroyers -----------------------------------
-    # Windows had ONE rule (Remove-Item) while POSIX had a dozen. These close
-    # the parity gap. Deliberately narrow, in three ways:
-    #
-    #  * APPEND IS NOT DESTROY. Add-Content and `Out-File -Append` only add to
-    #    the end of a file, exactly like `>>` versus `>`. Add-Content is absent
-    #    from this table entirely; Out-File carries a negative lookahead.
-    #  * -Force IS THE DESTRUCTIVE PART for move/copy/rename. Without it those
-    #    cmdlets REFUSE to overwrite an existing destination, so flagging the
-    #    bare form would be a false positive. Same discipline as git -d vs -D.
-    #  * SHORT ALIASES ARE OMITTED on purpose. PowerShell aliases Set-Content to
-    #    `sc`, but `sc.exe` is the Windows Service Control tool and `sc query` is
-    #    an ordinary read - matching it would flag safe commands. `mi`/`cpi`/
-    #    `rni`/`ren` are likewise too short to match safely. Accepted trade:
-    #    an agent writing the short form is missed. A false positive that gets
-    #    the guard uninstalled costs more than a miss.
+    # Truncation and overwrite operations (-Force required for move/copy/rename; append excluded).
     ("ps_clear_content", "shell", r"^\s*Clear-Content\b[^|;&]*"),
     ("ps_clear_content", "shell",
      rf"^\s*(?:{PS_CLEAR_CONTENT_ALIASES})\b[^|;&]*", POWERSHELL),
@@ -207,72 +125,43 @@ _DESTRUCTIVE_RULES = [
     ("ps_new_item_force", "shell", r"^\s*New-Item\b(?=[^|;&]*\s-Force\b)[^|;&]*"),
     ("ps_new_item_force", "shell",
      rf"^\s*(?:{PS_NEW_ITEM_ALIASES})\b(?=[^|;&]*\s-Force\b)[^|;&]*", POWERSHELL),
-    # Whole-volume operations. No snapshot can cover these, so they hard-stop -
-    # the Windows counterpart of mkfs.
+    # Whole-volume operations (non-recoverable).
     ("ps_format_volume", "shell", r"\b(?:Format-Volume|Clear-Disk)\b"),
     ("rmdir_s", "shell", r"\brmdir\b.*\/[sS]"),
     ("del_force", "shell", r"\bdel\b.*\/[fFsS]"),
-    # del / erase / rd / rmdir are Remove-Item in PowerShell and need NO flag,
-    # while the two cmd.exe rules above require /f or /s. Placed after them so
-    # the cmd.exe hard stops keep precedence when both could match.
+    # PowerShell del/erase/rd/rmdir aliases without flags (cmd.exe rules above take precedence).
     ("ps_remove_item", "shell",
      rf"^\s*(?:{PS_REMOVE_ALIASES})\b[^|;&]*", POWERSHELL),
     ("mv_overwrite", "shell", r"\bmv\s+(?:-[a-z]*f[a-z]*\s+)?\S+\s+\S+"),
-    # A small, bounded set of other local data-destroyers a cooperative agent
-    # can run by mistake. These are LOCAL (no external blast radius): they are
-    # snapshotted when the target can be resolved, and escalated honestly when
-    # it cannot. This is deliberately NOT an attempt to enumerate every
-    # dangerous command - string-level coverage is explicitly out of scope.
+    # Local data destroyers (snapshotted when target is resolvable, escalated otherwise).
     ("fs_shred", "shell", r"\bshred\b"),
     ("fs_truncate", "shell", r"\btruncate\b[^|;&]*\s-s\b"),
     ("fs_dd_of", "shell", r"\bdd\b[^|;&]*\bof=\S+"),
-    # Filesystem format: mkfs / mkfs.<fstype> wipes an entire device. Placed with
-    # the other fs_ destroyers; marked non-recoverable below (a whole-device
-    # format cannot be honestly snapshotted).
+    # Whole-device filesystem format (non-recoverable).
     ("fs_mkfs", "shell", r"\bmkfs(?:\.\w+)?\b"),
     ("fs_find_delete", "shell", r"\bfind\b[^|;&]*\s-delete\b"),
     ("git_clean", "git", r"\bgit\s+clean\b[^|;&]*-[a-z]*d"),
-    # Destructive git that loses work / rewrites history / prunes recovery. NOT
-    # "all git" - read-only and normal-flow git (status/diff/log/add/commit/
-    # push/pull/checkout <branch>) is deliberately left alone to keep the
-    # perimeter honest and avoid flooding review. Each has no local file operand,
-    # so decide.py escalates them (no snapshot to stand behind).
+    # Destructive git actions (history rewrites, discarding uncommitted work, reflog expiry).
     ("git_worktree_remove", "git", r"\bgit\s+worktree\s+remove\b[^|;&]*(?:--force|\s-f)\b"),
-    # Only the force form is destructive; a lone -d / --delete refuses on
-    # unmerged work. Two spellings: -D, matched case-sensitively via (?-i:...)
-    # despite re.I on the table, and `--delete --force` / `-d -f` in either
-    # order, where the lookaheads are what keep the safe lone form out.
+    # Case-sensitive -D or explicit force delete (-d -f / --delete --force).
     ("git_branch_delete", "git",
      r"\bgit\s+branch\b(?:[^|;&]*\s(?-i:-\w*D\w*)\b"
      r"|(?=[^|;&]*\s(?:--delete|-d)\b)(?=[^|;&]*\s(?:--force|-f)\b)[^|;&]*)"),
     ("git_checkout_discard", "git", r"\bgit\s+checkout\b[^|;&]*?(?:\s--\s|\s\.(?:\s|$))"),
     ("git_restore", "git", r"\bgit\s+restore\b"),
     ("git_stash_drop", "git", r"\bgit\s+stash\s+(?:drop|clear)\b"),
-    # `git stash pop` applies then drops the stash; a conflict during apply can
-    # leave the working tree mangled and the stash consumed. Real incident
-    # (raw-data #009b). `git stash apply` is left alone - it keeps the stash.
+    # Stash drop/pop operations that consume stashes.
     ("git_stash_pop", "git", r"\bgit\s+stash\s+pop\b"),
     ("git_reflog_expire", "git", r"\bgit\s+reflog\s+expire\b"),
     ("git_gc_prune", "git", r"\bgit\s+gc\b[^|;&]*--prune=\S+"),
     ("git_filter_branch", "git", r"\bgit\s+filter-(?:branch|repo)\b"),
     ("git_update_ref_delete", "git", r"\bgit\s+update-ref\s+-d\b"),
 ]
-# A rule may carry a FOURTH element: the dialect it is eligible in. Absent
-# means every dialect, which is all but the short PowerShell aliases.
-#
-# Only the aliases are gated. A full cmdlet name is unambiguous in any shell,
-# so gating it would buy nothing and would cost a miss whenever an adapter's
-# dialect guess is wrong.
+# Optional 4th tuple element gates eligibility to a specific shell dialect (e.g. POWERSHELL).
 _DESTRUCTIVE = [(r[0], r[1], re.compile(r[2], re.I | re.S),
                  r[3] if len(r) > 3 else None) for r in _DESTRUCTIVE_RULES]
 
-# Destructive rules whose blast radius is EXTERNAL / remote. A local snapshot
-# can never truthfully cover them, so they are treated as non-recoverable
-# surfaces and escalated regardless of the local environment label. (Trou 1:
-# without this, a force-push or terraform destroy in a project whose env
-# resolves to "development" would be allowed unattended.)
-# Local destructive rules (rm/mv/reset --hard/shred/...) are intentionally NOT
-# here - those are recoverable by a local snapshot.
+# Destructive rules with remote/external blast radius that cannot be covered by local snapshots.
 _EXTERNAL_IRREVERSIBLE = {
     "tf_destroy": "infra_destroy",
     "kubectl_delete": "cluster_resource_delete",
@@ -282,27 +171,7 @@ _EXTERNAL_IRREVERSIBLE = {
     "git_force_push": "remote_vcs_history",
 }
 
-# Local destructive commands this tool cannot honestly make reversible as built.
-# `rmdir /s` and `del /s|/f` remove a whole tree with no recycle bin, and the
-# operand extractor does not resolve their target, so no recovery point is ever
-# captured. Left unmarked they would be treated as ordinary local deletes -
-# exactly the case an agent hits in a dev/test/staging workspace. Marking them
-# as a non-recoverable surface makes the decision engine escalate them in EVERY
-# environment with an honest reason and the structural-approval override: a real
-# hard-stop, matching what we state publicly. A human structural-approval token
-# remains the one legitimate
-# override (an agent cannot forge it), consistent with the external
-# non-recoverable surfaces above.
-#
-# `Remove-Item -Recurse -Force` (ps_remove_item_rf) is deliberately NOT here.
-# recovery.py now extracts its target (a single -Path/-LiteralPath/positional
-# operand) and guard.py snapshots it when it exists inside the project root, so
-# it can be honestly recoverable. This module has no filesystem access (it only
-# describes the command), so it cannot know in advance whether that snapshot
-# will succeed - decide.py is where the still-unrecovered case (missing,
-# ambiguous, multi-drive, or out-of-root target) escalates as a hard-stop in
-# every environment, since an unrecoverable mutation is never waved through on
-# the strength of an environment label.
+# Local destructive commands that cannot be reliably snapshotted (escalated across all environments).
 _LOCAL_UNRECOVERABLE = {
     "service_control": "service_control",
     "account_control": "account_control",
@@ -312,35 +181,22 @@ _LOCAL_UNRECOVERABLE = {
     "ps_format_volume": "disk_format",
 }
 
-# Opaque remote execution: code is fetched and run in one step. It cannot be
-# previewed or snapshotted because the payload is not known before it runs.
+# Opaque remote execution (payload unknown before execution).
 _REMOTE_EXEC = re.compile(
     r"(?:curl|wget|fetch)\b[^|]*\|\s*(?:sudo\s+)?(?:bash|sh|zsh|python\d?|node|ruby|perl)\b"
     r"|base64\s+-d[^|]*\|\s*(?:bash|sh)\b"
     r"|\beval\b"
     r"|\|\s*(?:bash|sh)\s+-c\b"
-    # Opaque dynamic execution via a one-liner interpreter call. We do NOT try
-    # to defeat obfuscation (that arms race is out of scope); we only recognise
-    # that a `python -c` carrying os.system/eval/exec/__import__/subprocess/pty
-    # cannot be previewed, exactly like curl|bash, and therefore must escalate.
+    # Dynamic one-liner interpreter execution that cannot be pre-inspected.
     r"|\bpython\d?\s+-c\b[^|]*(?:os\.system|os\.popen|subprocess|__import__|\beval\b|\bexec\b|pty\.spawn|commands\.get)",
     re.I,
 )
 
 # Tools that mutate files indirectly (formatters, generators, package managers).
-# They rarely look destructive, but they rewrite the working tree - snapshot the
-# path first so the change is visible and reversible.
 _FILE_WRITERS = re.compile(
     r"\bprettier\b[^|;&]*--write"
     r"|\beslint\b[^|;&]*--fix"
-    # A CHECK IS NOT A WRITE. black, isort and rustfmt write by default;
-    # --check / --diff make them read-only, and treating those as mutating
-    # both over-blocked (no target resolved -> ESCALATE) and, once the
-    # operand extractor learned these verbs, snapshotted a file that was
-    # never going to change. gofmt is the other way round - it prints to
-    # stdout unless -w is given - so it needs the flag rather than lacking
-    # one. Measured 2026-09-17 via `black --check app.py`, which came back
-    # REVERSIBLE with a real snapshot of an unmodified file.
+    # Formatters write by default unless --check/--diff is present (gofmt requires -w).
     r"|\b(?:black|isort|rustfmt)\b(?![^|;&]*\s--?(?:check|diff))"
     r"|\bgofmt\b[^|;&]*\s-w\b"
     r"|\b(?:npm|yarn|pnpm)\s+(?:install|add|remove|i)\b"
@@ -349,24 +205,8 @@ _FILE_WRITERS = re.compile(
     re.I,
 )
 
-# Surfaces a local snapshot cannot truthfully cover. A mutation here is NOT
-# made "reversible" by copying a file - it must be escalated honestly (P2).
-# (label, pattern)
-# The shell prefix that can legally sit before a command word: leading
-# NAME=value assignments and sudo. The three new rules at the end of this
-# list are ANCHORED with it, which is the whole reason they are safe.
-# Unanchored, `\bdocker\s+rm\b` escalates
-# `git commit -m 'docker rm cleanup script'` and `\bnpm\s+unpublish\b`
-# escalates `rg 'npm unpublish' docs/` - the same accident as the SQL word
-# list, which escalated 21 of 61 ordinary commands on 09-14.
-#
-# Stated misses this buys: `docker exec redis redis-cli FLUSHALL` and
-# `ssh host docker rm x`. A wrapper word before the verb defeats the anchor,
-# and that is the trade for not firing on prose.
-#
-# rm_local and recovery._RM_RE spell this same prefix out independently; not
-# unified here because rm_local is the most load-bearing regex in the table
-# and this change has no reason to touch it.
+# Non-recoverable external surfaces (escalated; snapshots cannot cover).
+# Permitted command prefix: leading NAME=value environment assignments and optional sudo.
 _CMD_PREFIX = r"^\s*(?:[A-Za-z_]\w*=\S*\s+)*(?:sudo\s+)?"
 
 _NONRECOVERABLE_SURFACES = [
@@ -376,8 +216,7 @@ _NONRECOVERABLE_SURFACES = [
                          r"|hooks\.slack\.com|chat\.postMessage"),
     ("vcs_remote_state", r"\b(gh|hub)\s+(pr|issue|release)\s+(close|merge|delete|create)\b"
                          r"|\bgh\s+repo\s+delete\b|\bgh\s+api\b[^|;&]*-X\s*(?:DELETE|PUT)\b"),
-    # Generic twin of the `gh api -X DELETE` clause above. POST is deliberately
-    # absent: it is the verb of logins and form submissions, not of destruction.
+    # HTTP mutating requests (DELETE/PUT/PATCH).
     ("http_api_write", r"\b(?:curl|wget|xh|http(?:ie)?)\b[^|;&]*"
                        r"\s(?:-X\s*|--request[= ])(?:DELETE|PUT|PATCH)\b"),
     ("credential_rotation", r"\brotat(?:e|ing)\b[^|;&]*\b(key|secret|credential|token)\b"
@@ -388,9 +227,7 @@ _NONRECOVERABLE_SURFACES = [
     ("remote_filesystem", r"\bssh\b[^|;&]*\brm\b|\brsync\b[^|;&]*--delete\b"),
     ("schema_migration", r"\b(alembic|flyway|liquibase|prisma\s+migrate|knex\s+migrate|sequelize\s+db:migrate)\b"
                          r"|\brails\s+db:migrate\b|\bmanage\.py\s+migrate\b"),
-    # Content / deploy SaaS CLIs (Approach A) - the always-on string-layer twin of
-    # the egress guard. Narrow, DESTRUCTIVE-SUBCOMMAND-ONLY (like git -d/-D): never
-    # the whole tool, never the read/preview forms. External -> escalate.
+    # Content / deploy SaaS CLIs (destructive subcommands only).
     ("saas_deploy", r"\bshopify\s+theme\s+(?:push|delete)\b"
                     r"|\bvercel\s+(?:remove|rm)\b|\bvercel\b[^|;&]*--prod\b"
                     r"|\bnetlify\s+deploy\b[^|;&]*--prod\b|\bnetlify\s+sites:delete\b"
@@ -402,63 +239,30 @@ _NONRECOVERABLE_SURFACES = [
                      r"|\bsupabase\s+db\s+reset\b"
                      r"|\bfly(?:ctl)?\s+(?:apps\s+destroy|destroy)\b"),
 
-    # Measured 2026-09-17: 18 of 19 destructive forms below were ALLOW -
-    # nothing captured and nothing claimed, which is the bottom of the ladder
-    # but still a command that destroys data the tool never mentions.
-    #
-    # SURFACES, not plain destructive rules, and the reason is decide.py: step
-    # 3 honours a structural approval token and step 6 never checks one. A
-    # legitimate `docker volume rm` has no path at all as a plain rule. Same
-    # inversion as the service/account rules on 09-16.
-    #
-    # A container layer, a flushed keyspace and an unpublished version all sit
-    # outside the project tree, so no local snapshot could cover any of them
-    # however hard we tried - which is what makes them surfaces honestly.
+    # Container runtime destruction (volumes, images, containers, networks).
     ("container_runtime",
      _CMD_PREFIX + r"(?:docker|podman)(?:-compose)?\s+(?:"
-     # `rm` destroys the container's writable layer whether or not -f is
-     # given; -f only kills it first. rmi destroys the image.
      r"(?:rm|rmi)\b"
      r"|(?:volume|image|container|network|system|builder)\s+(?:rm|prune)\b"
-     # `down` alone removes containers and networks; only the -v form takes
-     # named volumes, which is the line worth drawing.
      r"|(?:compose\s+)?down\b[^|;&]*\s--?v(?:olumes)?\b"
      r")"),
 
-    # FLUSHALL/FLUSHDB discard the keyspace. Whether the instance is local or
-    # remote is unknowable here, and we hold no copy either way.
+    # Datastore flush operations.
     ("datastore_flush", _CMD_PREFIX + r"redis-cli\b[^|;&]*\bflush(?:all|db)\b"),
 
-    # Registry removal. npm forbids re-publishing the same version, so this is
-    # irreversible by policy rather than by physics. cargo/gem yank are the
-    # same act elsewhere - listing only npm would be the kubectl-delete
-    # mistake of 09-16, an enumeration that looks complete and is not.
+    # Package registry removal (irreversible policy).
     ("package_registry",
      _CMD_PREFIX + r"(?:(?:npm|pnpm|yarn)\s+unpublish\b|cargo\s+yank\b|gem\s+yank\b)"),
 ]
 _NONRECOVERABLE = [(label, re.compile(rx, re.I)) for label, rx in _NONRECOVERABLE_SURFACES]
 
-# The writers that rewrite the file they are POINTED AT. A subset of
-# _FILE_WRITERS, and the distinction is the whole finding: that rule's
-# comment promises "snapshot the path first so the change is visible and
-# reversible", and for a third of the tools it covers there is no path in the
-# text at all. npm/yarn/pnpm/pip/npx name none - they rewrite node_modules or
-# site-packages - so nothing can be extracted for them and they keep
-# escalating (Nizar's call, 2026-09-17: fail-closed is the honest answer and
-# `checkpoint` stays the opt-in way to cover them).
-#
-# Shared with recovery.py rather than retyped there. The classifier says
-# "this mutates" and the extractor says "this is what it touches"; if the two
-# disagree about WHICH commands, one looks for a path in text the other never
-# flagged. Same lesson as the _SQL_*_RX constants on 09-15.
+# Writers that modify the explicit path operand they target (shared with recovery.py).
 FILE_WRITER_TARGET_VERBS = ("prettier", "eslint", "black", "isort",
                             "gofmt", "rustfmt")
 
 _SQL_READ = re.compile(r"^\s*SELECT\b", re.I)
 
-# Was a bare word list searched anywhere in the command, while _SQL_READ above
-# is anchored. 21 of 61 ordinary commands escalated on it; see
-# tests/test_sql_verb_is_not_sql.py.
+# Mutating SQL statements matching statement grammar.
 _SQL_MUTATING = re.compile(
     f"{_SQL_DELETE_RX}|{_SQL_INSERT_RX}|{_SQL_UPDATE_RX}"
     f"|(?:{_SQL_TRUNCATE_RX})|{_SQL_DDL_RX}",
@@ -476,15 +280,7 @@ _SQL_TRUNCATE = re.compile(_SQL_TRUNCATE_RX, re.I)
 # --------------------------------------------------------------------------
 # Shell dialects
 # --------------------------------------------------------------------------
-#
-# bash and PowerShell agree that a command can continue on the next line, and
-# disagree on how to write it. The character is not interchangeable: a trailing
-# backtick in bash opens a command substitution, and a trailing backslash in
-# PowerShell is a literal backslash ending the command. Joining on the wrong one
-# would MERGE two separate commands, which can stop an anchored rule such as
-# rm_local (`^\s*rm`) from matching - a silent miss, the worst outcome. So the
-# caller states which shell the text came from; this module never guesses.
-# POSIX / POWERSHELL are defined at the top of the file, above the rule tables.
+# Line continuation characters per dialect (backslash for POSIX, backtick for PowerShell).
 _CONTINUATION = {POSIX: "\\", POWERSHELL: "`"}
 
 
@@ -492,28 +288,9 @@ _PS_ESCAPE_SEQUENCES = "nrt0abfv"       # only meaningful inside "double quotes"
 
 
 def strip_ps_escapes(cmd: str) -> str:
-    """Remove PowerShell backticks that mean nothing but "the next character".
-
+    """Remove PowerShell backtick character-escapes outside double quotes:
         Remo`ve-Item x   ->   Remove-Item x
-
-    THE MOST LIKELY REAL BYPASS OF THE POWERSHELL RULES, measured 2026-08-26.
-    A backtick before an ordinary character is PowerShell's escape for that
-    character - so the two strings above are the same command, and only the
-    second matched any rule.
-
-    Mechanical, like base64 decoding and unlike everything else in this
-    family: PowerShell's own grammar says what the backtick means, so removing
-    it is reading, not evaluating. `&('Remove-Item')` and `iex "..."` are NOT
-    in the same category - resolving those means evaluating an expression,
-    which a pre-execution guard must never do. They stay behind the frontier
-    and belong to the behavioural layer.
-
-    QUOTE STATE, not a lookahead. The first attempt excluded the escape
-    sequences (`n `r `t `0 `a `b `f `v) wherever they appeared - and missed
-    `Remo`ve-Item`, because `v is in that list. Those sequences only mean
-    anything INSIDE A DOUBLE-QUOTED STRING; in a bare command name a backtick
-    is just "the next character, literally". Inside single quotes PowerShell
-    does no escaping at all, so backticks there are left alone.
+    Preserves recognized escape sequences (`n, `t, etc.) inside double quotes.
     """
     out: List[str] = []
     in_single = in_double = False
@@ -540,21 +317,8 @@ def strip_ps_escapes(cmd: str) -> str:
 
 
 def join_continuations(cmd: str, dialect: str = POSIX) -> str:
-    """Fold a multi-line command back into one line.
-
-        bash            rm -rf \\        PowerShell     Remove-Item `
-                          /tmp/build                        -Recurse C:\\build
-
-    Both are ONE command. Without this, split_segments treats the newline as a
-    separator, cuts the command in two, and the operand extractor loses the path
-    that lives on the second line - so nothing is snapshotted. Present in bash
-    today, not only in PowerShell.
-
-    Idempotent: joining an already-joined string changes nothing.
-
-    Windows line endings are normalised first. Without that, the look-ahead
-    below meets the CR of a CRLF pair, decides this is not end-of-line, and the
-    whole fix silently does nothing on the one platform it was written for.
+    """Fold a multi-line command back into a single line across line continuations
+    (\\ for POSIX, ` for PowerShell). Normalizes CRLF to LF.
     """
     cmd = cmd.replace("\r\n", "\n")
     ch = _CONTINUATION.get(dialect, "\\")
@@ -563,8 +327,7 @@ def join_continuations(cmd: str, dialect: str = POSIX) -> str:
     while i < n:
         c = cmd[i]
         if c == ch:
-            # A continuation only counts at end of line: skip trailing blanks
-            # and require a newline immediately after.
+            # Continuation at end of line: skip blanks, require newline.
             j = i + 1
             while j < n and cmd[j] in " \t":
                 j += 1
@@ -579,38 +342,15 @@ def join_continuations(cmd: str, dialect: str = POSIX) -> str:
 
 # --------------------------------------------------------------------------
 # Same-line variable substitution
-#
-# The guard reads the TEXT of a command; it never runs it. So whenever the path
-# is not literally in the text, the target cannot be resolved and the action
-# escalates. Measured on 2026-08-24, four shapes cause that:
-#
-#     rm $(cat list.txt)        the shell would run `cat` to find out. We must
-#                               not, so this stays unresolvable - permanently.
-#     python cleanup.py         the paths are inside another file.
-#     rm $TARGET                set in an earlier, separate command. On Linux
-#                               the agent's bash session persists, so the value
-#                               exists somewhere we cannot reach from the hook
-#                               process. On Windows it does not even exist:
-#                               Claude Code spawns a fresh `powershell
-#                               -NoProfile` per tool call, so nothing survives.
-#     T=notes.txt; rm $T        THE ASSIGNMENT AND THE USE ARE IN THE SAME
-#                               STRING. Nothing has to be executed, guessed, or
-#                               asked for. This one is simply readable, and
-#                               this function reads it.
-#
-# Only the last shape is handled here, deliberately. Globs and brace expansion
-# are already resolved in recovery._path_operands; the first three cannot be
-# resolved by any pre-execution guard and continue to escalate.
+# Resolves in-line variable assignments within the same command string.
 # --------------------------------------------------------------------------
 
-# NAME=value, optionally exported, at the start of the line or after a
-# separator. The value is a quoted string or a run of unremarkable characters.
+# NAME=value assignment (optionally exported) at line start or after separator.
 _POSIX_ASSIGN = re.compile(
     r"""(?:^|(?<=[;&|]))\s*(?:export\s+)?
         ([A-Za-z_]\w*)=("[^"]*"|'[^']*'|[^\s;&|<>]*)""",
     re.VERBOSE)
-# $name = value. `env:` is included because that is the form an agent actually
-# uses on Windows ($env:TARGET = "x"), observed live.
+# PowerShell $name = value assignment (including $env:).
 _PS_ASSIGN = re.compile(
     r"""(?:^|(?<=[;|]))\s*
         \$((?:env:)?[A-Za-z_]\w*)\s*=\s*("[^"]*"|'[^']*'|[^\s;|<>]+)""",
@@ -622,41 +362,12 @@ _PS_REF = re.compile(r"\$\{((?:env:)?[A-Za-z_]\w*)\}|\$((?:env:)?[A-Za-z_]\w*)")
 _ASSIGN = {POSIX: _POSIX_ASSIGN, POWERSHELL: _PS_ASSIGN}
 _REF = {POSIX: _POSIX_REF, POWERSHELL: _PS_REF}
 
-# A value we refuse to substitute. Every character here can change the SHAPE of
-# the command rather than merely filling in a word:
-#
-#   $ and `   the value is itself unresolved, or contains a command
-#             substitution. Substituting would turn "I cannot tell" into
-#             something that LOOKS resolved. That is the exact lie this
-#             project exists to prevent.
-#   ; & |     one command would silently become two, and the classifier would
-#             then judge a command line that was never written.
-#   < > \n    redirection and line structure, same reasoning.
-#
-# When a value is refused the name is simply left unknown, which leaves its
-# references unresolved, which makes the whole substitution fail closed below.
+# Disallow substitution values containing command substitutions, operators, or redirects.
 _UNSAFE_VALUE = re.compile(r"[$`;&|<>\n]")
 
 
 def _assignment_survives(cmd: str, end: int) -> bool:
-    """False when the assignment runs in a subshell and its value never
-    reaches the command that uses it.
-
-        T=a | tee x ; rm $T      the assignment is one stage of a PIPELINE,
-        T=a & b      ; rm $T     and backgrounding forks - both run it in a
-                                 subshell, so the parent's T is never set.
-                                 Substituting would name a file the shell
-                                 never touched, and report a snapshot of it.
-
-        T=a && rm $T             `&&` and `||` are sequencing, not forking.
-        T=a || rm $T             The value survives. So does `T=a > out`.
-        T=a ;  rm $T
-
-    An unquoted value cannot CONTAIN these characters - the value pattern
-    stops before them - so `_UNSAFE_VALUE` never sees them and this check is
-    the only thing standing between the two cases. Doubled operators are
-    sequencing; single ones fork.
-    """
+    """Return False if the assignment was piped or backgrounded in a subshell."""
     rest = cmd[end:].lstrip(" \t")
     if rest.startswith("&&") or rest.startswith("||"):
         return True
@@ -664,35 +375,14 @@ def _assignment_survives(cmd: str, end: int) -> bool:
 
 
 def substitute_assignments(cmd: str, dialect: str = POSIX) -> str:
-    """Resolve variables assigned earlier in the SAME command string.
-
-        T=notes.txt; rm $T              ->  T=notes.txt; rm notes.txt
-        $t = "notes.txt"; rm $t         ->  $t = "notes.txt"; rm notes.txt
-
-    Returns the command UNCHANGED unless every variable reference in it could
-    be resolved. That is the honesty rule for this function, and it is the
-    whole reason it is safe to use:
-
-        rm $T $OTHER      with only T known
-
-    Substituting T alone yields `rm notes.txt $OTHER`, where $OTHER is now an
-    ordinary-looking operand that happens not to exist. Two operands collapse
-    to their common directory, and the guard would consider snapshotting a
-    directory for a command it still cannot read. Partial knowledge presented
-    as complete is worse than admitted ignorance, so a single unresolved
-    reference discards the whole substitution and the action escalates exactly
-    as it does today.
-
-    Nothing is executed. Values are read out of the string itself.
+    """Resolve variables assigned earlier in the same command string.
+    Returns the command unchanged unless all variable references resolve cleanly.
     """
     assign_re, ref_re = _ASSIGN.get(dialect), _REF.get(dialect)
     if not assign_re or "$" not in cmd:
         return cmd
 
-    # Where each name was last assigned, and the spans of the assignments
-    # themselves. A PowerShell assignment's left side ($t = ...) matches the
-    # reference pattern too, so those spans have to be skipped or the target
-    # of the assignment would be substituted with its own value.
+    # Track assignments and skip left-hand assignment spans during substitution.
     values: List[tuple] = []          # (position, name, value)
     skip: List[tuple] = []            # (start, end) of assignment left-hand sides
     for m in assign_re.finditer(cmd):
@@ -715,8 +405,7 @@ def substitute_assignments(cmd: str, dialect: str = POSIX) -> str:
         if any(a <= m.start() < b for a, b in skip):
             return m.group(0)         # this IS an assignment target
         name = m.group(1) or m.group(2)
-        # The value in force HERE: the last assignment to this name that
-        # appears before this reference. Later assignments have not run yet.
+        # Most recent assignment preceding this reference.
         latest = [v for pos, n, v in values if n == name and pos < m.start()]
         if not latest:
             resolved_all = False
@@ -729,54 +418,19 @@ def substitute_assignments(cmd: str, dialect: str = POSIX) -> str:
 
 # --------------------------------------------------------------------------
 # Nested shells
-#
-# Observed live on Windows, 2026-08-26. Claude Code's Bash tool is GIT BASH,
-# not PowerShell - `pwd` returns /c/Users/... - so the seven PowerShell rules
-# looked like the wrong investment. They were not; they were never being
-# HANDED the right string. Asked to use Remove-Item, the agent ran:
-#
-#     Bash(powershell.exe -Command "Remove-Item test.txt")
-#
-# _PS_REMOVE_RE is anchored at the start, the command starts with
-# `powershell.exe`, and seven correct rules sat dormant while the delete went
-# through. The filesystem guard caught it; the string layer never saw it.
-#
-# Third time the same shape: the rules were right and the plumbing never asked
-# them (see also `mv` missing from the shell-guard pre-filter, and dispatch
-# running on the line instead of the segment).
-#
-# WHAT THIS CANNOT DO, stated plainly: unwrapping is string work, so it
-# inherits the string layer's frontier. `powershell -c "R''emove-Item x"`
-# defeats it, and always will - obfuscation is the behavioural layer's job.
-# -EncodedCommand is the exception worth handling, because base64 is DECODED,
-# not evaluated: no execution, no guessing.
+# Unwraps subshell commands (e.g. bash -c, powershell -Command, cmd /c).
 # --------------------------------------------------------------------------
 
 _POWERSHELL_EXE = re.compile(r"^\s*(?:[\w:.\\/ ()-]*[\\/])?(?:powershell|pwsh)(?:\.exe)?\b",
                              re.I)
 _CMD_EXE = re.compile(r"^\s*(?:[\w:.\\/ ()-]*[\\/])?cmd(?:\.exe)?\s+/[ck]\b", re.I)
-# POSIX shells cluster short flags, so `-lc` is `-l -c` and `-ilc` is
-# `-i -l -c`. Demanding a bare `-c` here meant `bash -lc "rm app.db"` was never
-# unwrapped, and every ANCHORED rule (rm_local, ps_remove_item, the ps_* set)
-# then saw a segment beginning with "bash" and did not fire - a silent pass,
-# not the lost snapshot the notes recorded. `-lc` is the form agent shell tools
-# actually emit.
-#
-# `c` may sit ANYWHERE in the cluster. Measured, not reasoned: -c, -lc, -cl,
-# -clx, -cil and a repeated `-c -c` all run the script. An earlier draft
-# required c last and called `-cl` an accepted miss; running it showed it is a
-# real one.
-#
-# Uppercase is tolerated in the leading flags (-C is noclobber) but the cluster
-# still needs a LOWERCASE c, since -C is not -c.
+# Matches POSIX shells launching commands via clustered -c flags (-c, -lc, -cl, etc.).
 _POSIX_SH = re.compile(
     r"^\s*(?:[\w./-]*/)?(?:bash|sh|dash|zsh)"
     r"(?:\s+(?:--[\w-]+|-[A-Za-z]+))*"
     r"\s+-[A-Za-z]*c[A-Za-z]*\b")
 
-# PowerShell accepts abbreviations: -Command, -Comm, -c. Same for
-# -EncodedCommand / -enc / -e. Matching the documented prefixes rather than the
-# full words, because the short forms are what people actually type.
+# PowerShell -Command and -EncodedCommand prefix abbreviations.
 _PS_COMMAND_FLAG = re.compile(r"^-(?:c|co|com|comm|comma|comman|command)$", re.I)
 _PS_ENCODED_FLAG = re.compile(r"^-(?:e|en|enc|enco|encod|encode|encoded|"
                               r"encodedcommand)$", re.I)
@@ -791,47 +445,17 @@ def _strip_quotes(s: str) -> str:
     return s
 
 
-# A redirection ENDS the payload. In `-Command "Remove-Item x" 2>&1` the quoted
-# script is what the nested shell runs; the `2>&1` is the OUTER shell deciding
-# where that script's output goes. It was never part of the nested command.
+# Redirection tokens terminating nested command payload.
 _REDIRECTION_TOKEN = re.compile(r"^\d*(?:>>|>|<)")
 
 
 def _payload_tokens(toks: List[str]) -> str:
-    """The script a `-c` / `-Command` flag carries, and nothing else.
-
-    Two shapes, and confusing them was the bug:
-
-        quoted   -c "rm -rf x" 2>&1   -> the ONE quoted token is the script
-        bare     -c rm -rf x   2>&1   -> tokens up to the first redirection
-
-    WHAT WENT WRONG (2026-09-02, found by an agent on the labubu lab project).
-    This used to be `" ".join(toks)`, so a trailing redirection was joined into
-    the payload:
-
-        "Remove-Item -Force notes.txt" 2>&1
-
-    `_strip_quotes` only strips when the WHOLE string is a matching pair, and
-    this is not one - so the quotes stayed on, the payload began with a `"`
-    character, and every rule anchored `^\\s*Remove-Item` silently stopped
-    matching. Unanchored rules (rm_rf, ps_remove_item_rf) still fired but lost
-    their operand, degrading a clean snapshot into an ESCALATE; anchored rules
-    did not fire at all, which is a SILENT PASS. Both `bash -c` and `cmd /c`
-    had it too, so this was never Windows-only.
-
-    -EncodedCommand was the one branch immune to it, because it already took
-    exactly one token. That is the shape; this makes the other three match it.
-    """
+    """Extract script payload from -c / -Command arguments up to output redirection."""
     if not toks:
         return ""
     first = toks[0]
     quoted = len(first) >= 2 and first[0] in "\"'" and first[-1] == first[0]
-    # The quoted token is the whole script ONLY if nothing but a redirection
-    # follows it. `bash -c "a -c "b -c "..." is degenerate quoting, not a
-    # script plus a redirection, and taking the first token there would throw
-    # the payload away - it is how `'bash -c "' * 12` lost its innermost
-    # `rm x`. Fall through to the join, which peels one level per recursion
-    # exactly as this did before the fix.
+    # Handle single quoted script token or fall through to concatenate tokens.
     if quoted and (len(toks) == 1 or _REDIRECTION_TOKEN.match(toks[1])):
         return _strip_quotes(first)
     out = []
@@ -843,8 +467,7 @@ def _payload_tokens(toks: List[str]) -> str:
 
 
 def _decode_encoded(payload: str) -> Optional[str]:
-    """PowerShell's -EncodedCommand is base64 UTF-16LE. Decoding is not
-    evaluating - nothing runs, so this is safe for a pre-execution guard."""
+    """Decode PowerShell -EncodedCommand base64 UTF-16LE / UTF-8 payload."""
     import base64
     try:
         raw = base64.b64decode(payload.strip(), validate=True)
@@ -861,12 +484,7 @@ def _decode_encoded(payload: str) -> Optional[str]:
 
 
 def unwrap_nested(cmd: str) -> Optional[Tuple[str, str]]:
-    """One level of `<shell> -c <payload>`, or None.
-
-    Returns (payload, dialect_of_payload). The dialect is the point: a
-    PowerShell payload has to be judged by the PowerShell rules and split with
-    PowerShell quoting, whichever shell was holding it.
-    """
+    """Unwrap one level of `<shell> -c <payload>`, returning (payload, dialect) or None."""
     if _POWERSHELL_EXE.match(cmd):
         try:
             toks = shlex.split(cmd, posix=False)
@@ -882,9 +500,7 @@ def unwrap_nested(cmd: str) -> Optional[Tuple[str, str]]:
 
     m = _CMD_EXE.match(cmd)
     if m:
-        # cmd.exe's own verbs are closest to POSIX for splitting purposes; the
-        # dialect only decides quoting and continuation, and cmd uses neither
-        # PowerShell's backtick nor a distinct grammar we model.
+        # cmd.exe commands use POSIX splitting semantics.
         return _tokenised_payload(cmd[m.end():]), POSIX
 
     m = _POSIX_SH.match(cmd)
@@ -894,12 +510,7 @@ def unwrap_nested(cmd: str) -> Optional[Tuple[str, str]]:
 
 
 def _tokenised_payload(rest: str) -> str:
-    """`_payload_tokens` for the branches that carry raw text, not tokens.
-
-    Falls back to the old whole-string strip when shlex cannot tokenise -
-    an unbalanced quote must not make a command LESS visible than it was
-    before this function existed.
-    """
+    """Extract payload tokens, falling back to stripping quotes on tokenization error."""
     try:
         return _payload_tokens(shlex.split(rest, posix=False))
     except ValueError:
@@ -907,16 +518,7 @@ def _tokenised_payload(rest: str) -> str:
 
 
 def effective_command(cmd: str, dialect: str = POSIX) -> Tuple[str, str]:
-    """The command actually being run, and the dialect to judge it in.
-
-    Used by BOTH classify_pipeline and recovery.extract_path_operand. They
-    must agree on what the command IS, or one decides a rename is destructive
-    while the other looks for the operand in different text - the failure the
-    shared `redirect_target` already exists to prevent.
-
-    A wrapper with no recognisable payload is returned unchanged, so nothing
-    that is not a nested shell is disturbed.
-    """
+    """Return the innermost unwrapped command and its effective dialect."""
     for _ in range(_MAX_NESTING):
         nested = unwrap_nested(cmd)
         if not nested or not nested[0].strip():
@@ -927,27 +529,7 @@ def effective_command(cmd: str, dialect: str = POSIX) -> Tuple[str, str]:
 
 def effective_segments(cmd: str, dialect: str = POSIX,
                        substitute: bool = False) -> List[Tuple[str, str]]:
-    """Every command that will actually run, each with the dialect to judge it in.
-
-    SPLITTING AND UNWRAPPING ARE MUTUALLY RECURSIVE, and the order was the bug.
-    Both callers used to unwrap the whole LINE first and split afterwards, so
-
-        echo hi; powershell -Command "Remove-Item x"
-
-    found no wrapper - the line starts with `echo` - and the nested
-    Remove-Item was never judged at all. An agent hit this by accident on
-    2026-09-02 and reported the guard as missing the deletion entirely.
-
-    Split first, unwrap each segment, then split the payload it yields, down
-    to `_MAX_NESTING`. `substitute` is for recovery only: `T=notes.txt; rm $T`
-    names its target in a sibling segment, so the substitution has to happen
-    at each level BEFORE that level is split.
-
-    Used by classify_pipeline AND recovery.extract_path_operand, which is the
-    whole point - the two must agree on what the command IS, or one calls a
-    deletion destructive while the other looks for its target in text that no
-    longer describes the action.
-    """
+    """Recursively split and unwrap nested command segments with their effective dialects."""
     return _effective_segments(cmd, dialect, substitute, 0)
 
 
@@ -955,8 +537,7 @@ def _effective_segments(cmd: str, dialect: str, substitute: bool,
                         depth: int) -> List[Tuple[str, str]]:
     cmd = join_continuations(cmd, dialect)
     if dialect == POWERSHELL:
-        # After continuations, so an end-of-line backtick has already been
-        # consumed as one. What is left means "the literal next character".
+        # Strip character escapes after continuations have been folded.
         cmd = strip_ps_escapes(cmd)
     if substitute:
         cmd = substitute_assignments(cmd, dialect)
@@ -1003,11 +584,7 @@ def _split_segments_cached(cmd: str, dialect: str) -> Tuple[str, ...]:
             i += 1
             continue
         if ch == "&" and dialect != POWERSHELL:
-            # Single & in POSIX is a command separator / background operator,
-            # UNLESS it is part of:
-            # 1. &> or &>> redirection (stdout+stderr redirect)
-            # 2. >& or <& redirection (fd duplication, e.g. 2>&1, >&2, <&0)
-            # 3. Escaped \&
+            # Single & separator/background operator in POSIX (excluding &>, >&, <&, or \&).
             is_redirect = False
             if nxt == ">":
                 is_redirect = True
@@ -1042,24 +619,14 @@ def _split_segments_cached(cmd: str, dialect: str) -> Tuple[str, ...]:
 def split_segments(cmd: str, dialect: str = POSIX) -> List[str]:
     """Split a command line on shell separators (| || && ; newline, and single & in POSIX)
     while respecting single and double quotes. Returns trimmed, non-empty segments.
-
-    This is a pragmatic splitter, not a full shell parser; it exists so a
-    destructive step hidden after a safe one in a chain is still classified.
-
-    Line continuations are folded first, so a command written across two lines
-    is judged as the single command it is.
     """
     return list(_split_segments_cached(cmd, dialect))
 
 
 def redirect_target(cmd: str) -> Optional[str]:
-    """Return the file a truncating output redirection ('> file') overwrites, or
-    None. Quote- and escape-aware (the same technique as split_segments): a '>'
-    inside quotes or backslash-escaped is literal text, not the operator, so
-    `echo "a>b"` is safe while `echo "a>b" > app.db` targets app.db. Skips '>>'
-    (append), fd-prefixed redirects (2> &>), and /dev/* sinks. Shared by
-    _classify_segment (is it destructive?) and recovery.extract_path_operand
-    (what to snapshot), so the two never disagree."""
+    """Return the file a truncating output redirection ('> file') overwrites, or None.
+    Quote- and escape-aware. Skips append, fd duplications, and /dev/* sinks.
+    """
     n = len(cmd)
     i = 0
     quote = None
@@ -1083,27 +650,11 @@ def redirect_target(cmd: str) -> Optional[str]:
             if nxt == ">":                   # '>>' append - not destructive
                 i += 2
                 continue
-            # `1>`, `2>` and `&>` ALL TRUNCATE FROM BYTE ZERO, exactly like
-            # a bare `>`. They were skipped as "fd-prefixed, out of scope",
-            # and the scope argument does not survive the behaviour: `echo x
-            # 1> app.db` destroys app.db just as thoroughly. `1>` is `>`
-            # spelled with its default descriptor; `&>` redirects both
-            # streams. Silently allowed against an existing file until
-            # 2026-09-08.
-            #
-            # `2> /dev/null` and friends stay quiet because the /dev/ sink
-            # filter below already drops them. That filter, not this skip, is
-            # what protects the common idiom - checked before widening.
-            #
-            # What DOES still have to be skipped is fd DUPLICATION: `2>&1` and
-            # `>&2` point one descriptor at another and truncate nothing. The
-            # old digit/& test caught those only as a side effect of skipping
-            # every fd-prefixed form; now they are excluded on their own terms.
+            # Truncating redirects (1>, 2>, &>); fd duplications (2>&1, >&2) are skipped.
             if nxt == "&":                   # 2>&1, >&2 - duplication, not truncation
                 i += 2
                 continue
-            # Read the target token, quote-aware, skipping spaces and a leading
-            # '|' (the '>|' noclobber-override form).
+            # Read target token, skipping spaces and leading '|' (>| noclobber override).
             j = i + 1
             while j < n and cmd[j] in " \t|":
                 j += 1
@@ -1153,19 +704,7 @@ class Classification:
     action_type: str = "shell"
     nonrecoverable_surface: Optional[str] = None
     segments: List[str] = field(default_factory=list)
-    # HOW MANY SEGMENTS DESTROY SOMETHING, not just whether any does.
-    #
-    # A single snapshot can only stand behind ONE of them. The guard used to
-    # see `is_destructive=True` for the whole line, resolve a target from
-    # whichever segment the operand extractor understood, and report
-    # REVERSIBLE - while the other destructive step went unrecorded:
-    #
-    #     DROP TABLE users; rm old.txt      snapshot of old.txt, REVERSIBLE
-    #     git reset --hard; rm old.txt      snapshot of old.txt, REVERSIBLE
-    #
-    # recovery.py cannot see this, because it only knows rm / mv / Remove-Item
-    # / redirects and has no idea a DROP or a hard reset destroyed anything.
-    # The classifier does know, so it is the one that has to say (2026-09-08).
+    # Count of segments performing destructive operations (multi-destructive pipelines escalate).
     destructive_segments: int = 0
 
     @property
@@ -1183,11 +722,7 @@ def _classify_segment(cmd: str, dialect: str = POSIX) -> dict:
             matched, atype = rid, action_type
             break
 
-    # Fallback: a truncating output redirection ('> file') has no command verb
-    # for the regex rules above to catch, but it overwrites the file from byte 0.
-    # Only fires when no stronger rule already matched. Recoverable (the target
-    # is snapshotted via recovery.extract_path_operand), so it is NOT added to
-    # _LOCAL_UNRECOVERABLE.
+    # Fallback: truncating output redirection ('> file') overwriting target from byte 0.
     if matched is None and redirect_target(cmd):
         matched, atype = "fs_redirect_truncate", "shell"
 
@@ -1196,18 +731,16 @@ def _classify_segment(cmd: str, dialect: str = POSIX) -> dict:
     is_file_writer = bool(_FILE_WRITERS.search(cmd))
     is_destructive = matched is not None
 
-    # A non-recoverable surface (external effect, migration, credential, ...)
-    # is itself a mutation, even when no other rule fires.
+    # Non-recoverable surfaces count as mutations.
     surface = None
     for label, rx in _NONRECOVERABLE:
         if rx.search(cmd):
             surface = label
             break
-    # External/remote destructive rules cannot be covered by a local snapshot.
+    # External/remote destructive rules cannot be covered by local snapshot.
     if surface is None and matched in _EXTERNAL_IRREVERSIBLE:
         surface = _EXTERNAL_IRREVERSIBLE[matched]
-    # Local recursive-force deletes we cannot honestly recover: escalate in every
-    # environment (there is no low-blast exception that could wave them through).
+    # Local unrecoverable commands escalate across all environments.
     if surface is None and matched in _LOCAL_UNRECOVERABLE:
         surface = _LOCAL_UNRECOVERABLE[matched]
 
@@ -1253,13 +786,7 @@ def classify_pipeline(cmd: str, dialect: str = POSIX) -> Classification:
     on its own and the pipeline inherits the strongest signal. Opaque remote
     execution is detected on the full string because the pipe *is* the payload.
     """
-    # `powershell -Command "Remove-Item x"` IS a Remove-Item. Judge the payload
-    # and judge it in ITS dialect - recovery.extract_path_operand calls the
-    # same function, or the two would disagree about what the command even is.
-    # EACH SEGMENT CARRIES ITS OWN DIALECT, and it is not always the outer one.
-    # `powershell.exe -Command "ri x"` run from bash arrives as POSIX and
-    # effective_segments correctly re-dialects the payload to POWERSHELL; this
-    # used to discard that and judge every segment as the outer shell.
+    # Judge each segment in its own effective dialect.
     pairs = effective_segments(cmd, dialect)
     segments = [seg for seg, _ in pairs]
     seg_results = [_classify_segment(seg, d) for seg, d in pairs]
@@ -1282,10 +809,7 @@ def classify_pipeline(cmd: str, dialect: str = POSIX) -> Classification:
         is_sql_read=any_of("is_sql_read"),
         is_sql_mutating=any_of("is_sql_mutating"),
         is_file_writer=any_of("is_file_writer"),
-        # The original line AND every effective segment. `cmd` is no longer
-        # rewritten to the unwrapped payload, so searching it alone would stop
-        # seeing a nested `ssh host ...`. A superset of what was searched
-        # before, so nothing that used to be caught can slip through.
+        # Inspect full command string and all effective segments for remote execution.
         remote_exec=bool(_REMOTE_EXEC.search(cmd))
         or any(_REMOTE_EXEC.search(s) for s in segments),
         is_pipeline=len(seg_results) > 1,
@@ -1297,13 +821,7 @@ def classify_pipeline(cmd: str, dialect: str = POSIX) -> Classification:
 
 
 def is_file_writer_command(cmd: str) -> bool:
-    """Does `cmd` match the in-place-writer rule the classifier uses?
-
-    Exported so recovery.py can gate its operand extraction on the SAME test.
-    A looser one there would count a READ as an action - `prettier src/a.js`
-    with no --write prints to stdout - and a second acting segment turns a
-    snapshot into an escalation.
-    """
+    """Test if command matches mutating file-writer pattern (shared with recovery.py)."""
     return bool(_FILE_WRITERS.search(cmd))
 
 

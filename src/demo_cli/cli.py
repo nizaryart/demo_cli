@@ -28,24 +28,9 @@ from .version import __version__
 
 _EXIT = {ESCALATE: 2, CONTEXT_MISMATCH: 1}
 
-# WINDOWS PROCESS-CREATION FLAGS, DEFINED ONCE.
-#
-# Every long-lived child demo_cli starts detached - the filesystem guard and
-# the egress proxy - wants the same thing: no visible console, and no tie to
-# the parent's Ctrl+C. The combination is not obvious, and getting it wrong is
-# silent.
-#
-# CREATE_NO_WINDOW *without* DETACHED_PROCESS. Windows documents
-# CREATE_NO_WINDOW as IGNORED when DETACHED_PROCESS or CREATE_NEW_CONSOLE is
-# also set, so stacking them throws away the only flag that suppresses the
-# window and the child runs with a console for its whole life - a window
-# somebody eventually closes, and closing it kills the child. CREATE_NO_WINDOW
-# still gives the child its own invisible console, so Ctrl+C in the parent's
-# console does not reach it.
-#
-# Fixed in the mount path 2026-08-29 and missed in the egress path until a
-# review on 2026-09-07. They are shared constants now because two copies of
-# this reasoning is exactly how they drifted.
+# Windows process-creation flags for long-lived background workers (filesystem
+# guard and egress proxy). CREATE_NO_WINDOW suppresses console window without
+# DETACHED_PROCESS (which Windows treats as overriding CREATE_NO_WINDOW).
 _DETACHED_PROCESS = 0x00000008          # kept for reference; deliberately unused
 _CREATE_NEW_PROCESS_GROUP = 0x00000200
 _CREATE_NO_WINDOW = 0x08000000
@@ -120,48 +105,18 @@ def _undo_argv(a, root: Optional[str] = None) -> List[str]:
         argv.append(a.id)
     if getattr(a, "target", None):
         argv += ["--target", os.path.abspath(a.target)]
-    # ALWAYS PASS THE ROOT, not only when the user typed one.
-    #
-    # The elevated child is launched by ShellExecute, which does not inherit
-    # this process's working directory - it starts in C:\Windows\system32. So
-    # an undo that relied on the current directory (the normal way to run it)
-    # re-ran up there, resolved a project root of system32, and reported
-    #
-    #   No recovery point matched '93201f46'.
-    #   searched  C:\Windows\system32\.demo_cli\recovery
-    #
-    # while the parent told the user their recovery needed Administrator - a
-    # true statement with the wrong reason attached (dari, 2026-09-02). The
-    # child had every right to read the file; it was looking in the wrong
-    # place. rerun_elevated now sets lpDirectory too, but a recovery path must
-    # not depend on inheriting a directory to find its own ledger.
+    # Pass explicit project root since ShellExecute child starts in C:\Windows\system32.
     argv += ["--root", os.path.abspath(
         getattr(a, "root", None) or root or os.getcwd())]
-    # This process already took the pre-restore snapshot - the target lives in
-    # the mount and is readable unelevated, even when the recovery point is
-    # not. Without this the elevated child would take a second one of bytes
-    # nobody changed in between.
+    # Target already pre-snapshotted unelevated; skip duplicate in child.
     argv.append("--no-presnapshot")
     return argv
 
 
 def _undo_elevated(a, root: Optional[str] = None) -> Optional[int]:
-    """Retry an undo that was refused for lack of privilege, via UAC.
+    """Retry an undo that was refused for lack of privilege via UAC prompt.
 
-    WHY ASK RATHER THAN INSTRUCT. The filesystem guard writes its recovery
-    points into the ACL-locked backing on purpose: it is what stops the agent
-    from deleting the evidence of what it did. The consequence is that undo of
-    anything that layer caught needs Administrator - and on 2026-08-29 the
-    user met that as "No recovery point could be restored", went away
-    believing the file was gone, and only got it back by guessing to open an
-    admin shell.
-
-    Sending somebody to another shell mid-recovery is the manual step people
-    skip. UAC is itself the consent prompt, so asking directly is both fewer
-    steps and no less explicit about what is happening.
-
-    Returns None when elevation is unavailable, refused, or pointless (already
-    elevated) - the caller then prints the honest failure instead.
+    Returns None when elevation is unavailable, refused, or already elevated.
     """
     from . import protect as protect_mod
     if os.name != "nt" or protect_mod.is_elevated():
@@ -193,47 +148,24 @@ def cmd_undo(a) -> int:
     if not result.ok and result.denied:
         rc = _undo_elevated(a, cfg.project_root)
         if rc == 0:
-            # The elevated process owns its own console, which closes with it,
-            # so its RESTORED banner is never seen. Say it here, in the shell
-            # the person is actually looking at.
+            # Render restore output in parent console since child console closes on exit.
             render.render_restore(entry, True, __version__,
                                   recovery_dir=cfg.recovery_dir,
                                   requested_id=getattr(a, "id", None))
             _say_preserved(preserved)
             return 0
         if rc is not None:
-            # AND STOP BLAMING PERMISSIONS. This branch is only reachable when
-            # result.denied is True, so the banner underneath used to print
-            # "This recovery point needs Administrator" - after a retry that
-            # HAD Administrator and failed for some other reason. The honest
-            # diagnosis is printed just below and was then contradicted two
-            # lines later.
-            #
-            # The 2026-09-02 fix added the elevated output and left the banner
-            # alone: half of the same incident, and the half that was still
-            # lying. Found by review 2026-09-07 - the first defect in this
-            # project found by reading rather than by running it.
+            # Elevated retry ran with admin; do not blame permissions for non-zero exit.
             denied = False
             print(render.c("The elevated attempt did not restore it either "
                            f"(exit {rc}).", "red"))
-            # SHOW WHAT IT SAID. The elevated console closes with the process,
-            # so without this a completely diagnosable failure arrives as a
-            # bare exit code - and the message printed underneath blames the
-            # ACL, because that is the only reason this path knows about.
-            #
-            # On 2026-09-02 the log held the whole answer ("searched
-            # C:\\Windows\\system32\\.demo_cli\\recovery") while the user was
-            # told their recovery point needed Administrator. It already had
-            # Administrator. teardown prints this; undo did not - the same
-            # rule applied to one caller and not the other.
+            # Display child output captured from elevated execution.
             from . import protect as protect_mod
             out = protect_mod.elevated_output()
             for line in (out.splitlines() or ["(it printed nothing)"]):
                 print("  " + render.c(line, "dim"))
 
-    # Pass the ledger we searched: "not found" is unactionable without it, and
-    # the recovery dir follows the project root, which follows the directory a
-    # guard was started from.
+    # Render restore result with searched recovery directory.
     render.render_restore(entry, result.ok, __version__,
                           recovery_dir=cfg.recovery_dir,
                           requested_id=getattr(a, "id", None),
@@ -285,8 +217,7 @@ def cmd_verify(a) -> int:
         anchor_chains(main_path)
 
     v = verify_chain(main_path)
-    # Absent on a project that has never been mounted - not a failure, and not
-    # something to report as one. Only verified when the file exists.
+    # Filesystem chain is optional; only verify if it exists.
     fs = verify_chain(fs_path) if os.path.exists(fs_path) else None
 
     from .receipts import verify_cross_links
@@ -295,9 +226,7 @@ def cmd_verify(a) -> int:
     # Audit on-disk recovery artifacts
     artifacts = recovery.audit_recovery_artifacts(cfg.recovery_dir)
 
-    # No head for an empty ledger - GENESIS is not something to anchor, and
-    # printing it as if it were a chain head would invite someone to record a
-    # value that attests to nothing.
+    # Only anchor non-empty chains (skip empty genesis).
     heads = {}
     if v.ok and not v.absent:
         heads["main"] = v.head
@@ -305,22 +234,8 @@ def cmd_verify(a) -> int:
         heads["fs"] = fs.head
     render.render_verify(v, __version__, fs=fs, heads=heads or None, links=links, artifacts=artifacts)
 
-    # DAMAGE DOES NOT FAIL THE COMMAND. A torn line is a write that did not
-    # finish; the entries around it are intact and verified. Exiting non-zero
-    # would make every script treat a self-inflicted corruption as evidence of
-    # tampering - which is the same false alarm the wording used to raise.
-    #
-    # AN UNRESOLVED CROSS-LINK DOES FAIL IT. That is not damage: it means a
-    # receipt referenced a hash that is no longer in the other chain, which is
-    # what removing entries looks like.
-    #
-    # AN UNPERFORMED CHECK IS NOT A COMMAND FAILURE, and that decision is made
-    # HERE rather than inside CrossLinkResult.ok. The property now returns
-    # False when checked is False, because a caller writing `if links.ok`
-    # must not get a pass for a check that never ran. Whether the ABSENCE of
-    # a second chain should fail `demo_cli verify` is a different question,
-    # and the answer is no: a project whose filesystem guard has never written
-    # is an ordinary state, not evidence of anything.
+    # Torn lines report warning without failing; unresolved cross-links fail command.
+    # Absence of an unmounted filesystem chain is treated as valid.
     cross_ok = links.ok if (links and links.checked) else True
     artifacts_ok = artifacts.ok
     ok = v.ok and (fs.ok if fs else True) and cross_ok and artifacts_ok
@@ -493,10 +408,7 @@ def cmd_init(a) -> int:
     mode = getattr(a, "mode", None)
     if mode:
         template = template.replace('mode = "shadow"', f'mode = "{mode}"', 1)
-    # encoding="utf-8" writes NO byte-order mark. That matters: PowerShell's
-    # Out-File -Encoding utf8 adds one, TOML parsers reject it, and the guard
-    # used to fail open on every command as a result. `init` exists partly so a
-    # user never has to hand-write this file.
+    # Write UTF-8 without BOM for TOML parser compatibility.
     with open(path, "w", encoding="utf-8") as f:
         f.write(template)
     print(f"Wrote {path}" + (f" (mode = {mode})" if mode else ""))
@@ -504,12 +416,7 @@ def cmd_init(a) -> int:
 
 
 def _report_reconcile(changed) -> None:
-    """Say what a re-run actually DID.
-
-    A re-install that repaired a stale entry printed the same "Installed..."
-    line as one that changed nothing, so there was no way to tell a repair
-    from a no-op - which is part of why the stale timeout survived unnoticed.
-    """
+    """Report reconciled items from hook installation."""
     if not changed:
         print("  already current - nothing changed.")
         return
@@ -539,14 +446,7 @@ def _install_hook(a) -> int:
         _report_reconcile(changed)
         print("Gates Codex shell commands (Bash) AND file edits (apply_patch).")
         print()
-        # WHAT THIS SAID UNTIL 2026-09-13, and why it was changed: it listed
-        # approving the hook in /hooks as REQUIRED, and ended "Until then: no
-        # gating, no receipts, no protection." On Codex 0.154.0 / Windows the
-        # hook gated Bash and apply_patch, wrote receipts and snapshotted, with
-        # no approval step at all - so the tool was telling the user they were
-        # unprotected while it was protecting them. Wrong in the worse
-        # direction: a user who believes the guard is off either stops trusting
-        # what it says or turns it off for real.
+        # Codex hook reload and approval instructions.
         print("  RESTART CODEX. Hook config is read once, at session start; a")
         print("  session already running keeps whatever it loaded and this")
         print("  install has no effect on it (silently - no warning either side).")
@@ -623,21 +523,9 @@ _SHELL_GUARD_SNIPPET = r'''# >>> demo_cli shell guard >>>
 # shares the string classifier's frontier by design - obfuscation is the syscall
 # guard's job, not this).
 #
-# TWO ESCAPE HATCHES, and they exist because of a real lockout on 2026-08-25.
-# A syntax error committed to cli.py made `demo_cli` unimportable. This trap
-# runs on EVERY command in EVERY bash, it read the resulting non-zero exit as
-# "the guard refused", and every command in every shell started failing -
-# including the ones needed to fix the file. The recovery path was the one
-# thing that could not be done from a shell.
-#
-#   DEMO_CLI_DISABLE=1   turns the guard off entirely. `export` is a builtin
-#                        and matches no pattern below, so it still works from
-#                        a shell that is otherwise stuck.
-#   the sanity probe     below distinguishes "the guard said no" from "the
-#                        guard is broken". Our own failures must fail OPEN -
-#                        that is already the rule inside guard-shell, and a
-#                        package that will not even import is the same class
-#                        of failure, just earlier.
+# Escape hatches (fail-open if guard is broken):
+#   DEMO_CLI_DISABLE=1   turns the guard off entirely.
+#   the sanity probe     distinguishes guard block from an unrunnable guard.
 if [ -n "$BASH_VERSION" ] && [ -z "$DEMO_CLI_DISABLE" ] && command -v demo_cli >/dev/null 2>&1; then
   # Fail-safe egress probe: if proxy is configured for localhost but nothing is listening,
   # unset the proxy so child network commands do not fail with Connection Refused.
@@ -702,10 +590,7 @@ def cmd_guard_shell(a) -> int:
     from .guard import Guard
     from .context import Intent
     command = " ".join(getattr(a, "argv", None) or []).strip()
-    # Claude Code `!`-mode delivers the command wrapped as `eval '<cmd>' < /dev/null`.
-    # classify would flag the `eval` as opaque execution and block everything;
-    # unwrap it so we judge the real command. (The DEBUG trap also re-fires on
-    # eval's expansion, so a destructive inner command is caught either way.)
+    # Unwrap Claude Code !-mode wrapper (`eval '<cmd>' < /dev/null`) to inspect inner command.
     m = re.match(r"""^\s*eval\s+(['"])(.*)\1\s*(?:<\s*\S+\s*)*$""", command, re.S)
     if m:
         command = m.group(2).strip()
@@ -746,11 +631,7 @@ def cmd_install_shell_guard(a) -> int:
     already = os.path.exists(rc) and marker in open(rc, encoding="utf-8").read()
     if not already:
         with open(rc, "a", encoding="utf-8") as f:
-            # BASH_ENV makes a NON-interactive `bash -c` (Claude Code !-mode,
-            # which does not read ~/.bashrc) source the guard. We deliberately do
-            # NOT `source` it into the interactive shell: guarding the human's own
-            # prompt is out of scope (demo_cli gates the agent, not the user) and
-            # would fire the trap on ordinary interactive commands.
+            # BASH_ENV configures non-interactive bash -c (e.g. Claude Code !-mode).
             f.write(
                 f"\n# demo_cli shell guard (gates non-interactive bash -c, e.g. Claude Code !-mode)\n"
                 f"export BASH_ENV={script}\n")
@@ -795,8 +676,7 @@ def cmd_mount(a) -> int:
         return 1
     try:
         if clear_mountpoint(a.mountpoint):
-            # Said out loud. Deleting a directory silently is precisely what
-            # this tool exists not to do, even when it is provably empty.
+            # Report cleared leftover mount point.
             print(f"[fs] cleared a leftover mount point at {a.mountpoint}")
     except OSError as e:
         print(f"{a.mountpoint} could not be cleared: {e.strerror}")
@@ -809,7 +689,7 @@ def cmd_mount(a) -> int:
         print("project, run:  demo_cli protect <your project>")
         return 1
     if not backing:
-        # Said before the mount starts, not buried in the banner afterwards.
+        # Warn if mount is in-memory without persistent backing.
         print("NOTE: no --backing given, so this mount is IN MEMORY.")
         print("      Everything written inside it is LOST when you unmount.")
         print("      For real work:  demo_cli protect <your project>")
@@ -820,11 +700,7 @@ def cmd_mount(a) -> int:
 
 
 def _mount_foreground(a, backing) -> int:
-    """Run the mount in this process, printing to this terminal.
-
-    Now the opt-in rather than the default. Useful for debugging, and for
-    watching the [fs] lines live.
-    """
+    """Run the mount in this process, printing logs directly to terminal."""
     from . import fsmount, mountstate
     from .fsmount import mount
 
@@ -839,16 +715,7 @@ def _mount_foreground(a, backing) -> int:
 
 def _mount_detached(a, backing) -> int:
     """Start the guard as a background process that outlives this terminal.
-
-    THE DEFAULT, deliberately. The mount used to block, so closing the window
-    silently stopped all protection - and a guard that stops protecting you
-    without saying so is worse than one you never installed, because you go on
-    believing you are covered. That is the fourth costume of "installed but
-    inert" in this project; the other three each cost hours.
-
-    Detached, the [fs] lines have no terminal to reach, and those lines are
-    the only channel carrying recovery-point ids. They go to mount.log, and
-    doctor points at it.
+    Logs are written to mount.log.
     """
     import subprocess
     import time
@@ -875,13 +742,10 @@ def _mount_detached(a, backing) -> int:
     if a.debug:
         argv += ["--debug"]
 
-    # Detach properly on both platforms: no console, no process group tie, so
-    # closing the terminal or pressing Ctrl+C here does not take the guard down
-    # with it.
+    # Detach background process from console and process group.
     kwargs = {}
     if os.name == "nt":
-        # See _CREATE_NO_WINDOW at the top of this module for why this
-        # combination and not DETACHED_PROCESS.
+        # Windows process creation flags (CREATE_NO_WINDOW and new process group).
         kwargs["creationflags"] = _CREATE_NO_WINDOW | _CREATE_NEW_PROCESS_GROUP
     else:
         kwargs["start_new_session"] = True
@@ -890,17 +754,7 @@ def _mount_detached(a, backing) -> int:
         proc = subprocess.Popen(argv, stdout=fh, stderr=fh,
                                 stdin=subprocess.DEVNULL, **kwargs)
 
-    # WAIT FOR THE MOUNT POINT, not for a fixed number of seconds. Two seconds
-    # was a guess: on a slow machine the child is still importing when it
-    # expires, so poll() returns None, and the parent reports a guard that has
-    # not started - `Last Result: 0` with nothing mounted (2026-08-29).
-    # --no-wait: return as soon as the child is spawned.
-    #
-    # THE SCHEDULED TASK USES IT, and nothing else should. Its .cmd owns a
-    # console window that stays open for as long as this process runs, so
-    # waiting here would park a window on the user's desktop for minutes at
-    # every logon. Setup does the waiting instead, in the shell the person is
-    # looking at, where progress is wanted rather than alarming.
+    # Wait for mount point to appear (or return immediately if --no-wait specified).
     if getattr(a, "no_wait", False):
         mounted = proc.poll() is None
     else:
@@ -936,15 +790,7 @@ def _mount_detached(a, backing) -> int:
 
 
 def _watch_layers(cfg, port, baseline, proc, seconds: int = 60) -> None:
-    """Re-check coverage while the agent runs, and shout if a layer drops.
-
-    A daemon thread, so it cannot keep the process alive after the agent
-    exits. It reports TRANSITIONS only - a status line every minute is noise,
-    and noise is how a real warning gets missed.
-
-    The warning goes to STDERR, so it appears even while the agent owns the
-    terminal for its own output.
-    """
+    """Watchdog thread: re-check coverage and report layer status transitions to stderr."""
     import threading
     import time
 
@@ -999,10 +845,7 @@ def cmd_unmount(a) -> int:
     try:
         os.kill(st.pid, signal.SIGTERM)
     except PermissionError:
-        # Expected, and a GOOD sign: the guard runs elevated so the backing
-        # directory is out of reach, which also means a non-elevated process
-        # cannot kill it. An agent cannot stop the thing watching it. Say what
-        # to do rather than reporting a bare access error.
+        # Guard runs elevated; non-elevated process cannot terminate it.
         print(f"Could not stop pid {st.pid}: access denied.")
         print("  The guard runs elevated, which is why an ordinary process")
         print("  cannot kill it. Stop it from an Administrator shell.")
@@ -1019,29 +862,8 @@ def cmd_unmount(a) -> int:
 
 
 def _relock_target(project: str, backing: Optional[str]) -> Optional[str]:
-    """The backing to re-lock, when this project is ALREADY protected.
-
-    `protect` is a move, so on an already-protected project it refuses:
-    "<backing> already exists. Refusing to merge two trees." Correct as far as
-    it goes - but doctor's remediation for an unlocked backing is `demo_cli
-    protect`, so the fix we printed could never apply to the situation we
-    printed it for. Found on real hardware 2026-09-05, and it is the same
-    defect class as the winfspy message: a diagnostic naming a fix that does
-    not fix.
-
-    In that situation there are not two trees. There is ONE tree seen twice -
-    the mount and its backing - so there is nothing to move and the only thing
-    that can be missing is the lock.
-
-    THE EVIDENCE HAS TO BE demo_cli'S OWN RECORD, not a guess. A false
-    negative here just refuses as before, which is harmless. A false positive
-    applies an Administrators-only ACL to an unrelated directory and locks
-    somebody's data away - so this requires a mount record that NAMES this
-    backing. A plain directory that happens to sit beside a plain `X.real`
-    produces no such record and is refused exactly as it is today.
-
-    Not gated on the guard RUNNING: a protected project whose guard is stopped
-    still has a backing that ought to be locked.
+    """Return verified backing path to re-lock if project is already protected.
+    Requires an existing mount record matching this backing directory.
     """
     if os.name != "nt":
         return None
@@ -1075,24 +897,13 @@ def cmd_protect(a) -> int:
                 print("  " + render.c("could not elevate.", "red"))
                 print(protect_mod.elevated_output())
                 return 1
-            # THE CHILD'S OUTPUT IS NOT OURS TO REPORT. ShellExecuteExW gives
-            # the elevated process its own console, which closes the moment it
-            # exits - so everything it printed is gone, and this shell would
-            # otherwise end on "Re-applying the lock on ..." with no outcome
-            # at all. Observed on real hardware 2026-09-06: the lock HAD been
-            # applied and the command still looked like it did nothing.
-            #
-            # So do not relay, and do not trust the exit code either: ask the
-            # filesystem. The parent can read an ACL without elevation.
+            # Query filesystem ACL directly to verify lock status.
             state = protect_mod.is_locked(relock)
             if state is True:
                 print("  " + render.c(f"locked {relock} to Administrators and SYSTEM", "green"))
                 print("  " + render.c("no files were moved.", "dim") + "\n")
                 return 0
-            # None is not False. The whole reason this branch reads the ACL
-            # instead of the exit code is that "I do not know" must not be
-            # printed as an outcome - so it is not printed as the OTHER
-            # outcome either.
+            # Distinguish unlocked (False) from unreadable ACL state (None).
             if state is False:
                 print("  " + render.c(f"the elevated step exited {rc}, but {relock} is "
                                       f"still not locked", "red") + "\n")
@@ -1102,9 +913,7 @@ def cmd_protect(a) -> int:
                                       f"locked is unknown", "yellow") + "\n")
             return 1
         protect_mod.lock_directory(relock)
-        # Believe is_locked, not lock_directory's return value. icacls has
-        # exited 0 on a failed grant before (see protect.lock_directory), and
-        # this project's rule is that a claim of protection needs evidence.
+        # Verify ACL state with is_locked rather than relying solely on icacls return code.
         state = protect_mod.is_locked(relock)
         if state is True:
             print("  " + render.c(f"locked {relock} to Administrators and SYSTEM", "green"))
@@ -1165,8 +974,7 @@ def cmd_unprotect(a) -> int:
         for step in protect_mod.unprotect(plan):
             print("  " + render.c(step, "green"))
     except PermissionError as exc:
-        # The same guard teardown has. `unprotect` is the way out, and the way
-        # out must never end in a traceback.
+        # Catch permission errors gracefully during unprotect.
         print("  " + render.c(str(exc), "red"))
         print()
         return 1
@@ -1187,12 +995,7 @@ from .egress import (
 
 
 def cmd_guarded(a) -> int:
-    """Launch an agent with every layer that can be started, started.
-
-    The value is as much the COVERAGE REPORT as the launch: it answers "am I
-    actually protected?" at the one moment somebody is guaranteed to be
-    looking, instead of leaving it to a `doctor` run nobody thinks to do.
-    """
+    """Launch an agent with all configured security layers and print a coverage report."""
     import subprocess
     import time
 
@@ -1210,9 +1013,7 @@ def cmd_guarded(a) -> int:
         return 1
     started_egress = None
 
-    # Start the proxy if it is not already up. Nothing else is auto-started:
-    # the mount needs elevation and a relocated project, and hooks are
-    # persistent host config that must not be written behind the user's back.
+    # Auto-start proxy if configured and not already running.
     if not getattr(a, "no_egress", False) and not g.port_open(port):
         mitm = __import__("shutil").which("mitmdump")
         if mitm:
@@ -1223,18 +1024,7 @@ def cmd_guarded(a) -> int:
             env = dict(os.environ, DEMO_CLI_EGRESS_MODE=egress_mode,
                        PYTHONPATH=os.path.dirname(here) + os.pathsep
                        + os.environ.get("PYTHONPATH", ""))
-            # SAME FLAGS AS _mount_detached, and for the same reason. This
-            # was DETACHED_PROCESS | CREATE_NO_WINDOW - the exact combination
-            # _mount_detached documents as broken, because Windows IGNORES
-            # CREATE_NO_WINDOW when DETACHED_PROCESS is also set. The guard
-            # was fixed on 2026-08-29; the egress spawn was missed, so the
-            # proxy kept a visible console for its whole life - a window
-            # somebody eventually closes, and closing it kills the proxy
-            # after `guarded` has already reported [+] egress.
-            #
-            # Note the premise is one recorded observation, not a re-test:
-            # CREATE_NO_WINDOW is still on the unverified list. The two call
-            # sites agreeing matters either way, and one check settles both.
+            # Detached process creation flags (CREATE_NO_WINDOW without DETACHED_PROCESS).
             kwargs = {"creationflags": _CREATE_NO_WINDOW | _CREATE_NEW_PROCESS_GROUP} \
                 if os.name == "nt" else {"start_new_session": True}
             with open(log, "a", encoding="utf-8") as fh:
@@ -1271,10 +1061,7 @@ def cmd_guarded(a) -> int:
         if layer.fixable:
             print(f"      {render.c('turn it on: ' + layer.fixable, 'dim')}")
     print(f"\n  {g.summary(layers)}\n")
-    # Flush before handing the terminal over. Python buffers stdout when it is
-    # not a tty, the child does not, so without this the coverage report lands
-    # AFTER the agent's own output - and a report you read afterwards is not a
-    # report, it is a log entry.
+    # Flush coverage report to terminal before spawning child agent.
     sys.stdout.flush()
 
     extra_np = None
@@ -1282,10 +1069,7 @@ def cmd_guarded(a) -> int:
         extra_np = cfg.egress.get("no_proxy")
     env = g.child_env(dict(os.environ), port, g.port_open(port), extra_no_proxy=extra_np, config=cfg)
 
-    # Resolve the executable OURSELVES. On Windows subprocess goes through
-    # CreateProcess, which does not consult PATHEXT - so `claude`, installed
-    # as claude.cmd, is invisible to it while working perfectly in the shell
-    # the user just typed it into. shutil.which does honour PATHEXT.
+    # Resolve executable via shutil.which to honor Windows PATHEXT.
     exe = __import__("shutil").which(argv[0])
     if not exe:
         print(f"{argv[0]}: not found on PATH.")
@@ -1298,8 +1082,7 @@ def cmd_guarded(a) -> int:
     except KeyboardInterrupt:
         return 130
     finally:
-        # Only what we started. A proxy the user already had running in another
-        # terminal is theirs, and killing it would be a surprise.
+        # Terminate proxy only if started by this process.
         if started_egress and started_egress.poll() is None:
             started_egress.terminate()
             print("\ndemo_cli: stopped the egress guard it started.")
@@ -1377,10 +1160,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--version", action="version", version=f"demo_cli {__version__}")
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--no-color", action="store_true", help="disable coloured output")
-    # The elevated child writes its own output here. Not for users: it is how
-    # the parent recovers what happened on the other side of a UAC prompt,
-    # now that the elevation path no longer routes through `cmd /c ... > log`.
-    # See protect.rerun_elevated for why that shell wrapper had to go.
+    # Captured output log for elevated child process.
     common.add_argument("--elevated-log", metavar="PATH", help=argparse.SUPPRESS)
     common.add_argument("--root", metavar="DIR",
                         help="project whose ledger to use, instead of resolving one "
@@ -1431,9 +1211,7 @@ def build_parser() -> argparse.ArgumentParser:
     rp = sub.add_parser("report", parents=[common], help="summarise recorded decisions (shadow report)")
     rp.set_defaults(func=cmd_report)
 
-    # `receipts` is an ALIAS for `receipt`. A user running `demo_cli receipts` (plural)
-    # expects to view the recorded receipts ledger (`--list` by default).
-    # `demo_cli receipt` (singular) prints a shareable proof card for the latest (or by id).
+    # Alias: `demo_cli receipts` lists entries; `demo_cli receipt` prints a proof card.
     rc = sub.add_parser("receipt", parents=[common], aliases=["receipts"],
                         help="show a copy-pasteable proof card, or list receipts (`demo_cli receipts`)")
     rc.add_argument("id", nargs="?", default=None,
@@ -1466,19 +1244,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     ih = sub.add_parser("install-hook", parents=[common],
                         help="wire the safety hook into Claude Code, Cursor, or Codex")
-    # Claude Code is the default host, and was reachable ONLY as the bare form.
-    # Two hosts had a flag and the third did not, so `--claude` failed with a
-    # usage dump listing every subcommand - and the bare form is the one that
-    # writes host config with no host named in the command.
+    # Mutually exclusive host selection flags.
     ih_host = ih.add_mutually_exclusive_group()
     ih_host.add_argument("--claude", action="store_true",
-                         help="install the Claude Code PreToolUse hook (the default)")
+                          help="install the Claude Code PreToolUse hook (the default)")
     ih_host.add_argument("--cursor", action="store_true",
-                         help="install the Cursor beforeShellExecution hook (into .cursor/hooks.json) "
-                              "instead of the Claude Code PreToolUse hook")
+                          help="install the Cursor beforeShellExecution hook (into .cursor/hooks.json) "
+                               "instead of the Claude Code PreToolUse hook")
     ih_host.add_argument("--codex", action="store_true",
-                         help="install the Codex PreToolUse hook (into .codex/hooks.json) "
-                              "instead of the Claude Code PreToolUse hook")
+                          help="install the Codex PreToolUse hook (into .codex/hooks.json) "
+                               "instead of the Claude Code PreToolUse hook")
     ih.add_argument("--scope", choices=("project", "global"), default="project")
     ih.add_argument("--print", action="store_true", help="print the settings snippet instead of writing")
     ih.set_defaults(func=cmd_install_hook)
@@ -1635,12 +1410,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    # REDIRECT BEFORE ANYTHING PRINTS. ShellExecute cannot redirect handles,
-    # and the elevated console is launched hidden and closes with the process,
-    # so without this a failure on the far side of the UAC prompt arrives as a
-    # bare exit code with the actual error already gone. The parent used to
-    # get this by wrapping the child in `cmd /c "... > log 2>&1"`, which is
-    # what let shell metacharacters in an argument reach an elevated shell.
+    # Redirect output to elevated log sink if specified.
     log = getattr(args, "elevated_log", None)
     if log:
         try:
