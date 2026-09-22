@@ -1166,7 +1166,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="project whose ledger to use, instead of resolving one "
                              "from the current directory. A filesystem guard mounted "
                              "elsewhere writes elsewhere; this is how you reach it")
-    sub = p.add_subparsers(dest="cmd")
+    sub = p.add_subparsers(dest="cmd", metavar="COMMAND")
 
     ch = sub.add_parser("check", parents=[common], help="evaluate one command before it runs")
     ch.add_argument("command")
@@ -1326,14 +1326,12 @@ def build_parser() -> argparse.ArgumentParser:
     td.add_argument("--yes", action="store_true", help="skip confirmations")
     td.set_defaults(func=cmd_teardown)
 
-    ta = sub.add_parser("_teardown-admin", parents=[common],
-                        help=argparse.SUPPRESS)
+    ta = sub.add_parser("_teardown-admin", parents=[common])
     ta.add_argument("project")
     ta.add_argument("--report", required=True)
     ta.set_defaults(func=cmd_teardown_admin)
 
-    rt = sub.add_parser("_register-task", parents=[common],
-                        help=argparse.SUPPRESS)
+    rt = sub.add_parser("_register-task", parents=[common])
     rt.add_argument("project")
     rt.set_defaults(func=cmd_register_task)
 

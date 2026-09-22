@@ -12,3 +12,6 @@ demo_cli_receipts.jsonl
 .demo_cli/
 .demo_cli.toml
 *.egg-info/
+build/
+dist/
+.pytest_cache/

@@ -25,6 +25,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7"]
+egress = ["mitmproxy>=10.0"]
 
 # The filesystem guard (Windows). `fsmount.py` genuinely imports winfspy, so
 # this is a real dependency - but an OPTIONAL one, on purpose:
@@ -51,6 +52,9 @@ version = { attr = "demo_cli.version.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+demo_cli = ["py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
